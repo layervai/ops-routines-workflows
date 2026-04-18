@@ -42,7 +42,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check-dependency-age:
+  check-pip-age:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') }}
