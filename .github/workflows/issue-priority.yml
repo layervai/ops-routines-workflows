@@ -1,0 +1,85 @@
+# REUSABLE: Issue priority label enforcement.
+# Canary + auto-apply for `priority: {critical,high,medium,low}` labels.
+# Primary enforcement is form-level (`validations: required` on the
+# consumer repo's issue-form dropdown); this workflow covers edits,
+# blank-issue openings, and label-strip races. Rubric: see the
+# `priority: *` label descriptions in each consumer repo.
+name: Issue priority enforcement (reusable)
+
+on:
+  workflow_call:
+
+permissions:
+  issues: write
+
+# Coalesce bursts on the same issue (rapid label edits, form submit
+# auto-apply, etc.) so we don't queue parallel runs that race on the
+# Issues API.
+concurrency:
+  group: issue-priority-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  enforce-priority:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    # Skip runs triggered by our own label mutations. Without this guard
+    # every auto-apply would fire a `labeled` event that re-invokes this
+    # workflow (which would then no-op, but burn a run each time).
+    if: ${{ github.event.sender.type != 'Bot' }}
+    steps:
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const issue = context.payload.issue;
+            if (!issue) return;
+
+            const valid = ['critical', 'high', 'medium', 'low'];
+            const allLabels = issue.labels.map(l => l.name);
+            const priorityLabels = allLabels.filter(n => n.startsWith('priority: '));
+            const currentPrio = priorityLabels.map(n => n.slice('priority: '.length));
+
+            if (currentPrio.length === 1 && valid.includes(currentPrio[0])) {
+              core.info(`Issue #${issue.number} has priority: ${currentPrio[0]}`);
+              return;
+            }
+
+            // Issue forms render a dropdown selection as:
+            //   ### Priority\n\n<value>\n
+            // The regex is anchored on the heading so a user typing the
+            // word "priority" in a free-text field doesn't drive the
+            // auto-label. Unanchored drift in GitHub's form-render
+            // format would cause us to fall through to setFailed — the
+            // invariant test in tests/issue_priority_test.sh pins the
+            // expected rendered shape so a silent upstream change shows
+            // up as a red test run, not a silently broken workflow.
+            const match = (issue.body || '').match(
+              /^###\s+Priority\s*\n+\s*(critical|high|medium|low)\b/im
+            );
+            if (match) {
+              const desired = `priority: ${match[1].toLowerCase()}`;
+              // Single PUT that replaces the label set, collapsing
+              // remove-stale + add-desired into one Issues API call.
+              // That's one webhook event instead of two, halving the
+              // self-trigger load on the consumer shim (further guarded
+              // by the Bot sender check above).
+              const nonPrio = allLabels.filter(n => !n.startsWith('priority: '));
+              await github.rest.issues.setLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: [...nonPrio, desired],
+              });
+              core.info(`Applied ${desired} from form selection`);
+              return;
+            }
+
+            // Canary path. Issues don't have required status checks, so
+            // this only puts a red X in the issue's sidebar — it does
+            // not block anything. The actionable signal is for the
+            // issue author or a maintainer to add a priority label.
+            core.setFailed(
+              `Issue #${issue.number} has no valid priority label. ` +
+              `Add exactly one of: priority: critical, priority: high, ` +
+              `priority: medium, priority: low.`
+            );
