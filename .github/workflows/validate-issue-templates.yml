@@ -1,0 +1,130 @@
+# REUSABLE: Issue-template schema validation.
+# Validates `.github/ISSUE_TEMPLATE/*.yml` and `*.yaml` against GitHub's
+# published schemas: `vendor.github-issue-config` for `config.yml`,
+# `vendor.github-issue-forms` for everything else.
+#
+# Context: consumer repos that ship issue forms + `blank_issues_enabled:
+# false` depend on their forms rendering. A malformed form silently
+# falls back to the blank-issue path — which is disabled — so a
+# rendering regression hides issue creation entirely until a reporter
+# reports the breakage externally. actionlint doesn't know the issue-
+# form schema, so this is the only way to fence it pre-merge.
+#
+# Consumer usage (thin shim):
+#
+#   name: Validate issue templates
+#   on:
+#     push:
+#       branches: [main]
+#       paths: [".github/ISSUE_TEMPLATE/**"]
+#     pull_request:
+#       paths: [".github/ISSUE_TEMPLATE/**"]
+#   permissions:
+#     contents: read
+#   jobs:
+#     validate-templates:
+#       uses: layervai/ops-routines-workflows/.github/workflows/validate-issue-templates.yml@<SHA>  # vX.Y.Z
+#
+# Optional inputs cover the handful of adjustable knobs (template dir,
+# pinned tool versions). Self-contained — no shared-lib checkout needed.
+name: Validate issue templates (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      template-dir:
+        description: "Directory containing issue form YAMLs."
+        required: false
+        type: string
+        default: ".github/ISSUE_TEMPLATE"
+      check-jsonschema-version:
+        description: "Pinned check-jsonschema version. Bump intentionally."
+        required: false
+        type: string
+        default: "0.37.1"
+      python-version:
+        description: "Python minor version for the runner."
+        required: false
+        type: string
+        default: "3.12"
+
+permissions:
+  contents: read
+
+# Cancel in-flight runs on the same PR when a new commit lands — a form-
+# only edit is cheap to re-validate, and stacking runs just slows feedback.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-templates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install check-jsonschema
+        env:
+          CHECK_JSONSCHEMA_VERSION: ${{ inputs.check-jsonschema-version }}
+        run: |
+          set -euo pipefail
+          python3 -m pip --version
+          python3 -m pip install --no-cache-dir "check-jsonschema==${CHECK_JSONSCHEMA_VERSION}"
+          check-jsonschema --version
+
+      - name: Validate issue templates
+        env:
+          TEMPLATE_DIR: ${{ inputs.template-dir }}
+        run: |
+          set -euo pipefail
+          # A missing template dir in a consumer that opted into this
+          # reusable is a regression — fail loud rather than pass vacuously.
+          # Consumers with no issue forms shouldn't be calling this at all.
+          if [[ ! -d "$TEMPLATE_DIR" ]]; then
+            echo "ERROR: $TEMPLATE_DIR not found." >&2
+            echo "  A consumer calling this reusable must have at least" >&2
+            echo "  one issue form. If you deliberately removed every" >&2
+            echo "  form, also remove the caller workflow." >&2
+            exit 1
+          fi
+
+          # Both .yml and .yaml are accepted by GitHub — glob both here
+          # so a contributor's .yaml file can't silently skip validation
+          # (the exact silent-skip class this reusable exists to prevent).
+          shopt -s nullglob
+          forms=()
+          configs=()
+          for f in "$TEMPLATE_DIR"/*.yml "$TEMPLATE_DIR"/*.yaml; do
+            case "$(basename "$f")" in
+              config.yml|config.yaml)
+                # GitHub picks one config file per directory; if both are
+                # present, validate both so the misconfiguration surfaces
+                # here instead of at issue-creation time.
+                configs+=("$f")
+                ;;
+              *)
+                forms+=("$f")
+                ;;
+            esac
+          done
+
+          # An empty template dir still defeats `blank_issues_enabled:
+          # false` — same reasoning as the missing-dir branch above.
+          if (( ${#forms[@]} == 0 )); then
+            echo "ERROR: no issue-form YAMLs found in $TEMPLATE_DIR." >&2
+            echo "  At least one bug_report / feature_request form is" >&2
+            echo "  required for a repo that opts into this validation." >&2
+            exit 1
+          fi
+
+          check-jsonschema --builtin-schema vendor.github-issue-forms "${forms[@]}"
+
+          if (( ${#configs[@]} > 0 )); then
+            check-jsonschema --builtin-schema vendor.github-issue-config "${configs[@]}"
+          fi
