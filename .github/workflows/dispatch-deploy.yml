@@ -1,0 +1,195 @@
+# REUSABLE: Fire `repository_dispatch` from a public consumer repo to a
+# private deploy-receiver repo, using the qurl-deploy-dispatcher GitHub
+# App's narrowly-scoped token (contents:write, metadata:read only).
+#
+# This workflow is the single chokepoint for cross-repo deploy
+# triggers — public consumers (qurl-integrations today; future Slack /
+# Teams / Zapier integrations tomorrow) call it via `uses:` instead of
+# inlining the App-token-mint pattern. Centralisation gives us:
+#   - One audit point for dispatch logic and version pins
+#   - target_repo + event_type allowlist that consumers cannot bypass
+#   - Future integrations get the secure path with a single `uses:` line
+#
+# Why it lives here (and ships through the public mirror):
+#   GitHub blocks public repos from calling reusables in private
+#   repos. The mirror at layervai/ops-routines-workflows is the
+#   public-visible copy; this file is its source-of-truth (passthrough
+#   in scripts/embed-lib-into-workflows.py).
+name: Dispatch deploy (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      target_repo:
+        description: |
+          Receiver repo for the repository_dispatch (just the repo
+          name — owner is hard-coded to `layervai` and is NOT a caller
+          input, to prevent a compromised consumer from dispatching
+          against an arbitrary owner). Must be in the allowlist below.
+        required: true
+        type: string
+      event_type:
+        description: |
+          The repository_dispatch event_type the receiver workflow
+          listens for. Must be in the allowlist below.
+        required: true
+        type: string
+      client_payload:
+        description: |
+          A JSON OBJECT (encoded as a string) to send as the dispatch's
+          client_payload. The reusable parses this string into a real
+          JSON object before forwarding to GitHub — receivers that
+          access github.event.client_payload.<key> will see typed
+          values, not nested JSON strings. Caller is expected to
+          interpolate any github-context values it needs into the
+          string before passing (e.g. embed github.sha via the
+          standard double-curly-brace expression in the caller's own
+          workflow file). Keep small — GitHub limit is 10 top-level
+          properties, 64 KB total.
+        required: false
+        type: string
+        default: '{}'
+    secrets:
+      app_id:
+        description: DEPLOY_DISPATCHER_APP_ID (org secret, selected-repos)
+        required: true
+      app_private_key:
+        description: DEPLOY_DISPATCHER_APP_PRIVATE_KEY (org secret, selected-repos)
+        required: true
+    outputs:
+      dispatched_at:
+        description: |
+          ISO-8601 UTC timestamp when the dispatch was successfully
+          accepted by GitHub. Empty if the dispatch failed before that
+          point (allowlist reject, JSON malformed, API non-204).
+          Useful for caller-side logging and downstream poll-for-run
+          steps that want to bound their search by time.
+        value: ${{ jobs.dispatch.outputs.dispatched_at }}
+      target:
+        description: |
+          The fully-qualified target repo + event_type pair that was
+          dispatched (e.g. "layervai/qurl-integrations-infra:discord-bot-deploy").
+          Echoed for the caller's audit trail.
+        value: ${{ jobs.dispatch.outputs.target }}
+
+# Deny-all default: the reusable's own GITHUB_TOKEN never reads or
+# writes anything. The cross-repo dispatch is performed by the App-
+# minted token returned from create-github-app-token, which is
+# independent of the workflow's token. Anything more permissive here
+# would expand the trust surface of this workflow without enabling
+# any of its actual work.
+permissions: {}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      dispatched_at: ${{ steps.fire.outputs.dispatched_at }}
+      target: ${{ steps.fire.outputs.target }}
+    steps:
+      # Allowlist enforcement — defence in depth. If a caller passes
+      # an off-list target_repo or event_type, fail loud BEFORE we
+      # mint a token, so a misconfigured caller can't accidentally
+      # widen blast radius. Add new pairs here in the same PR that
+      # adds a new consumer; do not let consumers expand the allowlist
+      # via inputs.
+      #
+      # Implementation note: we iterate the allowlist as a bash array
+      # and exact-match, NOT a single-string substring/regex match.
+      # Earlier draft used `grep -q` against a comma-joined string,
+      # which was vulnerable to (a) regex metacharacters in event_type
+      # (operator-defined, can contain `.`, `*`, `[`, etc.) and (b)
+      # comma injection — a payload of "ok-pair,evil-pair" would have
+      # contains-matched the full allowlist literal. Exact-equality is
+      # the only safe form here.
+      - name: Validate target_repo + event_type against allowlist
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+          EVENT_TYPE: ${{ inputs.event_type }}
+        run: |
+          set -euo pipefail
+          # Allowlist of "<target_repo>:<event_type>" pairs. Edit this
+          # array (and only this array) to onboard a new consumer.
+          ALLOWLIST=(
+            "qurl-integrations-infra:discord-bot-deploy"
+            "qurl-integrations-infra:slack-bot-deploy"
+          )
+          PAIR="${TARGET_REPO}:${EVENT_TYPE}"
+          for entry in "${ALLOWLIST[@]}"; do
+            if [ "$entry" = "$PAIR" ]; then
+              echo "::notice::allowlist match: ${PAIR}"
+              exit 0
+            fi
+          done
+          echo "::error::dispatch target/event not in allowlist: ${PAIR}"
+          echo "::error::Allowlist entries:"
+          for entry in "${ALLOWLIST[@]}"; do echo "::error::  - ${entry}"; done
+          echo "::error::To add a new consumer, edit dispatch-deploy.yml ALLOWLIST in the same PR that wires the consumer."
+          exit 1
+
+      - name: Mint GitHub App token (scoped to target_repo only)
+        id: app-token
+        # SHA-pinned per the LayerV dep-age-check shim convention.
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          app-id: ${{ secrets.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+          owner: layervai
+          # Critical AND forward-compatible: scope the minted token
+          # to ONLY the dispatch target. Today the App is installed
+          # only on qurl-integrations-infra so this is a no-op; when
+          # the App is installed on additional receivers (Slack
+          # rollout, future integrations), the same line keeps each
+          # dispatch's token narrowed to one receiver — a leaked
+          # token from one consumer's run cannot reach another
+          # receiver. Removing this would silently widen blast
+          # radius the moment a second install lands.
+          repositories: ${{ inputs.target_repo }}
+
+      # Fire the repository_dispatch by piping a properly-formed JSON
+      # body via `jq + --input -`. Earlier draft used
+      # `gh api --raw-field client_payload=<string>` which sends
+      # client_payload as a JSON STRING — receivers that access
+      # `github.event.client_payload.sha` would get null and reject
+      # the run. The peter-evans/repository-dispatch action this
+      # reusable replaces does an internal JSON.parse on its input
+      # string before calling createDispatchEvent, so it always
+      # produced a real object on the wire; we restore that contract
+      # here via `--argjson`.
+      - name: Fire repository_dispatch
+        id: fire
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          EVENT_TYPE: ${{ inputs.event_type }}
+          CLIENT_PAYLOAD: ${{ inputs.client_payload }}
+        run: |
+          set -euo pipefail
+          # Validate client_payload parses as a JSON object before
+          # we send it (jq's --argjson would also reject malformed
+          # JSON, but the dedicated check produces a clearer error
+          # for the operator). Plain JSON values like `"abc"` or
+          # `42` would be accepted by jq but rejected by GitHub —
+          # require an object at the top level.
+          if ! printf '%s' "$CLIENT_PAYLOAD" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            echo "::error::client_payload must be a JSON object (got: $(printf '%s' "$CLIENT_PAYLOAD" | jq -r 'type' 2>/dev/null || echo 'invalid JSON'))"
+            exit 1
+          fi
+          # Build the full request body and pipe to gh api --input.
+          # --argjson reads the value as JSON (preserving object-ness),
+          # NOT as a string. This is the fix for the earlier
+          # --raw-field bug.
+          jq -n --arg et "$EVENT_TYPE" --argjson cp "$CLIENT_PAYLOAD" \
+            '{event_type: $et, client_payload: $cp}' \
+          | gh api \
+              --method POST \
+              --input - \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/layervai/${TARGET_REPO}/dispatches"
+          # GitHub returns 204 No Content on success; gh api would have
+          # exited non-zero otherwise.
+          NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "dispatched_at=${NOW}" >>"$GITHUB_OUTPUT"
+          echo "target=layervai/${TARGET_REPO}:${EVENT_TYPE}" >>"$GITHUB_OUTPUT"
+          echo "::notice::Dispatched ${EVENT_TYPE} to layervai/${TARGET_REPO} at ${NOW}"
