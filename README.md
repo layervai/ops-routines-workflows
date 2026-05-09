@@ -58,6 +58,25 @@ jobs:
 
 Same pattern for the other ecosystems. No `secrets:` block needed — the workflows are self-contained.
 
+### Optional: PR comments with retry-after dates (v0.6.0+)
+
+Set `comment_on_failure: true` and the workflow will post a sticky PR comment listing each pin that failed the age check, with its eligible-after date and days remaining. The comment is updated in place on subsequent runs and deleted once the PR clears.
+
+Requires the calling job to grant `pull-requests: write` (Dependabot PRs need this granted explicitly — the default Dependabot token is read-only). If the token can't write, the post-step soft-fails to a `::notice` and the run still succeeds; retry-after dates are still in the Job Summary.
+
+```yaml
+jobs:
+  age-check:
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') }}
+    uses: layervai/ops-routines-workflows/.github/workflows/age-check-pip.yml@<SHA> # v0.6.0
+    with:
+      min_age_days: 7
+      comment_on_failure: true
+    permissions:
+      contents: read
+      pull-requests: write
+```
+
 ## Bypass
 
 Add the `age-check-bypass` label to a PR to skip the check. Use only for CVE-driven emergency updates.
