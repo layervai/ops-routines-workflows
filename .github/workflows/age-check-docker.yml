@@ -27,6 +27,16 @@ on:
         required: false
         type: string
         default: "."
+      comment_on_failure:
+        description: |
+          Post a sticky PR comment listing images that failed the age check
+          and how many days each has left until eligible. Requires the
+          calling job to grant `pull-requests: write` (Dependabot PRs need
+          this granted explicitly; the default Dependabot token is
+          read-only). Soft-fails to a `::notice` if the token can't write.
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -39,6 +49,13 @@ jobs:
   check-docker-age:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      # Only used when `comment_on_failure: true`. Caller's job-level
+      # `permissions:` block caps this; if the caller restricts to
+      # `contents: read` (or runs as Dependabot without an explicit
+      # grant), the post-step soft-fails to a `::notice`.
+      pull-requests: write
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') }}
     steps:
       - name: Checkout consumer repo
@@ -63,6 +80,10 @@ jobs:
           MIN_AGE_DAYS: ${{ inputs.min_age_days }}
           BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
           DOCKERFILE_GLOB: ${{ inputs.dockerfile_glob }}
+          # `record_failure` writes a TSV row here for each too-new image
+          # so the post-step below can render the data into a comment
+          # without redoing classification. Unset → no-op.
+          AGE_CHECK_FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
         run: |
           set -euo pipefail
           export PATH="${HOME}/go/bin:${PATH}"
@@ -274,6 +295,49 @@ jobs:
             date -u -d "@$((publish_epoch + min_age_days * 86400))" +%Y-%m-%d 2>/dev/null || echo "unknown"
           }
 
+          # Append a single failure row to a workflow-level TSV so a downstream
+          # job step can render the data into a PR comment without re-doing the
+          # classification work. No-op when AGE_CHECK_FAILURES_FILE is unset (the
+          # common case — local dev, callers that didn't opt into the comment
+          # feature). Format is one row per too-new pin:
+          #
+          #   <display_id>\t<display_version>\t<age_days>\t<min_age_days>\t<eligible_date>\t<days_remaining>
+          #
+          # Tabs were chosen over JSON because the consumer (a small bash step in
+          # the template) parses with `IFS=$'\t' read` — no jq dependency, and
+          # `display_id` / `display_version` have already been run through
+          # `safe_for_md` so they cannot contain tabs.
+          #
+          # `days_remaining` is computed as calendar-day delta between today (UTC,
+          # midnight) and the eligible-after date. That matches the `eligible_date`
+          # column the user reads on the same row — the alternative (`min - age`)
+          # off-by-ones on freshly-committed pins because `age_days` floors:
+          # a pin committed 22h ago has age_days=0, so `min - age` would suggest
+          # "wait 7 days" when in calendar terms only 6 days remain until eligible.
+          # Falls back to the floor approximation only if the eligible string is
+          # unparseable (defensive — should never happen since the caller fed it
+          # through `eligible_date_utc`). Clamped at 0 to defend against clock
+          # skew producing a negative.
+          preflight::record_failure() {
+            local file="${AGE_CHECK_FAILURES_FILE:-}"
+            [ -z "$file" ] && return 0
+            local display_id="$1" display_version="$2" age_days="$3"
+            local min_age_days="$4" eligible="$5"
+            local days_remaining today_epoch eligible_epoch
+            today_epoch=$(date -u -d "$(date -u +%Y-%m-%d)" +%s 2>/dev/null || true)
+            eligible_epoch=$(date -u -d "${eligible}" +%s 2>/dev/null || true)
+            if [ -n "${today_epoch}" ] && [ -n "${eligible_epoch}" ]; then
+              days_remaining=$(( (eligible_epoch - today_epoch) / 86400 ))
+            else
+              days_remaining=$(( min_age_days - age_days ))
+            fi
+            [ "$days_remaining" -lt 0 ] && days_remaining=0
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$display_id" "$display_version" "$age_days" \
+              "$min_age_days" "$eligible" "$days_remaining" \
+              >> "$file"
+          }
+
           # ----- Shared age-check outcome helper --------------------------------------
 
           # Classify a dependency's age and emit the full CI output for it
@@ -369,6 +433,7 @@ jobs:
                 local eligible; eligible=$(preflight::eligible_date_utc "$publish_epoch" "$min_age_days")
                 echo "::error${file_prefix}${full_id} ${verb} ${age_days} day(s) ago (minimum: ${min_age_days}; eligible after ${eligible})"
                 echo "| \`${display_id}\` | ${display_version} | ${age_days} | :x: **too new** (eligible after ${eligible}) |" >> "$GITHUB_STEP_SUMMARY"
+                preflight::record_failure "$display_id" "$display_version" "$age_days" "$min_age_days" "$eligible"
                 return 1
                 ;;
             esac
@@ -761,3 +826,95 @@ jobs:
             echo "All Docker dependencies are at least ${MIN_AGE_DAYS} days old"
           }
           docker_age::main
+
+      - name: Comment retry-after dates on PR
+        if: ${{ !cancelled() && inputs.comment_on_failure && github.event.pull_request.number }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MIN_AGE_DAYS: ${{ inputs.min_age_days }}
+          FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
+          # Per-ecosystem render parameters. Bash body below is identical
+          # across all 5 reusables; only these env values change.
+          ECOSYSTEM: docker
+          ITEM_COLUMN: Image
+          SEPARATOR: "@"
+        run: |
+          # ============================================================================
+          # comment-on-failure.sh - Post sticky PR comment with retry-after dates
+          # ============================================================================
+          #
+          # Embedded into each `age-check-<eco>.yml.tmpl` at the
+          # `# @@COMMENT_ON_FAILURE@@` marker by `scripts/embed-lib-into-workflows.py`.
+          #
+          # Reads the TSV that `preflight::record_failure` wrote during the main
+          # run step (one row per too-new pin) and renders a single sticky comment
+          # with the per-pin eligible date and days-remaining. Updates an existing
+          # sticky comment when one is found (marker is `<!-- ops-routines:age-check
+          # -comment:${ECOSYSTEM} -->`); deletes the sticky on a clean run so a
+          # stale "X days remaining" doesn't outlive the failure that produced it.
+          #
+          # Soft-fails on permission denial (typical on Dependabot PRs where the
+          # token is read-only) — emits a `::notice` so the run still succeeds and
+          # the user can find retry-after dates in the Job Summary.
+          #
+          # Required env (set per-ecosystem in the calling step):
+          #   GH_TOKEN, REPO, PR_NUMBER, RUN_URL, MIN_AGE_DAYS, FAILURES_FILE,
+          #   ECOSYSTEM, ITEM_COLUMN, SEPARATOR
+          # ============================================================================
+
+          set -euo pipefail
+
+          MARKER="<!-- ops-routines:age-check-comment:${ECOSYSTEM} -->"
+
+          # `gh api ... --paginate` pages through all PR comments. The jq filter
+          # selects whichever one carries our marker (there should be 0 or 1).
+          # `--jq '... // empty'` returns the empty string when no match — keeps
+          # `existing_id` testable with `[ -n "$existing_id" ]`.
+          existing_id=$(
+            gh api --paginate "/repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              --jq "[.[] | select(.body | contains(\"${MARKER}\"))] | first | .id // empty" \
+              2>/dev/null || true
+          )
+
+          if [ -s "${FAILURES_FILE:-/dev/null}" ]; then
+            body_file=$(mktemp)
+            # shellcheck disable=SC2016
+            # The printf format strings below intentionally contain literal
+            # backticks and `%s` placeholders for Markdown rendering — no shell
+            # expansion is wanted in those slots.
+            {
+              printf '%s\n\n' "${MARKER}"
+              printf '### Dependency Age Check failed — %s\n\n' "${ECOSYSTEM}"
+              printf 'New pin(s) below have not yet reached the **%s-day** quarantine. Wait until the eligible date, push any new commit, and the check will pass.\n\n' "${MIN_AGE_DAYS}"
+              printf '| %s | Age (days) | Eligible after | Days remaining |\n' "${ITEM_COLUMN}"
+              printf '|---|---:|---|---:|\n'
+              while IFS=$'\t' read -r id ver age _min eligible remaining; do
+                [ -z "${id}" ] && continue
+                printf '| `%s%s%s` | %s | %s | %s |\n' \
+                  "${id}" "${SEPARATOR}" "${ver}" "${age}" "${eligible}" "${remaining}"
+              done < "${FAILURES_FILE}"
+              printf '\n> Need to merge sooner? Add the **`age-check-bypass`** label — verified-CVE emergencies only.\n'
+              printf '\n<sub>Updated by `ops-routines-workflows/age-check-%s` · [run log](%s)</sub>\n' "${ECOSYSTEM}" "${RUN_URL}"
+            } > "${body_file}"
+
+            if [ -n "${existing_id}" ]; then
+              if ! gh api -X PATCH "/repos/${REPO}/issues/comments/${existing_id}" \
+                   -F "body=@${body_file}" >/dev/null 2>&1; then
+                echo "::notice::Could not update age-check comment — caller workflow needs \`pull-requests: write\` (Dependabot PRs need this granted explicitly). Retry-after dates are in the Job Summary."
+              fi
+            else
+              if ! gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body-file "${body_file}" >/dev/null 2>&1; then
+                echo "::notice::Could not post age-check comment — caller workflow needs \`pull-requests: write\` (Dependabot PRs need this granted explicitly). Retry-after dates are in the Job Summary."
+              fi
+            fi
+            rm -f "${body_file}"
+          elif [ -n "${existing_id}" ]; then
+            # No too-new failures this run; clear the stale sticky if one exists
+            # so reviewers don't act on outdated retry-after dates.
+            if ! gh api -X DELETE "/repos/${REPO}/issues/comments/${existing_id}" >/dev/null 2>&1; then
+              echo "::notice::Could not delete stale age-check comment (id ${existing_id}). Caller workflow may need \`pull-requests: write\`."
+            fi
+          fi
