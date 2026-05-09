@@ -963,6 +963,17 @@ jobs:
 
           if [ -s "${FAILURES_FILE:-/dev/null}" ]; then
             body_file=$(mktemp)
+            # Dedupe rows: a single pin referenced in N workflow / lockfile
+            # entries records N identical TSV rows (one per file processed by
+            # the main script). Per-file `::error file=…` annotations correctly
+            # fire N times so each file in the Files Changed tab gets its own
+            # inline annotation; this comment is a SUMMARY, not a per-file
+            # annotation, so it should list each pin once. `sort -u` works
+            # because age / eligible / remaining are identical for a given
+            # (id, version) within a single run (the script captures
+            # `now_epoch` once at startup).
+            deduped_failures=$(mktemp)
+            sort -u "${FAILURES_FILE}" > "${deduped_failures}"
             # shellcheck disable=SC2016
             # The printf format strings below intentionally contain literal
             # backticks and `%s` placeholders for Markdown rendering — no shell
@@ -977,10 +988,11 @@ jobs:
                 [ -z "${id}" ] && continue
                 printf '| `%s%s%s` | %s | %s | %s |\n' \
                   "${id}" "${SEPARATOR}" "${ver}" "${age}" "${eligible}" "${remaining}"
-              done < "${FAILURES_FILE}"
+              done < "${deduped_failures}"
               printf '\n> Need to merge sooner? Add the **`age-check-bypass`** label — verified-CVE emergencies only.\n'
               printf '\n<sub>Updated by `ops-routines-workflows/age-check-%s` · [run log](%s)</sub>\n' "${ECOSYSTEM}" "${RUN_URL}"
             } > "${body_file}"
+            rm -f "${deduped_failures}"
 
             if [ -n "${existing_id}" ]; then
               if ! gh api -X PATCH "/repos/${REPO}/issues/comments/${existing_id}" \
