@@ -286,9 +286,14 @@ jobs:
           # job step can render the data into a PR comment without re-doing the
           # classification work. No-op when AGE_CHECK_FAILURES_FILE is unset (the
           # common case — local dev, callers that didn't opt into the comment
-          # feature). Format is one row per too-new pin:
+          # feature). Format is one row per failed pin:
           #
-          #   <display_id>\t<display_version>\t<age_days>\t<min_age_days>\t<eligible_date>\t<days_remaining>
+          #   <display_id>\t<display_version>\t<age_days>\t<min_age_days>\t<eligible_date>\t<days_remaining>\t<kind>
+          #
+          # `kind` is `too_new` (this helper) or `unverifiable` (sibling helper
+          # `preflight::record_unverifiable`). The downstream renderer splits on
+          # kind so each failure class gets the right operator guidance:
+          # too-new → "wait until the eligible date"; unverifiable → "re-run".
           #
           # Tabs were chosen over JSON because the consumer (a small bash step in
           # the template) parses with `IFS=$'\t' read` — no jq dependency, and
@@ -319,9 +324,57 @@ jobs:
               days_remaining=$(( min_age_days - age_days ))
             fi
             [ "$days_remaining" -lt 0 ] && days_remaining=0
-            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
               "$display_id" "$display_version" "$age_days" \
               "$min_age_days" "$eligible" "$days_remaining" \
+              "too_new" \
+              >> "$file"
+          }
+
+          # Sibling of `record_failure` for the "couldn't fetch metadata" failure
+          # class — a pin shape-checks fine, but the registry / API / proxy returned
+          # an error or empty body so the script can't compute an age. Without
+          # this, transient upstream failures produce a red required check with
+          # no PR-level explanation: the comment-on-failure step gates on `[ -s
+          # FAILURES_FILE ]`, and the only writer was `record_failure` (too-new
+          # only). The reviewer then has to dig into the run log to discover that
+          # the failure was a 5xx and a re-run will pass.
+          #
+          # Writes the same TSV schema as `record_failure` so the renderer reads
+          # one format. The age / eligible / remaining columns carry sentinels
+          # (`?` / "n/a" / `?`) — the renderer hides those columns for the
+          # unverifiable section since "wait N days" copy doesn't apply. The
+          # `reason` arg is what gets shown to the operator in lieu of the
+          # eligible-after date.
+          #
+          # Args:
+          #   $1 display_id        already sanitized via safe_for_md
+          #   $2 display_version   already sanitized via safe_for_md
+          #   $3 reason            short human-readable cause, e.g.
+          #                        "gh api unreachable or commit not found"
+          #                        — surfaces in the comment so the reviewer
+          #                        knows whether to re-run or open an upstream
+          #                        issue. Tabs are stripped to keep the row
+          #                        parseable.
+          preflight::record_unverifiable() {
+            local file="${AGE_CHECK_FAILURES_FILE:-}"
+            [ -z "$file" ] && return 0
+            local display_id="$1" display_version="$2"
+            local reason="${3:-unknown reason}"
+            # Strip characters that would corrupt the downstream comment:
+            #   - tabs/newlines break `IFS=$'\t' read` (multiline reason would
+            #     produce row count != failure count)
+            #   - `|` breaks the markdown table layout — the reason cell sits
+            #     between two `|` separators in the rendered comment, and an
+            #     embedded `|` would split the row into extra columns. All
+            #     in-tree call sites pass pipe-free strings today; this strip
+            #     defends a future caller forwarding upstream error text (e.g.,
+            #     curl stderr that happens to contain `|`).
+            reason=$(printf '%s' "$reason" | tr -d '\t\n|')
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$display_id" "$display_version" "?" \
+              "n/a" "$reason" "?" \
+              "unverifiable" \
               >> "$file"
           }
 
@@ -741,12 +794,16 @@ jobs:
                 if ! ts=$(actions_age::committer_date "$owner" "$repo" "$ref_part"); then
                   echo "::error file=${file}::Could not verify age for ${owner}/${repo}@${ref_part} (gh api unreachable or commit not found)"
                   echo "| \`${safe_owner_repo}\` | \`${safe_sha_short}\` | — | :x: api unreachable |" >> "$GITHUB_STEP_SUMMARY"
+                  preflight::record_unverifiable "$safe_owner_repo" "$safe_sha_short" \
+                    "gh api unreachable or commit not found"
                   failed=true
                   continue
                 fi
                 if [ -z "$ts" ]; then
                   echo "::error file=${file}::No committer date for ${owner}/${repo}@${ref_part}"
                   echo "| \`${safe_owner_repo}\` | \`${safe_sha_short}\` | — | :x: no committer date |" >> "$GITHUB_STEP_SUMMARY"
+                  preflight::record_unverifiable "$safe_owner_repo" "$safe_sha_short" \
+                    "gh api returned no committer date"
                   failed=true
                   continue
                 fi
@@ -796,12 +853,17 @@ jobs:
           # Embedded into each `age-check-<eco>.yml.tmpl` at the
           # `# @@COMMENT_ON_FAILURE@@` marker by `scripts/embed-lib-into-workflows.py`.
           #
-          # Reads the TSV that `preflight::record_failure` wrote during the main
-          # run step (one row per too-new pin) and renders a single sticky comment
-          # with the per-pin eligible date and days-remaining. Updates an existing
-          # sticky comment when one is found (marker is `<!-- ops-routines:age-check
-          # -comment:${ECOSYSTEM} -->`); deletes the sticky on a clean run so a
-          # stale "X days remaining" doesn't outlive the failure that produced it.
+          # Reads the TSV that `preflight::record_failure` and
+          # `preflight::record_unverifiable` wrote during the main run step (one row
+          # per failed pin) and renders a single sticky comment. Each row carries a
+          # `kind` column — `too_new` or `unverifiable` — so the renderer can split
+          # into two sections with the right operator action: too-new pins get an
+          # eligible-after date and "wait then push any commit"; unverifiable pins
+          # (registry/API outages, missing manifests, etc.) get the upstream reason
+          # and "re-run the failed check." Updates an existing sticky in place
+          # (marker is `<!-- ops-routines:age-check-comment:${ECOSYSTEM} -->`);
+          # deletes the sticky on a clean run so a stale "X days remaining" doesn't
+          # outlive the failure that produced it.
           #
           # Soft-fails on permission denial (typical on Dependabot PRs where the
           # token is read-only) — emits a `::notice` so the run still succeeds and
@@ -834,11 +896,66 @@ jobs:
             # fire N times so each file in the Files Changed tab gets its own
             # inline annotation; this comment is a SUMMARY, not a per-file
             # annotation, so it should list each pin once. `sort -u` works
-            # because age / eligible / remaining are identical for a given
-            # (id, version) within a single run (the script captures
+            # because age / eligible / remaining / kind are identical for a
+            # given (id, version) within a single run (the script captures
             # `now_epoch` once at startup).
             deduped_failures=$(mktemp)
             sort -u "${FAILURES_FILE}" > "${deduped_failures}"
+
+            # Split rows by kind, deduping cross-kind for the same pin. The
+            # legacy assumption was "a pin is either too_new OR unverifiable in a
+            # single run" — true within a single file, but a pin referenced in
+            # two changed files can hit both branches if `gh api` succeeds for
+            # file A and fails for file B (transient mid-run flake). When that
+            # happens the too_new judgment is the durable answer (we have a valid
+            # age from the file where the fetch succeeded); the unverifiable from
+            # the other file is just noise. Without this dedup, a reviewer sees
+            # the same pin in both sections with conflicting actions
+            # ("wait until eligible" AND "re-run the failed check"), which is
+            # confusing and slightly misleading.
+            #
+            # Two-pass awk via the `NR==FNR` trick: pass 1 collects the set of
+            # (id, version) pairs that have a too_new row; pass 2 emits each row
+            # to its kind's output file, skipping an unverifiable row when its
+            # (id, version) is already in the too_new set. Empty `kind` column on
+            # a legacy row defaults to too_new — defensive only; both writers
+            # always set it.
+            #
+            # Wrapped in `if !` so a future regression in the awk script (output
+            # path collision, syntax error, etc.) doesn't trip `set -e` and
+            # silently suppress the comment — the whole point of this feature is
+            # to surface failures at PR review time without forcing the reviewer
+            # to dig into logs. Fallback dumps the deduped data into the too_new
+            # bucket so the reviewer at least sees the failed pins, with a
+            # `::warning` flagging the degraded render.
+            too_new_failures=$(mktemp)
+            unverifiable_failures=$(mktemp)
+            if ! awk -F '\t' '
+              NR == FNR {
+                if (($7 == "" ? "too_new" : $7) == "too_new") {
+                  too_new_pins[$1 "\t" $2] = 1
+                }
+                next
+              }
+              {
+                kind = $7 == "" ? "too_new" : $7
+                if (kind == "too_new") {
+                  print > too_new_out
+                } else if (kind == "unverifiable") {
+                  key = $1 "\t" $2
+                  if (!(key in too_new_pins)) {
+                    print > unverifiable_out
+                  }
+                }
+              }
+            ' too_new_out="${too_new_failures}" \
+              unverifiable_out="${unverifiable_failures}" \
+              "${deduped_failures}" "${deduped_failures}"; then
+              echo "::warning::age-check renderer failed to split rows by kind; falling back to a flat list — some entries may be unverifiable rather than too-new (see the per-pin annotations in this run for the real classification)."
+              cp "${deduped_failures}" "${too_new_failures}"
+              : > "${unverifiable_failures}"
+            fi
+
             # shellcheck disable=SC2016
             # The printf format strings below intentionally contain literal
             # backticks and `%s` placeholders for Markdown rendering — no shell
@@ -846,18 +963,37 @@ jobs:
             {
               printf '%s\n\n' "${MARKER}"
               printf '### Dependency Age Check failed — %s\n\n' "${ECOSYSTEM}"
-              printf 'New pin(s) below have not yet reached the **%s-day** quarantine. Wait until the eligible date, push any new commit, and the check will pass.\n\n' "${MIN_AGE_DAYS}"
-              printf '| %s | Age (days) | Eligible after | Days remaining |\n' "${ITEM_COLUMN}"
-              printf '|---|---:|---|---:|\n'
-              while IFS=$'\t' read -r id ver age _min eligible remaining; do
-                [ -z "${id}" ] && continue
-                printf '| `%s%s%s` | %s | %s | %s |\n' \
-                  "${id}" "${SEPARATOR}" "${ver}" "${age}" "${eligible}" "${remaining}"
-              done < "${deduped_failures}"
-              printf '\n> Need to merge sooner? Add the **`age-check-bypass`** label — verified-CVE emergencies only.\n'
+
+              if [ -s "${too_new_failures}" ]; then
+                printf '#### Pins below quarantine\n\n'
+                printf 'New pin(s) below have not yet reached the **%s-day** quarantine. Wait until the eligible date, push any new commit, and the check will pass.\n\n' "${MIN_AGE_DAYS}"
+                printf '| %s | Age (days) | Eligible after | Days remaining |\n' "${ITEM_COLUMN}"
+                printf '|---|---:|---|---:|\n'
+                while IFS=$'\t' read -r id ver age _min eligible remaining _kind; do
+                  [ -z "${id}" ] && continue
+                  printf '| `%s%s%s` | %s | %s | %s |\n' \
+                    "${id}" "${SEPARATOR}" "${ver}" "${age}" "${eligible}" "${remaining}"
+                done < "${too_new_failures}"
+                printf '\n'
+              fi
+
+              if [ -s "${unverifiable_failures}" ]; then
+                printf '#### Pins that could not be verified\n\n'
+                printf 'Upstream metadata fetch failed for the pin(s) below. This is usually a transient registry/API issue — re-run the failed check from the Actions tab; if it keeps failing, open an issue with the reason text.\n\n'
+                printf '| %s | Reason |\n' "${ITEM_COLUMN}"
+                printf '|---|---|\n'
+                while IFS=$'\t' read -r id ver _age _min reason _remaining _kind; do
+                  [ -z "${id}" ] && continue
+                  printf '| `%s%s%s` | %s |\n' \
+                    "${id}" "${SEPARATOR}" "${ver}" "${reason}"
+                done < "${unverifiable_failures}"
+                printf '\n'
+              fi
+
+              printf '> Need to merge sooner? Add the **`age-check-bypass`** label — verified-CVE emergencies only.\n'
               printf '\n<sub>Updated by `ops-routines-workflows/age-check-%s` · [run log](%s)</sub>\n' "${ECOSYSTEM}" "${RUN_URL}"
             } > "${body_file}"
-            rm -f "${deduped_failures}"
+            rm -f "${deduped_failures}" "${too_new_failures}" "${unverifiable_failures}"
 
             if [ -n "${existing_id}" ]; then
               if ! gh api -X PATCH "/repos/${REPO}/issues/comments/${existing_id}" \
@@ -871,8 +1007,9 @@ jobs:
             fi
             rm -f "${body_file}"
           elif [ -n "${existing_id}" ]; then
-            # No too-new failures this run; clear the stale sticky if one exists
-            # so reviewers don't act on outdated retry-after dates.
+            # No failures this run (neither too-new nor unverifiable); clear the
+            # stale sticky if one exists so reviewers don't act on outdated
+            # retry-after dates or stale upstream-error reasons.
             if ! gh api -X DELETE "/repos/${REPO}/issues/comments/${existing_id}" >/dev/null 2>&1; then
               echo "::notice::Could not delete stale age-check comment (id ${existing_id}). Caller workflow may need \`pull-requests: write\`."
             fi
