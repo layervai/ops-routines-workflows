@@ -34,13 +34,36 @@ jobs:
             const issue = context.payload.issue;
             if (!issue) return;
 
+            // Holding label attached when an issue lands with no valid
+            // priority. It makes the gap filterable in the issue list and
+            // is stripped automatically once a real priority is set (see
+            // the valid-priority branch below), so the issue self-heals.
+            const HOLDING_LABEL = 'needs: priority';
+
+            // Shared API targets so the owner/repo/issue triple isn't
+            // hand-retyped at every label/comment call site. createLabel
+            // is repo-scoped (no issue_number), the rest issue-scoped.
+            const repoRef = { owner: context.repo.owner, repo: context.repo.repo };
+            const issueRef = { ...repoRef, issue_number: issue.number };
+
             const valid = ['critical', 'high', 'medium', 'low'];
             const allLabels = issue.labels.map(l => l.name);
             const priorityLabels = allLabels.filter(n => n.startsWith('priority: '));
             const currentPrio = priorityLabels.map(n => n.slice('priority: '.length));
 
             if (currentPrio.length === 1 && valid.includes(currentPrio[0])) {
-              core.info(`Issue #${issue.number} has priority: ${currentPrio[0]}`);
+              // Priority is defined. If the holding label lingers from an
+              // earlier no-priority state, strip it now (same atomic PUT)
+              // so the issue self-heals back to green without a maintainer.
+              if (allLabels.includes(HOLDING_LABEL)) {
+                await github.rest.issues.setLabels({
+                  ...issueRef,
+                  labels: allLabels.filter(n => n !== HOLDING_LABEL),
+                });
+                core.info(`Cleared ${HOLDING_LABEL}; issue #${issue.number} has priority: ${currentPrio[0]}`);
+              } else {
+                core.info(`Issue #${issue.number} has priority: ${currentPrio[0]}`);
+              }
               return;
             }
 
@@ -49,7 +72,7 @@ jobs:
             // The regex is anchored on the heading so a user typing the
             // word "priority" in a free-text field doesn't drive the
             // auto-label. Unanchored drift in GitHub's form-render
-            // format would cause us to fall through to setFailed — the
+            // format would cause us to fall through to remediation — the
             // invariant test in tests/issue_priority_test.sh pins the
             // expected rendered shape so a silent upstream change shows
             // up as a red test run, not a silently broken workflow.
@@ -59,25 +82,78 @@ jobs:
             if (match) {
               const desired = `priority: ${match[1].toLowerCase()}`;
               // Single PUT that replaces the label set, collapsing
-              // remove-stale + add-desired into one Issues API call.
-              // That's one webhook event instead of two, halving the
-              // self-trigger load on the consumer shim (further guarded
-              // by the Bot sender check above).
-              const nonPrio = allLabels.filter(n => !n.startsWith('priority: '));
+              // remove-stale + add-desired (and dropping any holding
+              // label) into one Issues API call. That's one webhook
+              // event instead of several, halving the self-trigger load
+              // on the consumer shim (further guarded by the Bot sender
+              // check above).
+              const keep = allLabels.filter(n => !n.startsWith('priority: ') && n !== HOLDING_LABEL);
               await github.rest.issues.setLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number,
-                labels: [...nonPrio, desired],
+                ...issueRef,
+                labels: [...keep, desired],
               });
               core.info(`Applied ${desired} from form selection`);
               return;
             }
 
-            // Canary path. Issues don't have required status checks, so
-            // this only puts a red X in the issue's sidebar — it does
-            // not block anything. The actionable signal is for the
-            // issue author or a maintainer to add a priority label.
+            // No valid priority and no parseable form selection — the
+            // out-of-band path (gh issue create / REST API / a stripped
+            // label). GitHub has no pre-create gate for issues, so
+            // creation can't be blocked; instead we make the missing-
+            // priority state loud and self-healing: attach a holding
+            // label so it's filterable, comment ONCE asking the author
+            // to define a real priority, and fail the run so the red X
+            // persists until they do. The form-level `validations:
+            // required` dropdown already covers the web-UI path; this
+            // closes the API/CLI gap. The author must pick a priority —
+            // we deliberately do NOT silently default one (a wrong
+            // default is worse than a loud, unset flag).
+
+            // Apply the holding label + comment only on the transition
+            // INTO the holding state (label not already present), so
+            // re-runs on later edit/label events don't spam duplicate
+            // comments — and createLabel isn't re-attempted on every
+            // re-fire of an already-flagged issue. setLabels is the same
+            // atomic PUT the form path uses — the consumer shim's
+            // concurrency note relies on that atomicity.
+            if (!allLabels.includes(HOLDING_LABEL)) {
+              // Ensure the holding label exists first — consumer repos
+              // don't all pre-define it, and createLabel must precede
+              // setLabels so the intended color/description win (a bare
+              // setLabels would auto-create the label with a default
+              // color). createLabel 422s if it already exists; swallow
+              // only that and surface anything else.
+              try {
+                await github.rest.issues.createLabel({
+                  ...repoRef,
+                  name: HOLDING_LABEL,
+                  color: '0052cc',
+                  description: 'Set exactly one priority: * label to clear this flag.',
+                });
+              } catch (e) {
+                if (e.status !== 422) throw e;
+              }
+              await github.rest.issues.setLabels({
+                ...issueRef,
+                labels: [...allLabels, HOLDING_LABEL],
+              });
+              await github.rest.issues.createComment({
+                ...issueRef,
+                body:
+                  `⚠️ This issue needs **exactly one priority label**. Add ` +
+                  `\`priority: critical\`, \`priority: high\`, \`priority: medium\`, or ` +
+                  `\`priority: low\` — the \`${HOLDING_LABEL}\` flag and this failing ` +
+                  `check clear automatically once you do.\n\n` +
+                  `_Tip: issues opened through the web-UI forms set this ` +
+                  `automatically via the required Priority dropdown; the API/CLI ` +
+                  `path bypasses that, which is why you're seeing this._`,
+              });
+              core.info(`Flagged #${issue.number} with ${HOLDING_LABEL} and commented`);
+            }
+
+            // Fail the run so the red X persists until a real priority is
+            // set. A red X on an issue blocks nothing on its own — the
+            // holding label + comment are what make the gap actionable.
             core.setFailed(
               `Issue #${issue.number} has no valid priority label. ` +
               `Add exactly one of: priority: critical, priority: high, ` +
