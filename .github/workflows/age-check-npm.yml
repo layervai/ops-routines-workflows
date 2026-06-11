@@ -619,9 +619,11 @@ jobs:
           #   1 - at least one dependency is too young or its age can't be verified
           #
           # Known limitations (documented so future maintainers don't re-derive):
-          # - npm aliases (`npm:other-package@version`) and packages nested under
-          #   non-root `node_modules` won't be extracted cleanly; both are uncommon
-          #   in practice given npm v7+'s aggressive hoisting.
+          # - npm aliases (`npm:other-package@version`) won't be extracted
+          #   cleanly; uncommon in practice. Packages nested under a non-root
+          #   `node_modules` (a transitive dep pinned to a different version than
+          #   the hoisted one) ARE handled: the package name is the path segment
+          #   after the LAST `node_modules/`.
           # - Mixed public/private lockfiles: if a lockfile has 1 public package
           #   and 99 private packages, only the 1 public package is age-checked.
           #   The all-skipped-count guard below catches the fully-private case,
@@ -677,7 +679,7 @@ jobs:
                 .packages // {} | to_entries[]
                 | select(.key != "" and (.value.version // null) != null)
                 | select((.value.resolved // "") | startswith("https://"))
-                | (.key | sub("^node_modules/"; "")) + "@" + .value.version' \
+                | (.key | sub("^node_modules/"; "") | split("/node_modules/") | last) + "@" + .value.version' \
                 "$lockfile"
               return
             fi
@@ -710,7 +712,7 @@ jobs:
                 (.packages[$k] // {}) as $p
                 | select(($p.version // null) != null)
                 | select(($p.resolved // "") | startswith("https://"))
-                | ($k | sub("^node_modules/"; "")) + "@" + $p.version' "$lockfile" 2>/dev/null || true
+                | ($k | sub("^node_modules/"; "") | split("/node_modules/") | last) + "@" + $p.version' "$lockfile" 2>/dev/null || true
             done <<< "$added_keys" | sort -u
           }
 
