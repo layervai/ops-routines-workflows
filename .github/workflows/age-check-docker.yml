@@ -699,7 +699,17 @@ jobs:
             printf '%s\n' "$diff_out" \
               | awk '/^\+[^+]/' \
               | sed 's/^\+//' \
-              | awk 'toupper($1) == "FROM" { print $2 }' \
+              | awk 'toupper($1) == "FROM" {
+                  # FROM accepts flags between the keyword and the image ref
+                  # (e.g. `FROM --platform=$BUILDPLATFORM golang:1.x@sha256:... AS builder`,
+                  # the canonical cross-compile pattern). Skip leading --flag tokens
+                  # so the image ref is what gets pin/age-checked; without this the
+                  # flag itself was misread as an unpinned image and the check
+                  # hard-failed on digest-pinned FROM lines (layervai/website#531).
+                  i = 2
+                  while (i <= NF && substr($i, 1, 2) == "--") i++
+                  if (i <= NF) print $i
+                }' \
               | while IFS= read -r spec; do
                   [ -z "$spec" ] && continue
                   case "$spec" in
