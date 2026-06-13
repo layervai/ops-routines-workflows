@@ -902,7 +902,7 @@ jobs:
           MIN_AGE_DAYS: ${{ inputs.min_age_days }}
           FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
           # Per-ecosystem render parameters. Bash body below is identical
-          # across all 5 reusables; only these env values change.
+          # across all reusables; only these env values change.
           ECOSYSTEM: docker
           ITEM_COLUMN: Image
           SEPARATOR: "@"
