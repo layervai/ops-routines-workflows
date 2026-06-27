@@ -1,0 +1,168 @@
+# REUSABLE: CI build-completion Slack notification.
+# Posts a Block Kit "build card" to #build-notifications for the calling
+# repo's CI run. Centralizes the curl/jq payload builder + the
+# per-gate-result aggregation that the qurl-* SDK repos previously
+# copy-pasted (and let drift) into each ci.yml.
+#
+# The caller passes:
+#   - header: the card title, e.g. "qURL Go SDK Build".
+#   - gates:  a JSON object mapping each gate's DISPLAY label to its
+#             job result, e.g.
+#               {"Tests": "success", "Lint": "failure", "Vuln": "success"}
+#             Key order is preserved → it is the field order on the card.
+#             Aggregation (success iff all-success; failure if any
+#             failure; cancelled if any cancelled; else incomplete) lives
+#             here, so adding/removing a gate is a one-line change in the
+#             caller's `gates` object — no aggregation if-chain to edit.
+#   - extra_fields (optional): a JSON object of static label→value fields
+#             appended after the gates, e.g. {"Python": "3.10, 3.12, 3.13"}.
+#
+# Field budget: the card always emits 2 base fields (Branch, Trigger),
+# then one per gate, then one per extra_fields entry. Slack caps a
+# section at 10 fields, so keep gates + extra_fields ≤ 8 combined — past
+# that, Slack rejects the payload (HTTP 400) and the card is dropped
+# (best-effort, so the build stays green). No current consumer is close.
+#
+# Best-effort by design: a missing SLACK_WEBHOOK_URL is a no-op (not a
+# failure), and a failed POST is swallowed. The caller wires whether to
+# run at all (`if:` / `needs:`) since that is repo-specific (e.g. repos
+# with cancel-in-progress use `!cancelled()` instead of `always()`).
+name: CI Slack notification (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      header:
+        description: 'Card title, e.g. "qURL Go SDK Build".'
+        required: true
+        type: string
+      gates:
+        description: >-
+          JSON object mapping gate display-label → job result
+          (success/failure/cancelled/skipped). Key order = card field order.
+        required: true
+        type: string
+      extra_fields:
+        description: >-
+          Optional JSON object of static label→value fields rendered after
+          the gates (e.g. {"Python": "3.10, 3.12, 3.13"}).
+        required: false
+        type: string
+        default: '{}'
+    secrets:
+      SLACK_WEBHOOK_URL:
+        description: >-
+          Slack incoming-webhook URL for #build-notifications. Optional:
+          when unset the job logs and exits 0 (no notification).
+        required: false
+
+# No GitHub token is needed — the job only POSTs to an external webhook.
+permissions: {}
+
+jobs:
+  notify:
+    name: Notify Slack
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Notify Slack
+        # Best-effort: nothing in this notification path may ever red the
+        # build. The originals guaranteed this with a job-level
+        # `continue-on-error: true`, which a reusable-workflow caller job
+        # can't carry — so it lives on the step here. Covers not just a
+        # failed webhook POST (already `|| echo`'d) but any step failure,
+        # e.g. jq exiting non-zero on a malformed `gates` input under the
+        # runner's `set -eo pipefail`.
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          INPUT_HEADER: ${{ inputs.header }}
+          INPUT_GATES: ${{ inputs.gates }}
+          INPUT_EXTRA: ${{ inputs.extra_fields }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          # GitHub context flows through env, never interpolated into the
+          # script body — a crafted branch/actor name with shell
+          # metacharacters can't break out.
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_SHA: ${{ github.sha }}
+          GH_REF_NAME: ${{ github.ref_name }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ -z "$SLACK_WEBHOOK" ]]; then
+            echo "SLACK_WEBHOOK_URL not configured, skipping notification"
+            exit 0
+          fi
+
+          WORKFLOW_URL="${GH_SERVER_URL}/${GH_REPOSITORY}/actions/runs/${GH_RUN_ID}"
+          SHORT_SHA="${GH_SHA:0:7}"
+          COMMIT_URL="${GH_SERVER_URL}/${GH_REPOSITORY}/commit/${GH_SHA}"
+
+          # First line of the commit message via pure parameter expansion
+          # (strip from the first newline on) — immune to the SIGPIPE edge of
+          # `echo "$msg" | head -n1` under the runner's `set -eo pipefail`.
+          COMMIT_FIRST_LINE="${COMMIT_MESSAGE%%$'\n'*}"
+
+          case "$GH_EVENT_NAME" in
+            push)
+              if [[ "$COMMIT_FIRST_LINE" == *"Merge pull request"* ]]; then
+                TRIGGER_TEXT="PR merge"
+              else
+                TRIGGER_TEXT="Push"
+              fi
+              ;;
+            workflow_dispatch) TRIGGER_TEXT="Manual" ;;
+            *) TRIGGER_TEXT="$GH_EVENT_NAME" ;;
+          esac
+
+          # head_commit is absent on workflow_dispatch, leaving COMMIT_MESSAGE
+          # empty — fall back so the card never renders bare backticks.
+          FIRST_LINE="${COMMIT_FIRST_LINE:0:100}"
+          FIRST_LINE="${FIRST_LINE:-(no commit message)}"
+
+          # Everything below — aggregate status, per-gate emoji, and the
+          # whole Block Kit payload — is built by jq from the gates/extra
+          # JSON. This is the single source of the aggregation rules the
+          # consumer ci.yml files used to each re-implement.
+          PAYLOAD=$(jq -n \
+            --arg header "$INPUT_HEADER" \
+            --arg branch "$GH_REF_NAME" \
+            --arg sha "$SHORT_SHA" \
+            --arg trigger "$TRIGGER_TEXT" \
+            --arg actor "$GH_ACTOR" \
+            --arg commit "$FIRST_LINE" \
+            --arg commit_url "$COMMIT_URL" \
+            --arg workflow_url "$WORKFLOW_URL" \
+            --argjson gates "$INPUT_GATES" \
+            --argjson extra "$INPUT_EXTRA" \
+            '
+            def emoji($r): {"success": ":white_check_mark:", "failure": ":x:"}[$r] // ":warning:";
+            ($gates | to_entries) as $g
+            # The length==0 guard must come first: jq `all` is vacuously
+            # true on an empty array, so without it an empty `gates` object
+            # would short-circuit to a green "successful" card for a build
+            # where zero gates ran. Treat no-gates as incomplete instead.
+            | (if   ($g | length == 0)                 then {color: "#ffc107", emoji: ":warning:",         status: "incomplete"}
+               elif ($g | all(.value == "success"))   then {color: "#36a64f", emoji: ":white_check_mark:", status: "successful"}
+               elif ($g | any(.value == "failure"))   then {color: "#dc3545", emoji: ":x:",               status: "failed"}
+               elif ($g | any(.value == "cancelled")) then {color: "#ffc107", emoji: ":warning:",         status: "cancelled"}
+               else                                        {color: "#ffc107", emoji: ":warning:",         status: "incomplete"} end) as $agg
+            | {attachments: [{color: $agg.color, blocks: [
+                {type: "section", text: {type: "mrkdwn", text: ("\($agg.emoji) *\($header)* \($agg.status)")}},
+                {type: "section", fields: (
+                  [ {type: "mrkdwn", text: ("*Branch:*\n`\($branch)` (\($sha))")},
+                    {type: "mrkdwn", text: ("*Trigger:*\n\($trigger) by \($actor)")} ]
+                  + ($g | map({type: "mrkdwn", text: ("*\(.key):*\n\(emoji(.value))")}))
+                  + ($extra | to_entries | map({type: "mrkdwn", text: ("*\(.key):*\n\(.value)")}))
+                )},
+                {type: "section", text: {type: "mrkdwn", text: ("*Commit:* `\($commit)`")}},
+                {type: "context", elements: [
+                  {type: "mrkdwn", text: ("<\($commit_url)|\($sha)>  |  <\($workflow_url)|View workflow>")}
+                ]}
+              ]}]}')
+
+          curl -sfS -X POST "$SLACK_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" || echo "Slack notification failed (non-critical)"
