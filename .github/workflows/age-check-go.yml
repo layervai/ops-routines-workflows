@@ -32,6 +32,37 @@ on:
         type: boolean
         required: false
         default: false
+      private_modules:
+        description: |
+          Optional newline-delimited exact module=owner/repo declarations for
+          private GitHub modules (for example github.com/acme/widget=acme/widget).
+        required: false
+        type: string
+        default: ""
+      private_module_owner:
+        description: "GitHub owner shared by every declared private module repository."
+        required: false
+        type: string
+        default: ""
+      private_module_repositories:
+        description: |
+          Newline-delimited repository names. Must exactly match private_modules;
+          this is passed verbatim to the App token's repository allowlist.
+        required: false
+        type: string
+        default: ""
+      private_module_require_verified_tags:
+        description: "Require GitHub-verified annotated tags for private modules. Defaults false; weaker provenance emits a warning."
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      OPS_ROUTINES_APP_ID:
+        description: "App ID used only when private_modules is non-empty."
+        required: false
+      OPS_ROUTINES_APP_PRIVATE_KEY:
+        description: "App private key used only when private_modules is non-empty."
+        required: false
 
 permissions:
   contents: read
@@ -53,6 +84,76 @@ jobs:
       pull-requests: write
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') }}
     steps:
+      - name: Require private-module configuration
+        if: ${{ inputs.private_modules != '' }}
+        env:
+          APP_ID: ${{ secrets.OPS_ROUTINES_APP_ID }}
+          PRIVATE_KEY: ${{ secrets.OPS_ROUTINES_APP_PRIVATE_KEY }}
+          OWNER: ${{ inputs.private_module_owner }}
+          REPOSITORIES: ${{ inputs.private_module_repositories }}
+        run: |
+          if [ -z "$APP_ID" ] || [ -z "$PRIVATE_KEY" ] || [ -z "$OWNER" ] || [ -z "$REPOSITORIES" ]; then
+            echo "::error::Private Go modules require App credentials, owner, and exact repositories."
+            exit 1
+          fi
+
+      - name: Validate private-module token scope
+        if: ${{ inputs.private_modules != '' }}
+        # Scope-only defense before minting: the authoritative module-path and
+        # provenance validation remains in the inlined age-check-go.sh below.
+        # This compact check is deliberately repeated because the token must
+        # not exist until its scope is proven; tests execute both forms.
+        env:
+          PRIVATE_MODULES: ${{ inputs.private_modules }}
+          OWNER: ${{ inputs.private_module_owner }}
+          REPOSITORIES: ${{ inputs.private_module_repositories }}
+        run: |
+          if [[ ! "$OWNER" =~ ^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]{0,37}[A-Za-z0-9])$ ]] \
+            || [[ "$OWNER" == *--* ]]; then
+            echo "::error::Invalid private-module GitHub owner: $OWNER"
+            exit 1
+          fi
+          declared=""
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+            if [[ "$line" != *=* ]] || [[ "${line#*=}" == *=* ]]; then
+              echo "::error::Malformed private module declaration: $line"
+              exit 1
+            fi
+            repo="${line#*=}"
+            if [[ ! "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]] \
+              || [ "${repo%%/*}" != "$OWNER" ]; then
+              echo "::error::Private module repository is invalid or outside owner $OWNER: $repo"
+              exit 1
+            fi
+            declared+="${repo#*/}"$'\n'
+          done <<< "$PRIVATE_MODULES"
+          supplied=""
+          while IFS= read -r repo || [ -n "$repo" ]; do
+            [ -z "$repo" ] && continue
+            if [[ ! "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]]; then
+              echo "::error::Invalid private-module token repository: $repo"
+              exit 1
+            fi
+            supplied+="$repo"$'\n'
+          done <<< "$REPOSITORIES"
+          if [ -z "$declared" ] || [ "$(printf '%s' "$declared" | sort -u)" != "$(printf '%s' "$supplied" | sort -u)" ] \
+            || [ "$(printf '%s' "$supplied" | sort | uniq -d)" != "" ]; then
+            echo "::error::Private-module token repositories must exactly match the declared repositories"
+            exit 1
+          fi
+
+      - name: Mint exact private-module reader token
+        if: ${{ inputs.private_modules != '' }}
+        id: private_module_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.OPS_ROUTINES_APP_ID }}
+          private-key: ${{ secrets.OPS_ROUTINES_APP_PRIVATE_KEY }}
+          owner: ${{ inputs.private_module_owner }}
+          repositories: ${{ inputs.private_module_repositories }}
+          permission-contents: read
+
       - name: Checkout consumer repo
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -62,6 +163,11 @@ jobs:
         env:
           MIN_AGE_DAYS: ${{ inputs.min_age_days }}
           BASE_REF: ${{ inputs.base_ref != '' && inputs.base_ref || (github.event.pull_request.base.ref || 'main') }}
+          PRIVATE_MODULES: ${{ inputs.private_modules }}
+          PRIVATE_MODULE_OWNER: ${{ inputs.private_module_owner }}
+          PRIVATE_MODULE_REPOSITORIES: ${{ inputs.private_module_repositories }}
+          PRIVATE_MODULE_REQUIRE_VERIFIED_TAGS: ${{ inputs.private_module_require_verified_tags }}
+          GH_TOKEN: ${{ steps.private_module_token.outputs.token }}
           # `record_failure` writes a TSV row here for each too-new module
           # so the post-step below can render the data into a comment
           # without redoing classification. Unset → no-op.
@@ -81,7 +187,7 @@ jobs:
           #   non-numeric)
           # - GNU `date -d` availability probe (catches BSD/macOS silently
           #   replacing GNU date)
-          # - Required-tool existence checks (jq, curl, gh)
+          # - Required-tool existence checks (caller supplies its exact tool list)
           # - Explicit base_ref verification before `git diff` so a missing ref
           #   doesn't get conflated with "no changes detected" by a trailing
           #   `|| true` on the filter pipeline
@@ -92,7 +198,7 @@ jobs:
           #
           # REQUIRED CALL ORDER in main():
           #
-          #   preflight::require_tools jq curl [gh …]   # tools first
+          #   preflight::require_tools <tool> [...]      # tools first
           #   preflight::require_gnu_date                # then date-d probe
           #   preflight::validate_min_age_days           # then env validation
           #   preflight::verify_base_ref "origin/${BASE_REF}"  # MUST come before any
@@ -397,8 +503,8 @@ jobs:
           #   $4 now_epoch         caller's pre-computed `date +%s`
           #   $5 min_age_days      positive integer (caller already validated)
           #   $6 verb              past-tense verb for too-new error messages
-          #                        ("published" | "committed" | "built" |
-          #                        "uploaded"). Defaults to "published".
+          #                        ("published" | "committed" | "tagged" |
+          #                        "built" | "uploaded"). Defaults to "published".
           #   $7 file_hint         optional source filename for `file=` annotation
           #   $8 separator         how to join id + version in log lines. Default
           #                        "@"; pip uses "==".
@@ -609,6 +715,11 @@ jobs:
           # Expected env vars:
           #   MIN_AGE_DAYS - default 7
           #   BASE_REF     - default 'main'
+          #   PRIVATE_MODULES - optional newline-delimited exact module=owner/repo pairs
+          #   PRIVATE_MODULE_OWNER - GitHub owner for every declared private repository
+          #   PRIVATE_MODULE_REPOSITORIES - newline-delimited exact repository names
+          #   GH_TOKEN - App installation token; required only when PRIVATE_MODULES is set
+          #   PRIVATE_MODULE_REQUIRE_VERIFIED_TAGS - true requires a verified annotated tag
           #
           # Exit codes:
           #   0 - all newly-added module versions are >= MIN_AGE_DAYS old
@@ -621,6 +732,10 @@ jobs:
 
           MIN_AGE_DAYS="${MIN_AGE_DAYS:-7}"
           BASE_REF="${BASE_REF:-main}"
+          PRIVATE_MODULES="${PRIVATE_MODULES:-}"
+          PRIVATE_MODULE_OWNER="${PRIVATE_MODULE_OWNER:-}"
+          PRIVATE_MODULE_REPOSITORIES="${PRIVATE_MODULE_REPOSITORIES:-}"
+          PRIVATE_MODULE_REQUIRE_VERIFIED_TAGS="${PRIVATE_MODULE_REQUIRE_VERIFIED_TAGS:-false}"
 
 
           # ----- Separable: find changed go.sum files ---------------------------------
@@ -679,12 +794,217 @@ jobs:
             echo "$response" | jq -r '.Time // empty'
           }
 
+          # ----- Separable: exact private-module declaration + GitHub provenance -----
+
+          # Private modules never appear on proxy.golang.org, so their age must be
+          # established from an authenticated, exact GitHub tag lookup. Keep this path
+          # explicit and opt-in: an undeclared module always follows the existing public
+          # proxy behavior, and a malformed declaration fails before any API request.
+          go_age::validate_private_config() {
+            if [ "$PRIVATE_MODULE_REQUIRE_VERIFIED_TAGS" != "true" ] && [ "$PRIVATE_MODULE_REQUIRE_VERIFIED_TAGS" != "false" ]; then
+              echo "::error::PRIVATE_MODULE_REQUIRE_VERIFIED_TAGS must be true or false" >&2
+              return 1
+            fi
+            if [ -z "$PRIVATE_MODULES" ]; then
+              if [ -n "$PRIVATE_MODULE_OWNER" ] || [ -n "$PRIVATE_MODULE_REPOSITORIES" ] || [ "$PRIVATE_MODULE_REQUIRE_VERIFIED_TAGS" = "true" ]; then
+                echo "::error::Private-module owner, repository scope, and verified-tag policy all require PRIVATE_MODULES declarations" >&2
+                return 1
+              fi
+              return 0
+            fi
+
+            if [ -z "$PRIVATE_MODULE_OWNER" ] || [ -z "$PRIVATE_MODULE_REPOSITORIES" ] || [ -z "${GH_TOKEN:-}" ]; then
+              echo "::error::PRIVATE_MODULES requires PRIVATE_MODULE_OWNER, PRIVATE_MODULE_REPOSITORIES, and GH_TOKEN" >&2
+              return 1
+            fi
+            if [[ ! "$PRIVATE_MODULE_OWNER" =~ ^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]{0,37}[A-Za-z0-9])$ ]] \
+              || [[ "$PRIVATE_MODULE_OWNER" == *--* ]]; then
+              echo "::error::Invalid PRIVATE_MODULE_OWNER: ${PRIVATE_MODULE_OWNER}" >&2
+              return 1
+            fi
+
+            local line module repo repo_owner repo_name
+            local declared_modules=$'\n' declared_repositories=""
+            while IFS= read -r line || [ -n "$line" ]; do
+              [ -z "$line" ] && continue
+              if [[ "$line" != *=* ]] || [[ "${line#*=}" == *=* ]]; then
+                echo "::error::Malformed PRIVATE_MODULES entry (expected module=owner/repo): ${line}" >&2
+                return 1
+              fi
+              module="${line%%=*}"
+              repo="${line#*=}"
+              if [[ ! "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]]; then
+                echo "::error::Invalid private GitHub repository: ${repo}" >&2
+                return 1
+              fi
+              local repo_module="github.com/${repo}" module_suffix
+              if [ "$module" != "$repo_module" ]; then
+                module_suffix="${module#"$repo_module"}"
+                if [ "$module_suffix" = "$module" ] || [[ ! "$module_suffix" =~ ^/v([2-9]|[1-9][0-9]+)$ ]]; then
+                  echo "::error::Private module/repository mismatch: ${module} must equal ${repo_module} or its /vN major-version path" >&2
+                  return 1
+                fi
+              fi
+              repo_owner="${repo%%/*}"
+              repo_name="${repo#*/}"
+              if [ "$repo_owner" != "$PRIVATE_MODULE_OWNER" ]; then
+                echo "::error::Private repository ${repo} is outside owner ${PRIVATE_MODULE_OWNER}" >&2
+                return 1
+              fi
+              if [[ "$declared_modules" == *$'\n'"${module}"$'\n'* ]]; then
+                echo "::error::Duplicate PRIVATE_MODULES entry: ${module}" >&2
+                return 1
+              fi
+              declared_modules+="${module}"$'\n'
+              declared_repositories+="${repo_name}"$'\n'
+            done <<< "$PRIVATE_MODULES"
+
+            if [ "$declared_modules" = $'\n' ]; then
+              echo "::error::PRIVATE_MODULES contains no declarations" >&2
+              return 1
+            fi
+
+            local supplied_repositories="" seen_repositories=$'\n'
+            while IFS= read -r repo_name || [ -n "$repo_name" ]; do
+              [ -z "$repo_name" ] && continue
+              if [[ ! "$repo_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]]; then
+                echo "::error::Invalid PRIVATE_MODULE_REPOSITORIES entry: ${repo_name}" >&2
+                return 1
+              fi
+              if [[ "$seen_repositories" == *$'\n'"${repo_name}"$'\n'* ]]; then
+                echo "::error::Duplicate PRIVATE_MODULE_REPOSITORIES entry: ${repo_name}" >&2
+                return 1
+              fi
+              seen_repositories+="${repo_name}"$'\n'
+              supplied_repositories+="${repo_name}"$'\n'
+            done <<< "$PRIVATE_MODULE_REPOSITORIES"
+
+            local declared_sorted supplied_sorted
+            declared_sorted=$(printf '%s' "$declared_repositories" | sort -u)
+            supplied_sorted=$(printf '%s' "$supplied_repositories" | sort -u)
+            if [ "$declared_sorted" != "$supplied_sorted" ]; then
+              echo "::error::PRIVATE_MODULE_REPOSITORIES must exactly match repositories declared by PRIVATE_MODULES" >&2
+              return 1
+            fi
+          }
+
+          go_age::private_signature_allowed() {
+            local tag_kind="$1" verification="$2"
+            if [ "$PRIVATE_MODULE_REQUIRE_VERIFIED_TAGS" != "true" ]; then
+              return 0
+            fi
+            [ "$tag_kind" = "annotated" ] && [ "$verification" = "verified" ]
+          }
+
+          go_age::private_repo_for() {
+            local wanted_module="$1" line
+            while IFS= read -r line || [ -n "$line" ]; do
+              [ -z "$line" ] && continue
+              if [ "${line%%=*}" = "$wanted_module" ]; then
+                printf '%s\n' "${line#*=}"
+                return 0
+              fi
+            done <<< "$PRIVATE_MODULES"
+            return 1
+          }
+
+          go_age::github_json() {
+            local path="$1"
+            # Retry only transient transport/HTTP failures. curl's default retry class
+            # excludes definitive 4xx responses such as a missing tag, so provenance
+            # errors still fail immediately and closed. GitHub 403 responses also fail
+            # immediately: they may be authorization failures, not safe retry signals.
+            curl -fsS -m 10 --retry 2 --retry-delay 1 --retry-max-time 25 --retry-connrefused \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL:-https://api.github.com}${path}"
+          }
+
+          # Emit one tab-separated provenance row:
+          #   timestamp  tag-kind  tag-object-sha  target-commit-sha  verification
+          # Annotated tags carry their own tagger timestamp. Lightweight tags do not
+          # record a creation timestamp, so the immutable target commit's committer time
+          # is the only Git-native age signal available; the provenance row makes that
+          # distinction explicit in the hosted log. Unlike proxy.golang.org's
+          # server-observed first-seen time, both private timestamps are author-selected
+          # metadata and can be backdated. Verified-tag policy authenticates the signer,
+          # not the timestamp; this path is therefore only a quarantine aid for trusted
+          # internal producers, not an equivalent public transparency guarantee.
+          go_age::private_tag_metadata() {
+            local repo="$1" version="$2"
+            # Go adds +incompatible to v2+ module versions that retain a v1-style module
+            # path, but the repository tag itself omits that Go-only suffix.
+            local tag_version="${version%+incompatible}"
+            if [[ ! "$tag_version" =~ ^v[0-9A-Za-z.-]{1,127}$ ]]; then
+              echo "Invalid private module tag: ${version}" >&2
+              return 1
+            fi
+
+            local ref_json ref_name object_type object_sha
+            if ! ref_json=$(go_age::github_json "/repos/${repo}/git/ref/tags/${tag_version}"); then
+              echo "Exact private tag ${repo}@${version} is missing or inaccessible" >&2
+              return 1
+            fi
+            IFS=$'\t' read -r ref_name object_type object_sha <<< "$(printf '%s' "$ref_json" \
+              | jq -r '[.ref, .object.type, .object.sha] | map(. // "") | @tsv')"
+            if [ "$ref_name" != "refs/tags/${tag_version}" ]; then
+              echo "Private tag ${repo}@${version} returned a mismatched ref name" >&2
+              return 1
+            fi
+            if [[ ! "$object_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Private tag ${repo}@${version} returned an invalid object SHA" >&2
+              return 1
+            fi
+
+            case "$object_type" in
+              tag)
+                local tag_json tag_name target_type target_sha tagger_date verification
+                if ! tag_json=$(go_age::github_json "/repos/${repo}/git/tags/${object_sha}"); then
+                  echo "Annotated tag object ${repo}@${object_sha} is inaccessible" >&2
+                  return 1
+                fi
+                IFS=$'\t' read -r tag_name target_type target_sha tagger_date verification <<< "$(printf '%s' "$tag_json" \
+                  | jq -r '[.tag, .object.type, .object.sha, .tagger.date,
+                    (if .verification.verified == true then "verified" else ("unverified:" + (.verification.reason // "unknown")) end)]
+                    | map(. // "") | @tsv')"
+                if [ "$tag_name" != "$tag_version" ] || [ "$target_type" != "commit" ] \
+                  || [[ ! "$target_sha" =~ ^[0-9a-f]{40}$ ]] || [ -z "$tagger_date" ]; then
+                  echo "Annotated tag provenance mismatch for ${repo}@${version}" >&2
+                  return 1
+                fi
+                printf '%s\tannotated\t%s\t%s\t%s\n' \
+                  "$tagger_date" "$object_sha" "$target_sha" "$verification"
+                ;;
+              commit)
+                local commit_json commit_sha commit_date
+                if ! commit_json=$(go_age::github_json "/repos/${repo}/commits/${object_sha}"); then
+                  echo "Lightweight tag target ${repo}@${object_sha} is inaccessible" >&2
+                  return 1
+                fi
+                IFS=$'\t' read -r commit_sha commit_date <<< "$(printf '%s' "$commit_json" \
+                  | jq -r '[.sha, .commit.committer.date] | map(. // "") | @tsv')"
+                if [ "$commit_sha" != "$object_sha" ] || [ -z "$commit_date" ]; then
+                  echo "Lightweight tag provenance mismatch for ${repo}@${version}" >&2
+                  return 1
+                fi
+                printf '%s\tlightweight\t%s\t%s\tunavailable\n' \
+                  "$commit_date" "$object_sha" "$commit_sha"
+                ;;
+              *)
+                echo "Unsupported private tag target type for ${repo}@${version}: ${object_type:-empty}" >&2
+                return 1
+                ;;
+            esac
+          }
+
           # ----- Main -----------------------------------------------------------------
 
           go_age::main() {
             preflight::require_tools curl jq awk sed grep sort
             preflight::require_gnu_date
             preflight::validate_min_age_days
+            go_age::validate_private_config || exit 1
 
             local base_ref="origin/${BASE_REF}"
             preflight::verify_base_ref "$base_ref"
@@ -742,31 +1062,61 @@ jobs:
                 local safe_module; safe_module=$(preflight::safe_for_md "$module")
                 local safe_version; safe_version=$(preflight::safe_for_md "$version")
 
-                local publish_time
-                if ! publish_time=$(go_age::published_at "$module" "$version"); then
-                  echo "::error file=${sum_file}::Could not verify age for ${module}@${version} (proxy.golang.org unreachable or module not found)"
-                  echo "| \`${safe_module}\` | ${safe_version} | — | :x: proxy unreachable |" >> "$GITHUB_STEP_SUMMARY"
-                  preflight::record_unverifiable "$safe_module" "$safe_version" \
-                    "proxy.golang.org unreachable or module not found"
-                  failed=true
-                  continue
+                local publish_time age_verb="published" private_repo metadata
+                if private_repo=$(go_age::private_repo_for "$module"); then
+                  if ! metadata=$(go_age::private_tag_metadata "$private_repo" "$version"); then
+                    echo "::error file=${sum_file}::Could not verify private tag provenance for ${module}@${version}"
+                    echo "| \`${safe_module}\` | ${safe_version} | — | :x: private tag unverifiable |" >> "$GITHUB_STEP_SUMMARY"
+                    preflight::record_unverifiable "$safe_module" "$safe_version" \
+                      "private GitHub tag missing or provenance mismatch"
+                    failed=true
+                    continue
+                  fi
+                  local tag_kind tag_object_sha target_commit_sha verification
+                  IFS=$'\t' read -r publish_time tag_kind tag_object_sha target_commit_sha verification <<< "$metadata"
+                  if ! go_age::private_signature_allowed "$tag_kind" "$verification"; then
+                    echo "::error file=${sum_file}::Private module ${module}@${version} requires a GitHub-verified annotated tag"
+                    echo "| \`${safe_module}\` | ${safe_version} | — | :x: signed tag required |" >> "$GITHUB_STEP_SUMMARY"
+                    preflight::record_unverifiable "$safe_module" "$safe_version" \
+                      "GitHub-verified annotated tag required"
+                    failed=true
+                    continue
+                  fi
+                  if [ "$tag_kind" != "annotated" ] || [ "$verification" != "verified" ]; then
+                    echo "::warning file=${sum_file}::Private module ${module}@${version} uses ${tag_kind} provenance (${verification}); its author-selected timestamp is not signature-authenticated"
+                  fi
+                  echo "  PRIVATE: ${module}@${version} ${tag_kind} tag=${tag_object_sha} commit=${target_commit_sha} signature=${verification}"
+                  if [ "$tag_kind" = "lightweight" ]; then
+                    age_verb="committed"
+                  else
+                    age_verb="tagged"
+                  fi
+                else
+                  if ! publish_time=$(go_age::published_at "$module" "$version"); then
+                    echo "::error file=${sum_file}::Could not verify age for ${module}@${version} (proxy.golang.org unreachable or module not found)"
+                    echo "| \`${safe_module}\` | ${safe_version} | — | :x: proxy unreachable |" >> "$GITHUB_STEP_SUMMARY"
+                    preflight::record_unverifiable "$safe_module" "$safe_version" \
+                      "proxy.golang.org unreachable or module not found"
+                    failed=true
+                    continue
+                  fi
                 fi
 
                 if [ -z "$publish_time" ]; then
-                  echo "::error file=${sum_file}::proxy.golang.org returned no publish time for ${module}@${version}"
+                  echo "::error file=${sum_file}::No provenance timestamp returned for ${module}@${version}"
                   echo "| \`${safe_module}\` | ${safe_version} | — | :x: no publish time |" >> "$GITHUB_STEP_SUMMARY"
                   preflight::record_unverifiable "$safe_module" "$safe_version" \
-                    "proxy.golang.org returned no publish time"
+                    "no provenance timestamp returned"
                   failed=true
                   continue
                 fi
 
                 # Classify + emit via shared helper. _and_tally updates counters
-                # via dynamic scoping. Verb is "published" (Go modules are
-                # published to proxy.golang.org with release tags).
+                # via dynamic scoping. The verb reflects the provenance source:
+                # published (public proxy), tagged (annotated), or committed (lightweight).
                 preflight::age_row_and_tally \
                   "$safe_module" "$safe_version" "$publish_time" "$now_epoch" "$MIN_AGE_DAYS" \
-                  "published" "$sum_file" "@"
+                  "$age_verb" "$sum_file" "@"
               done <<< "$new_deps"
 
               echo "::endgroup::"
@@ -780,6 +1130,8 @@ jobs:
               exit 1
             fi
 
+            # Go's only skip class is a deliberate pseudo-version commit pin. Outages
+            # record an unverifiable failure, so an all-skipped guard is not appropriate.
             preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS" "$skipped_count"
             echo "All Go dependencies are at least ${MIN_AGE_DAYS} days old"
           }

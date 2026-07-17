@@ -97,7 +97,7 @@ jobs:
           #   non-numeric)
           # - GNU `date -d` availability probe (catches BSD/macOS silently
           #   replacing GNU date)
-          # - Required-tool existence checks (jq, curl, gh)
+          # - Required-tool existence checks (caller supplies its exact tool list)
           # - Explicit base_ref verification before `git diff` so a missing ref
           #   doesn't get conflated with "no changes detected" by a trailing
           #   `|| true` on the filter pipeline
@@ -108,7 +108,7 @@ jobs:
           #
           # REQUIRED CALL ORDER in main():
           #
-          #   preflight::require_tools jq curl [gh …]   # tools first
+          #   preflight::require_tools <tool> [...]      # tools first
           #   preflight::require_gnu_date                # then date-d probe
           #   preflight::validate_min_age_days           # then env validation
           #   preflight::verify_base_ref "origin/${BASE_REF}"  # MUST come before any
@@ -413,8 +413,8 @@ jobs:
           #   $4 now_epoch         caller's pre-computed `date +%s`
           #   $5 min_age_days      positive integer (caller already validated)
           #   $6 verb              past-tense verb for too-new error messages
-          #                        ("published" | "committed" | "built" |
-          #                        "uploaded"). Defaults to "published".
+          #                        ("published" | "committed" | "tagged" |
+          #                        "built" | "uploaded"). Defaults to "published".
           #   $7 file_hint         optional source filename for `file=` annotation
           #   $8 separator         how to join id + version in log lines. Default
           #                        "@"; pip uses "==".
