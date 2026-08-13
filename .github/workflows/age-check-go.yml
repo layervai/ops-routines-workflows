@@ -22,6 +22,20 @@ on:
         required: false
         type: string
         default: ""
+      exempt_module_prefixes:
+        description: |
+          Optional comma- or newline-separated first-party module exemptions.
+          Each entry must either end with "/" (a segment-safe module-path
+          prefix: github.com/layervai/ matches github.com/layervai/frp but
+          never github.com/layervai-evil/frp) or name one full module path to
+          match exactly. Matching pins skip age enforcement and are reported
+          in the log as "exempt (first-party): <module>@<version>"; malformed
+          entries fail the check loudly. Prefer this over the age-check-bypass
+          label for first-party pins — the label skips the ENTIRE check for
+          every dependency in the PR.
+        required: false
+        type: string
+        default: ""
       comment_on_failure:
         description: |
           Post a sticky PR comment listing modules that failed the age
@@ -163,6 +177,7 @@ jobs:
         env:
           MIN_AGE_DAYS: ${{ inputs.min_age_days }}
           BASE_REF: ${{ inputs.base_ref != '' && inputs.base_ref || (github.event.pull_request.base.ref || 'main') }}
+          EXEMPT_MODULE_PREFIXES: ${{ inputs.exempt_module_prefixes }}
           PRIVATE_MODULES: ${{ inputs.private_modules }}
           PRIVATE_MODULE_OWNER: ${{ inputs.private_module_owner }}
           PRIVATE_MODULE_REPOSITORIES: ${{ inputs.private_module_repositories }}
@@ -715,6 +730,9 @@ jobs:
           # Expected env vars:
           #   MIN_AGE_DAYS - default 7
           #   BASE_REF     - default 'main'
+          #   EXEMPT_MODULE_PREFIXES - optional comma- or newline-separated first-party
+          #                  exemptions; each entry ends with "/" (segment-safe module
+          #                  path prefix) or names one full module path exactly
           #   PRIVATE_MODULES - optional newline-delimited exact module=owner/repo pairs
           #   PRIVATE_MODULE_OWNER - GitHub owner for every declared private repository
           #   PRIVATE_MODULE_REPOSITORIES - newline-delimited exact repository names
@@ -732,6 +750,7 @@ jobs:
 
           MIN_AGE_DAYS="${MIN_AGE_DAYS:-7}"
           BASE_REF="${BASE_REF:-main}"
+          EXEMPT_MODULE_PREFIXES="${EXEMPT_MODULE_PREFIXES:-}"
           PRIVATE_MODULES="${PRIVATE_MODULES:-}"
           PRIVATE_MODULE_OWNER="${PRIVATE_MODULE_OWNER:-}"
           PRIVATE_MODULE_REPOSITORIES="${PRIVATE_MODULE_REPOSITORIES:-}"
@@ -998,6 +1017,113 @@ jobs:
             esac
           }
 
+          # ----- Separable: first-party module exemption ------------------------------
+
+          # First-party modules (e.g. github.com/layervai/*) gain nothing from the
+          # release-age cooldown: the org publishes them itself, usually minutes
+          # before pinning. EXEMPT_MODULE_PREFIXES lets a caller skip age enforcement
+          # for exactly those module paths — unlike the age-check-bypass PR label,
+          # which skips the ENTIRE check for every dependency in the labeled PR.
+          #
+          # Matching rule (segment-safe by construction):
+          #   - An entry ending in "/" matches any module path that starts with it.
+          #     Because the entry itself terminates at a path-segment boundary,
+          #     "github.com/layervai/" can never match "github.com/layervai-evil/x".
+          #   - An entry not ending in "/" matches the full module path exactly.
+          # Exempt pins are reported in the log ("exempt (first-party): ...") and
+          # counted in the skipped tally — visible skips, never silent ones.
+
+          # Emit one normalized exemption entry per line: split on commas and
+          # newlines, trim surrounding whitespace, drop blank fields. Blank fields
+          # are tolerated (a YAML block scalar always ends with a newline, and a
+          # trailing comma is harmless); an input that yields NO entries at all is
+          # rejected by the validator below.
+          go_age::exempt_entries() {
+            printf '%s\n' "$EXEMPT_MODULE_PREFIXES" \
+              | tr ',' '\n' \
+              | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+              | grep -v '^$' || true
+          }
+
+          go_age::validate_exempt_config() {
+            if [ -z "$EXEMPT_MODULE_PREFIXES" ]; then
+              return 0
+            fi
+
+            local entries; entries=$(go_age::exempt_entries)
+            if [ -z "$entries" ]; then
+              echo "::error::EXEMPT_MODULE_PREFIXES is set but contains no entries" >&2
+              return 1
+            fi
+
+            local entry first_element seen=$'\n'
+            while IFS= read -r entry; do
+              [ -z "$entry" ] && continue
+              # Go module paths are ASCII letters/digits plus `-._~/`. Anything
+              # else (globs, spaces, `=`) is a config mistake — fail loudly rather
+              # than let an entry silently never match.
+              if [[ ! "$entry" =~ ^[A-Za-z0-9._~/-]+$ ]]; then
+                echo "::error::Malformed EXEMPT_MODULE_PREFIXES entry (allowed: letters, digits, '.', '_', '~', '/', '-'; globs are not supported): ${entry}" >&2
+                return 1
+              fi
+              if [[ "$entry" == /* ]] || [[ "$entry" == *//* ]]; then
+                echo "::error::Malformed EXEMPT_MODULE_PREFIXES entry (leading slash or empty path segment): ${entry}" >&2
+                return 1
+              fi
+              # Module paths start with a domain-style element (github.com, k8s.io).
+              # An entry like "layervai/" is almost certainly a forgotten host and
+              # would otherwise never match anything, silently.
+              first_element="${entry%%/*}"
+              if [[ "$first_element" != *.* ]]; then
+                echo "::error::EXEMPT_MODULE_PREFIXES entry must start with a domain-style path element (e.g. github.com/layervai/): ${entry}" >&2
+                return 1
+              fi
+              # A host-only prefix ("github.com/") would exempt EVERY module on that
+              # host — a silent broad bypass that defeats per-module exemption. A
+              # prefix entry must scope to at least an org/owner segment under the
+              # host. (Exact-match entries with one segment stay legal: gopkg.in/yaml.v3
+              # is a real module path.)
+              if [[ "$entry" == */ ]]; then
+                local segment_body="${entry%/}"
+                if [[ "$segment_body" != */* ]]; then
+                  echo "::error::EXEMPT_MODULE_PREFIXES prefix entry exempts an entire host; scope it to an org (e.g. github.com/layervai/): ${entry}" >&2
+                  return 1
+                fi
+              fi
+              if [[ "$seen" == *$'\n'"${entry}"$'\n'* ]]; then
+                echo "::error::Duplicate EXEMPT_MODULE_PREFIXES entry: ${entry}" >&2
+                return 1
+              fi
+              seen+="${entry}"$'\n'
+            done <<< "$entries"
+          }
+
+          go_age::module_is_exempt() {
+            local module="$1"
+            if [ -z "$EXEMPT_MODULE_PREFIXES" ]; then
+              return 1
+            fi
+            # Normalize the entry list once per run, not once per dependency.
+            if [ -z "${GO_AGE_EXEMPT_ENTRIES_CACHED+x}" ]; then
+              GO_AGE_EXEMPT_ENTRIES_CACHED=$(go_age::exempt_entries)
+            fi
+            local entries entry
+            entries="$GO_AGE_EXEMPT_ENTRIES_CACHED"
+            while IFS= read -r entry; do
+              [ -z "$entry" ] && continue
+              if [[ "$entry" == */ ]]; then
+                # Segment-safe: the entry ends at a path-segment boundary, so a
+                # prefix match implies the module lives strictly under it.
+                if [[ "$module" == "$entry"* ]]; then
+                  return 0
+                fi
+              elif [ "$module" = "$entry" ]; then
+                return 0
+              fi
+            done <<< "$entries"
+            return 1
+          }
+
           # ----- Main -----------------------------------------------------------------
 
           go_age::main() {
@@ -1005,6 +1131,7 @@ jobs:
             preflight::require_gnu_date
             preflight::validate_min_age_days
             go_age::validate_private_config || exit 1
+            go_age::validate_exempt_config || exit 1
 
             local base_ref="origin/${BASE_REF}"
             preflight::verify_base_ref "$base_ref"
@@ -1053,6 +1180,17 @@ jobs:
                 # also skipped.
                 if [[ "$version" =~ [-.][0-9]{14}-[0-9a-f]{12}$ ]]; then
                   echo "  SKIP: ${module}@${version} (pseudo-version)"
+                  skipped_count=$((skipped_count + 1))
+                  continue
+                fi
+
+                # First-party exemption: the caller's own org publishes these
+                # modules, so the release-age cooldown proves nothing for them.
+                # Reported and tallied — a visible skip, never a silent one. This
+                # takes precedence over private-module routing: an exempt module
+                # needs no provenance lookup at all.
+                if go_age::module_is_exempt "$module"; then
+                  echo "  exempt (first-party): ${module}@${version}"
                   skipped_count=$((skipped_count + 1))
                   continue
                 fi
@@ -1130,8 +1268,9 @@ jobs:
               exit 1
             fi
 
-            # Go's only skip class is a deliberate pseudo-version commit pin. Outages
-            # record an unverifiable failure, so an all-skipped guard is not appropriate.
+            # Go's skip classes are both deliberate: pseudo-version commit pins and
+            # declared first-party exemptions. Outages record an unverifiable
+            # failure, so an all-skipped guard is not appropriate.
             preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS" "$skipped_count"
             echo "All Go dependencies are at least ${MIN_AGE_DAYS} days old"
           }
