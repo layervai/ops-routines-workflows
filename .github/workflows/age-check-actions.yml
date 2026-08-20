@@ -68,6 +68,10 @@ jobs:
           # releases here don't self-block. Override via env to tighten
           # or widen the list.
           AGE_CHECK_SKIP_SELF_REFS: "layervai/ops-routines layervai/ops-routines-workflows"
+          # Binds the self-reference rollout seam to the caller's organization.
+          # The checker still requires the exact pin to be a verified commit on
+          # the exact repository's protected default branch.
+          ACTIONS_AGE_TRUSTED_OWNER: ${{ github.repository_owner }}
           # `record_failure` writes a TSV row here for each too-new pin
           # so the post-step below can render the data into a comment
           # without redoing classification. Unset → no-op.
@@ -613,6 +617,10 @@ jobs:
           #   MIN_AGE_DAYS - default 7
           #   BASE_REF     - default 'main'
           #   GH_TOKEN     - required for gh api commit lookups
+          #   ACTIONS_AGE_TRUSTED_OWNER - caller repository owner; self-reference pins
+          #                  may skip age only inside this owner and after provenance
+          #   AGE_CHECK_SKIP_SELF_REFS - trusted reusable repositories whose exact pins
+          #                  receive the provenance-gated self-reference treatment
           #
           # Exit codes:
           #   0 - all newly-added uses: refs are SHA-pinned and >= MIN_AGE_DAYS old
@@ -625,6 +633,7 @@ jobs:
 
           MIN_AGE_DAYS="${MIN_AGE_DAYS:-7}"
           BASE_REF="${BASE_REF:-main}"
+          ACTIONS_AGE_TRUSTED_OWNER="${ACTIONS_AGE_TRUSTED_OWNER:-}"
 
 
           # ----- Input validation: owner/repo slug ------------------------------------
@@ -641,7 +650,18 @@ jobs:
             # Length cap: owner max 39 + "/" + repo max 100 + subpath reasonable
             # upper bound. 255 accommodates deep monorepo paths.
             [ ${#slug} -le 255 ] || return 1
-            [[ "$slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]
+            [[ "$slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || return 1
+
+            # The character-class check above is intentionally permissive for real action
+            # subpaths (including dotfiles), but path structure is security-sensitive:
+            # owner/repo is parsed before the trusted self-reference decision. Reject
+            # empty, `.` and `..` segments so a crafted path cannot inherit trust from its
+            # first two segments while resolving somewhere else. A trailing slash is an
+            # empty final segment and is rejected explicitly for a clearer invariant.
+            [[ "$slug" != */ ]] || return 1
+            [[ "$slug" != *//* ]] || return 1
+            [[ "$slug" != */./* && "$slug" != */. ]] || return 1
+            [[ "$slug" != */../* && "$slug" != */.. ]] || return 1
           }
 
           # ----- Separable: find changed action/workflow files ------------------------
@@ -689,6 +709,64 @@ jobs:
             fi
           }
 
+          actions_age::github_tsv() {
+            local path="$1" filter="$2"
+            gh api "$path" --jq "$filter" 2>/dev/null
+          }
+
+          # A reusable workflow cannot quarantine its own fresh release without creating
+          # a rollout deadlock. The narrow self-reference seam therefore skips commit age
+          # only after proving that the exact pinned SHA is a GitHub-verified commit on
+          # the exact same-owner repository's protected default branch. Emit the default
+          # branch name on success; any missing/mismatched evidence fails closed.
+          actions_age::trusted_self_ref_provenance() {
+            local owner="$1" repo="$2" sha="$3"
+            if [ -z "$ACTIONS_AGE_TRUSTED_OWNER" ] || [ "$owner" != "$ACTIONS_AGE_TRUSTED_OWNER" ]; then
+              echo "Self-reference repository is outside the caller's trusted owner: ${owner}/${repo}" >&2
+              return 1
+            fi
+
+            local repo_fields full_name repo_owner default_branch
+            repo_fields=$(actions_age::github_tsv "/repos/${owner}/${repo}" \
+              '[.full_name, .owner.login, .default_branch] | map(. // "") | @tsv') || return 1
+            IFS=$'\t' read -r full_name repo_owner default_branch <<< "$repo_fields"
+            if [ "$full_name" != "${owner}/${repo}" ] || [ "$repo_owner" != "$owner" ] || [ -z "$default_branch" ]; then
+              echo "Self-reference repository identity mismatch: ${owner}/${repo}" >&2
+              return 1
+            fi
+
+            local branch_fields branch_name branch_protected branch_head
+            branch_fields=$(actions_age::github_tsv "/repos/${owner}/${repo}/branches/${default_branch}" \
+              '[.name, ((.protected // false) | tostring), .commit.sha] | map(. // "") | @tsv') || return 1
+            IFS=$'\t' read -r branch_name branch_protected branch_head <<< "$branch_fields"
+            if [ "$branch_name" != "$default_branch" ] || [ "$branch_protected" != "true" ] \
+              || [[ ! "$branch_head" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Self-reference default branch is missing or unprotected: ${owner}/${repo}@${default_branch}" >&2
+              return 1
+            fi
+
+            local commit_fields commit_sha commit_verified commit_reason
+            commit_fields=$(actions_age::github_tsv "/repos/${owner}/${repo}/commits/${sha}" \
+              '[.sha, ((.commit.verification.verified // false) | tostring), (.commit.verification.reason // "unknown")] | @tsv') || return 1
+            IFS=$'\t' read -r commit_sha commit_verified commit_reason <<< "$commit_fields"
+            if [ "$commit_sha" != "$sha" ] || [ "$commit_verified" != "true" ] || [ "$commit_reason" != "valid" ]; then
+              echo "Self-reference commit is not GitHub-verified: ${owner}/${repo}@${sha} (reason: ${commit_reason})" >&2
+              return 1
+            fi
+
+            local compare_fields compare_status base_sha merge_base_sha behind_by
+            compare_fields=$(actions_age::github_tsv "/repos/${owner}/${repo}/compare/${sha}...${default_branch}" \
+              '[.status, .base_commit.sha, .merge_base_commit.sha, .behind_by] | map(. // "") | @tsv') || return 1
+            IFS=$'\t' read -r compare_status base_sha merge_base_sha behind_by <<< "$compare_fields"
+            if { [ "$compare_status" != "identical" ] && [ "$compare_status" != "ahead" ]; } \
+              || [ "$base_sha" != "$sha" ] || [ "$merge_base_sha" != "$sha" ] || [ "$behind_by" != "0" ]; then
+              echo "Self-reference commit is not on ${owner}/${repo}'s default branch ${default_branch}: ${sha}" >&2
+              return 1
+            fi
+
+            printf '%s\n' "$default_branch"
+          }
+
           # ----- Main -----------------------------------------------------------------
 
           actions_age::main() {
@@ -702,6 +780,7 @@ jobs:
             local now_epoch; now_epoch=$(date +%s)
             local failed=false
             local checked_count=0
+            local skipped_count=0
 
             local files; files=$(actions_age::changed_files "$base_ref")
             if [ -z "$files" ]; then
@@ -764,14 +843,10 @@ jobs:
                   continue
                 fi
 
-                # Self-reference bypass: skip pins pointing at `layervai/ops-routines`
-                # itself. Rationale: this reusable IS ops-routines; a consumer
-                # pinning layervai/ops-routines has already committed to trusting
-                # it (they're executing its workflow right now). Re-age-checking
-                # the reference creates a chicken-and-egg problem where a fresh
-                # ops-routines release blocks every consumer PR that bumps to it
-                # for MIN_AGE_DAYS days, even though the consumer will immediately
-                # run under that version regardless.
+                # Self-reference provenance seam: this reusable cannot quarantine its own
+                # fresh release without a rollout deadlock. A configured exact repository
+                # may skip age only after the pinned SHA proves same-owner repository
+                # identity, a valid GitHub signature, and protected-default-branch ancestry.
                 #
                 # Override via AGE_CHECK_SKIP_SELF_REFS env var (space-separated
                 # `owner/repo` pairs). Set empty to disable the skip.
@@ -781,8 +856,18 @@ jobs:
                 if [ -n "$skip_refs" ] && echo " $skip_refs " | grep -qF " ${owner}/${repo} "; then
                   local safe_owner_repo_skip; safe_owner_repo_skip=$(preflight::safe_for_md "${owner}/${repo}")
                   local safe_sha_short_skip; safe_sha_short_skip=$(preflight::safe_for_md "${ref_part:0:8}")
-                  echo "  SKIP: ${owner}/${repo}@${ref_part:0:8} (self-reference — trusted)"
-                  echo "| \`${safe_owner_repo_skip}\` | \`${safe_sha_short_skip}\` | — | :white_check_mark: self-ref (skipped) |" >> "$GITHUB_STEP_SUMMARY"
+                  local trusted_default_branch
+                  if ! trusted_default_branch=$(actions_age::trusted_self_ref_provenance "$owner" "$repo" "$ref_part"); then
+                    echo "::error file=${file}::Could not verify self-reference provenance for ${owner}/${repo}@${ref_part}"
+                    echo "| \`${safe_owner_repo_skip}\` | \`${safe_sha_short_skip}\` | — | :x: self-ref provenance unverifiable |" >> "$GITHUB_STEP_SUMMARY"
+                    preflight::record_unverifiable "$safe_owner_repo_skip" "$safe_sha_short_skip" \
+                      "self-reference repository, signature, or default-branch provenance mismatch"
+                    failed=true
+                    continue
+                  fi
+                  echo "  SELF-REF: ${owner}/${repo}@${ref_part} commit=verified default=${trusted_default_branch} branch=protected"
+                  echo "| \`${safe_owner_repo_skip}\` | \`${safe_sha_short_skip}\` | — | :white_check_mark: self-ref provenance |" >> "$GITHUB_STEP_SUMMARY"
+                  skipped_count=$((skipped_count + 1))
                   continue
                 fi
 
@@ -819,14 +904,14 @@ jobs:
             done
 
             if [ "$failed" = true ]; then
-              preflight::step_summary_failed "$MIN_AGE_DAYS" "$checked_count" "0"
+              preflight::step_summary_failed "$MIN_AGE_DAYS" "$checked_count" "$skipped_count"
               echo ""
               echo "::error::One or more GitHub Actions failed the age check."
               echo "To bypass for emergency security updates, add the 'age-check-bypass' label to this PR."
               exit 1
             fi
 
-            preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS"
+            preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS" "$skipped_count"
             echo "All GitHub Actions dependencies are at least ${MIN_AGE_DAYS} days old"
           }
           actions_age::main

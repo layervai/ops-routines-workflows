@@ -24,15 +24,15 @@ on:
         default: ""
       exempt_module_prefixes:
         description: |
-          Optional comma- or newline-separated first-party module exemptions.
+          Optional comma- or newline-separated same-owner public module paths.
           Each entry must either end with "/" (a segment-safe module-path
           prefix: github.com/layervai/ matches github.com/layervai/frp but
           never github.com/layervai-evil/frp) or name one full module path to
-          match exactly. Matching pins skip age enforcement and are reported
-          in the log as "exempt (first-party): <module>@<version>"; malformed
-          entries fail the check loudly. Prefer this over the age-check-bypass
-          label for first-party pins — the label skips the ENTIRE check for
-          every dependency in the PR.
+          match exactly. A matching pin skips the age delay only after the Go
+          proxy origin, exact GitHub tag, verified commit, and protected
+          default-branch ancestry agree. Malformed entries or unverifiable
+          provenance fail closed. Prefer this over age-check-bypass, which
+          skips the ENTIRE check for every dependency in the PR.
         required: false
         type: string
         default: ""
@@ -178,6 +178,8 @@ jobs:
           MIN_AGE_DAYS: ${{ inputs.min_age_days }}
           BASE_REF: ${{ inputs.base_ref != '' && inputs.base_ref || (github.event.pull_request.base.ref || 'main') }}
           EXEMPT_MODULE_PREFIXES: ${{ inputs.exempt_module_prefixes }}
+          FIRST_PARTY_MODULE_OWNER: ${{ github.repository_owner }}
+          FIRST_PARTY_GH_TOKEN: ${{ github.token }}
           PRIVATE_MODULES: ${{ inputs.private_modules }}
           PRIVATE_MODULE_OWNER: ${{ inputs.private_module_owner }}
           PRIVATE_MODULE_REPOSITORIES: ${{ inputs.private_module_repositories }}
@@ -731,8 +733,12 @@ jobs:
           #   MIN_AGE_DAYS - default 7
           #   BASE_REF     - default 'main'
           #   EXEMPT_MODULE_PREFIXES - optional comma- or newline-separated first-party
-          #                  exemptions; each entry ends with "/" (segment-safe module
-          #                  path prefix) or names one full module path exactly
+          #                  public module paths; each entry ends with "/" (segment-safe
+          #                  prefix) or names one full module path exactly. A match only
+          #                  bypasses the age delay after exact proxy/GitHub provenance.
+          #   FIRST_PARTY_MODULE_OWNER - caller repository owner; required and enforced as
+          #                  the GitHub owner for every first-party public module
+          #   FIRST_PARTY_GH_TOKEN - optional token for public GitHub provenance lookups
           #   PRIVATE_MODULES - optional newline-delimited exact module=owner/repo pairs
           #   PRIVATE_MODULE_OWNER - GitHub owner for every declared private repository
           #   PRIVATE_MODULE_REPOSITORIES - newline-delimited exact repository names
@@ -751,6 +757,8 @@ jobs:
           MIN_AGE_DAYS="${MIN_AGE_DAYS:-7}"
           BASE_REF="${BASE_REF:-main}"
           EXEMPT_MODULE_PREFIXES="${EXEMPT_MODULE_PREFIXES:-}"
+          FIRST_PARTY_MODULE_OWNER="${FIRST_PARTY_MODULE_OWNER:-}"
+          FIRST_PARTY_GH_TOKEN="${FIRST_PARTY_GH_TOKEN:-}"
           PRIVATE_MODULES="${PRIVATE_MODULES:-}"
           PRIVATE_MODULE_OWNER="${PRIVATE_MODULE_OWNER:-}"
           PRIVATE_MODULE_REPOSITORIES="${PRIVATE_MODULE_REPOSITORIES:-}"
@@ -785,8 +793,8 @@ jobs:
 
           # ----- Separable: Go module proxy query → ISO-8601 publish time -------------
 
-          go_age::published_at() {
-            local module="$1" version="$2"
+          go_age::proxy_escape() {
+            local value="$1" encoded="" i c
             # Go module proxy encoding: each uppercase letter becomes
             # `!<lowercase>` per https://pkg.go.dev/cmd/go#hdr-Module_proxy_protocol
             # so the proxy filesystem is case-insensitive-safe.
@@ -795,22 +803,30 @@ jobs:
             # GNU sed's `\L` selective-lowercase flag. BSD sed would emit the
             # literal string `!L` prefix instead, breaking every request. Using
             # bash-native iteration removes the implicit GNU-sed dependency.
-            local encoded_module="" i c
-            for ((i = 0; i < ${#module}; i++)); do
-              c="${module:i:1}"
+            for ((i = 0; i < ${#value}; i++)); do
+              c="${value:i:1}"
               if [[ "$c" =~ [A-Z] ]]; then
-                encoded_module+="!${c,}"
+                encoded+="!${c,}"
               else
-                encoded_module+="$c"
+                encoded+="$c"
               fi
             done
-            local info_url="https://proxy.golang.org/${encoded_module}/@v/${version}.info"
+            printf '%s\n' "$encoded"
+          }
+
+          go_age::proxy_file() {
+            local module="$1" version="$2" extension="$3"
+            local encoded_module encoded_version
+            encoded_module=$(go_age::proxy_escape "$module")
+            encoded_version=$(go_age::proxy_escape "$version")
+            curl -fsS -m 10 --retry 2 --retry-delay 1 --retry-max-time 25 --retry-connrefused \
+              "https://proxy.golang.org/${encoded_module}/@v/${encoded_version}.${extension}"
+          }
+
+          go_age::published_at() {
             local response
-            response=$(curl -sf -m 10 "$info_url" 2>/dev/null || echo "")
-            if [ -z "$response" ]; then
-              return 1
-            fi
-            echo "$response" | jq -r '.Time // empty'
+            response=$(go_age::proxy_file "$1" "$2" info) || return 1
+            printf '%s' "$response" | jq -er '.Time | select(type == "string" and length > 0)'
           }
 
           # ----- Separable: exact private-module declaration + GitHub provenance -----
@@ -1017,21 +1033,27 @@ jobs:
             esac
           }
 
-          # ----- Separable: first-party module exemption ------------------------------
+          # ----- Separable: provenance-gated first-party public releases --------------
 
           # First-party modules (e.g. github.com/layervai/*) gain nothing from the
-          # release-age cooldown: the org publishes them itself, usually minutes
-          # before pinning. EXEMPT_MODULE_PREFIXES lets a caller skip age enforcement
-          # for exactly those module paths — unlike the age-check-bypass PR label,
-          # which skips the ENTIRE check for every dependency in the labeled PR.
+          # release-age cooldown: the org publishes them itself, usually minutes before
+          # pinning. EXEMPT_MODULE_PREFIXES selects those module paths, but selection is
+          # not enough to skip the delay. Every matching pin must independently prove:
+          #   - its public proxy origin is the exact same-org GitHub repository and tag;
+          #   - that tag still resolves to the proxy's immutable target commit;
+          #   - the commit has a valid GitHub signature and is on the protected default
+          #     branch of the public repository; and
+          #   - the proxy's go.mod declares the exact module path.
+          # This is deliberately narrower than the age-check-bypass PR label, which skips
+          # the ENTIRE check for every dependency in the labeled PR.
           #
           # Matching rule (segment-safe by construction):
           #   - An entry ending in "/" matches any module path that starts with it.
           #     Because the entry itself terminates at a path-segment boundary,
           #     "github.com/layervai/" can never match "github.com/layervai-evil/x".
           #   - An entry not ending in "/" matches the full module path exactly.
-          # Exempt pins are reported in the log ("exempt (first-party): ...") and
-          # counted in the skipped tally — visible skips, never silent ones.
+          # Proven pins are reported in the log and counted in the skipped tally — visible
+          # skips, never silent ones. A provenance lookup error fails closed.
 
           # Emit one normalized exemption entry per line: split on commas and
           # newlines, trim surrounding whitespace, drop blank fields. Blank fields
@@ -1048,6 +1070,12 @@ jobs:
           go_age::validate_exempt_config() {
             if [ -z "$EXEMPT_MODULE_PREFIXES" ]; then
               return 0
+            fi
+
+            if [[ ! "$FIRST_PARTY_MODULE_OWNER" =~ ^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]{0,37}[A-Za-z0-9])$ ]] \
+              || [[ "$FIRST_PARTY_MODULE_OWNER" == *--* ]]; then
+              echo "::error::EXEMPT_MODULE_PREFIXES requires a valid FIRST_PARTY_MODULE_OWNER" >&2
+              return 1
             fi
 
             local entries; entries=$(go_age::exempt_entries)
@@ -1076,6 +1104,28 @@ jobs:
               first_element="${entry%%/*}"
               if [[ "$first_element" != *.* ]]; then
                 echo "::error::EXEMPT_MODULE_PREFIXES entry must start with a domain-style path element (e.g. github.com/layervai/): ${entry}" >&2
+                return 1
+              fi
+              local owner_root="github.com/${FIRST_PARTY_MODULE_OWNER}/"
+              if [[ "$entry" != "$owner_root"* ]]; then
+                echo "::error::EXEMPT_MODULE_PREFIXES entry must stay under the caller's GitHub owner ${FIRST_PARTY_MODULE_OWNER}: ${entry}" >&2
+                return 1
+              fi
+              if [ -z "${entry#"$owner_root"}" ]; then
+                # The one allowed owner-wide form is the segment-safe trailing-slash
+                # prefix itself. Exact paths must name at least one repository.
+                if [[ "$entry" != */ ]]; then
+                  echo "::error::EXEMPT_MODULE_PREFIXES exact entry must name a repository: ${entry}" >&2
+                  return 1
+                fi
+              elif [[ "${entry#"$owner_root"}" == /* ]]; then
+                echo "::error::Malformed EXEMPT_MODULE_PREFIXES repository path: ${entry}" >&2
+                return 1
+              fi
+              local exact_or_prefix_path="${entry%/}"
+              if [ "$entry" != "$owner_root" ] \
+                && [[ ! "$exact_or_prefix_path" =~ ^github\.com/${FIRST_PARTY_MODULE_OWNER}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}(/[A-Za-z0-9][A-Za-z0-9._~-]*)*$ ]]; then
+                echo "::error::Malformed first-party GitHub module path: ${entry}" >&2
                 return 1
               fi
               # A host-only prefix ("github.com/") would exempt EVERY module on that
@@ -1122,6 +1172,205 @@ jobs:
               fi
             done <<< "$entries"
             return 1
+          }
+
+          go_age::first_party_github_json() {
+            local path="$1"
+            local auth=()
+            if [ -n "$FIRST_PARTY_GH_TOKEN" ]; then
+              auth=(-H "Authorization: Bearer ${FIRST_PARTY_GH_TOKEN}")
+            fi
+            # Public provenance is independently anchored by proxy.golang.org. The token
+            # only raises GitHub's API rate limit; it grants no cross-repository trust.
+            curl -fsS -m 10 --retry 2 --retry-delay 1 --retry-max-time 25 --retry-connrefused \
+              "${auth[@]}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL:-https://api.github.com}${path}"
+          }
+
+          # Emit "owner/repository<TAB>tag" for a same-owner GitHub module. Nested Go
+          # modules use repository-relative tag prefixes (submodule/v1.2.3); semantic
+          # import-version suffixes (/v2+) are not part of that prefix.
+          go_age::first_party_coordinates() {
+            local module="$1" version="$2"
+            local owner_root="github.com/${FIRST_PARTY_MODULE_OWNER}/"
+            [[ "$module" == "$owner_root"* ]] || return 1
+            if [[ ! "$module" =~ ^github\.com/${FIRST_PARTY_MODULE_OWNER}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}(/[A-Za-z0-9][A-Za-z0-9._~-]*)*$ ]]; then
+              echo "Invalid first-party GitHub module path: ${module}" >&2
+              return 1
+            fi
+
+            local module_tail="${module#"$owner_root"}" repo_name suffix
+            repo_name="${module_tail%%/*}"
+            if [[ ! "$repo_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]]; then
+              echo "Invalid first-party repository in module path: ${module}" >&2
+              return 1
+            fi
+            if [ "$module_tail" = "$repo_name" ]; then
+              suffix=""
+            else
+              suffix="/${module_tail#*/}"
+            fi
+
+            local tag_version="${version%+incompatible}"
+            if [[ ! "$tag_version" =~ ^v([0-9]+)\.[0-9A-Za-z.-]{1,127}$ ]]; then
+              echo "Invalid first-party module tag: ${version}" >&2
+              return 1
+            fi
+            local version_major="${BASH_REMATCH[1]}"
+
+            if [[ "$suffix" =~ /v([0-9]+)$ ]]; then
+              local path_major="${BASH_REMATCH[1]}"
+              if [ "$path_major" -lt 2 ] || [ "$path_major" != "$version_major" ]; then
+                echo "First-party semantic import version does not match ${version}: ${module}" >&2
+                return 1
+              fi
+              suffix="${suffix%/v"${path_major}"}"
+            elif [ "$version_major" -ge 2 ] && [[ "$version" != *+incompatible ]]; then
+              echo "First-party v${version_major} module path lacks the required /v${version_major} suffix: ${module}" >&2
+              return 1
+            fi
+
+            local tag_prefix="${suffix#/}" expected_tag="$tag_version"
+            if [ -n "$tag_prefix" ]; then
+              expected_tag="${tag_prefix}/${tag_version}"
+            fi
+            printf '%s/%s\t%s\n' "$FIRST_PARTY_MODULE_OWNER" "$repo_name" "$expected_tag"
+          }
+
+          # Emit "tag-kind<TAB>tag-object-sha<TAB>target-commit-sha<TAB>tag-verification".
+          # A lightweight tag has no tag-object signature; the target commit signature is
+          # mandatory below. An annotated tag must itself also be GitHub-verified.
+          go_age::first_party_tag_target() {
+            local repo="$1" expected_tag="$2"
+            local ref_json ref_name object_type object_sha
+            ref_json=$(go_age::first_party_github_json "/repos/${repo}/git/ref/tags/${expected_tag}") || {
+              echo "Exact first-party tag ${repo}@${expected_tag} is missing or inaccessible" >&2
+              return 1
+            }
+            IFS=$'\t' read -r ref_name object_type object_sha <<< "$(printf '%s' "$ref_json" \
+              | jq -er '[.ref, .object.type, .object.sha] | map(. // "") | @tsv')" || return 1
+            if [ "$ref_name" != "refs/tags/${expected_tag}" ] || [[ ! "$object_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "First-party tag ref provenance mismatch for ${repo}@${expected_tag}" >&2
+              return 1
+            fi
+
+            case "$object_type" in
+              commit)
+                printf 'lightweight\t%s\t%s\tunavailable\n' "$object_sha" "$object_sha"
+                ;;
+              tag)
+                local tag_json tag_name target_type target_sha tag_verified tag_reason
+                tag_json=$(go_age::first_party_github_json "/repos/${repo}/git/tags/${object_sha}") || {
+                  echo "Annotated first-party tag object ${repo}@${object_sha} is inaccessible" >&2
+                  return 1
+                }
+                IFS=$'\t' read -r tag_name target_type target_sha tag_verified tag_reason <<< "$(printf '%s' "$tag_json" \
+                  | jq -er '[.tag, .object.type, .object.sha, ((.verification.verified // false) | tostring), (.verification.reason // "unknown")] | @tsv')" || return 1
+                if [ "$tag_name" != "$expected_tag" ] || [ "$target_type" != "commit" ] \
+                  || [[ ! "$target_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "Annotated first-party tag provenance mismatch for ${repo}@${expected_tag}" >&2
+                  return 1
+                fi
+                if [ "$tag_verified" != "true" ] || [ "$tag_reason" != "valid" ]; then
+                  echo "Annotated first-party tag ${repo}@${expected_tag} is not GitHub-verified (reason: ${tag_reason})" >&2
+                  return 1
+                fi
+                printf 'annotated\t%s\t%s\tverified\n' "$object_sha" "$target_sha"
+                ;;
+              *)
+                echo "Unsupported first-party tag target type for ${repo}@${expected_tag}: ${object_type:-empty}" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          # Emit a compact, log-safe provenance row:
+          #   repository  tag  commit  default-branch  tag-kind
+          go_age::first_party_provenance() {
+            local module="$1" version="$2"
+            local coordinates repo expected_tag
+            coordinates=$(go_age::first_party_coordinates "$module" "$version") || return 1
+            IFS=$'\t' read -r repo expected_tag <<< "$coordinates"
+
+            local info_json proxy_version origin_vcs origin_url origin_hash origin_ref
+            info_json=$(go_age::proxy_file "$module" "$version" info) || {
+              echo "First-party release is not available from proxy.golang.org: ${module}@${version}" >&2
+              return 1
+            }
+            IFS=$'\t' read -r proxy_version origin_vcs origin_url origin_hash origin_ref <<< "$(printf '%s' "$info_json" \
+              | jq -er '[.Version, .Origin.VCS, .Origin.URL, .Origin.Hash, .Origin.Ref] | map(. // "") | @tsv')" || {
+                echo "First-party proxy metadata is missing exact origin fields: ${module}@${version}" >&2
+                return 1
+              }
+            if [ "$proxy_version" != "$version" ] || [ "$origin_vcs" != "git" ] \
+              || [ "$origin_url" != "https://github.com/${repo}" ] \
+              || [[ ! "$origin_hash" =~ ^[0-9a-f]{40}$ ]] \
+              || [ "$origin_ref" != "refs/tags/${expected_tag}" ]; then
+              echo "First-party proxy origin mismatch for ${module}@${version}" >&2
+              return 1
+            fi
+
+            local mod_file declared_module
+            mod_file=$(go_age::proxy_file "$module" "$version" mod) || {
+              echo "First-party go.mod is not available from proxy.golang.org: ${module}@${version}" >&2
+              return 1
+            }
+            declared_module=$(printf '%s\n' "$mod_file" | awk '$1 == "module" { gsub(/^"|"$/, "", $2); print $2; exit }')
+            if [ "$declared_module" != "$module" ]; then
+              echo "First-party proxy go.mod declares ${declared_module:-no-module}, expected ${module}" >&2
+              return 1
+            fi
+
+            local tag_metadata tag_kind _tag_object_sha target_sha _tag_verification
+            tag_metadata=$(go_age::first_party_tag_target "$repo" "$expected_tag") || return 1
+            IFS=$'\t' read -r tag_kind _tag_object_sha target_sha _tag_verification <<< "$tag_metadata"
+            if [ "$target_sha" != "$origin_hash" ]; then
+              echo "First-party GitHub tag target does not match the proxy origin for ${module}@${version}" >&2
+              return 1
+            fi
+
+            local repo_json full_name repo_owner is_private default_branch
+            repo_json=$(go_age::first_party_github_json "/repos/${repo}") || return 1
+            IFS=$'\t' read -r full_name repo_owner is_private default_branch <<< "$(printf '%s' "$repo_json" \
+              | jq -er '[.full_name, .owner.login, ((.private // false) | tostring), .default_branch] | map(. // "") | @tsv')" || return 1
+            if [ "$full_name" != "$repo" ] || [ "$repo_owner" != "$FIRST_PARTY_MODULE_OWNER" ] \
+              || [ "$is_private" != "false" ] || [ -z "$default_branch" ]; then
+              echo "First-party repository is not the exact public same-owner repository: ${repo}" >&2
+              return 1
+            fi
+
+            local branch_json branch_name branch_protected branch_head
+            branch_json=$(go_age::first_party_github_json "/repos/${repo}/branches/${default_branch}") || return 1
+            IFS=$'\t' read -r branch_name branch_protected branch_head <<< "$(printf '%s' "$branch_json" \
+              | jq -er '[.name, ((.protected // false) | tostring), .commit.sha] | map(. // "") | @tsv')" || return 1
+            if [ "$branch_name" != "$default_branch" ] || [ "$branch_protected" != "true" ] \
+              || [[ ! "$branch_head" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "First-party repository default branch is missing or unprotected: ${repo}@${default_branch}" >&2
+              return 1
+            fi
+
+            local commit_json commit_sha commit_verified commit_reason
+            commit_json=$(go_age::first_party_github_json "/repos/${repo}/commits/${target_sha}") || return 1
+            IFS=$'\t' read -r commit_sha commit_verified commit_reason <<< "$(printf '%s' "$commit_json" \
+              | jq -er '[.sha, ((.commit.verification.verified // false) | tostring), (.commit.verification.reason // "unknown")] | @tsv')" || return 1
+            if [ "$commit_sha" != "$target_sha" ] || [ "$commit_verified" != "true" ] || [ "$commit_reason" != "valid" ]; then
+              echo "First-party release commit is not GitHub-verified: ${repo}@${target_sha} (reason: ${commit_reason})" >&2
+              return 1
+            fi
+
+            local compare_json compare_status base_sha merge_base_sha behind_by
+            compare_json=$(go_age::first_party_github_json "/repos/${repo}/compare/${target_sha}...${default_branch}") || return 1
+            IFS=$'\t' read -r compare_status base_sha merge_base_sha behind_by <<< "$(printf '%s' "$compare_json" \
+              | jq -er '[.status, .base_commit.sha, .merge_base_commit.sha, .behind_by] | map(. // "") | @tsv')" || return 1
+            if { [ "$compare_status" != "identical" ] && [ "$compare_status" != "ahead" ]; } \
+              || [ "$base_sha" != "$target_sha" ] || [ "$merge_base_sha" != "$target_sha" ] || [ "$behind_by" != "0" ]; then
+              echo "First-party release commit is not on ${repo}'s default branch ${default_branch}: ${target_sha}" >&2
+              return 1
+            fi
+
+            printf '%s\t%s\t%s\t%s\t%s\n' "$repo" "$expected_tag" "$target_sha" "$default_branch" "$tag_kind"
           }
 
           # ----- Main -----------------------------------------------------------------
@@ -1184,24 +1433,40 @@ jobs:
                   continue
                 fi
 
-                # First-party exemption: the caller's own org publishes these
-                # modules, so the release-age cooldown proves nothing for them.
-                # Reported and tallied — a visible skip, never a silent one. This
-                # takes precedence over private-module routing: an exempt module
-                # needs no provenance lookup at all.
-                if go_age::module_is_exempt "$module"; then
-                  echo "  exempt (first-party): ${module}@${version}"
-                  skipped_count=$((skipped_count + 1))
-                  continue
-                fi
-
                 # Sanitize module path + version for step-summary cells. Go
                 # module paths contain `/` and `.`; safe_for_md preserves them.
                 local safe_module; safe_module=$(preflight::safe_for_md "$module")
                 local safe_version; safe_version=$(preflight::safe_for_md "$version")
 
-                local publish_time age_verb="published" private_repo metadata
-                if private_repo=$(go_age::private_repo_for "$module"); then
+                # Exact private declarations retain their authenticated tag-age path even
+                # when a consumer also configures an owner-wide public first-party prefix.
+                local private_repo=""
+                private_repo=$(go_age::private_repo_for "$module") || private_repo=""
+
+                # A configured same-owner public module may bypass the cooldown only
+                # after the proxy origin, exact GitHub tag, verified target commit, and
+                # protected-default-branch ancestry all agree. This takes precedence
+                # over private-module routing, but unlike the old path-only exemption it
+                # performs every provenance lookup before recording a visible skip.
+                if [ -z "$private_repo" ] && go_age::module_is_exempt "$module"; then
+                  local first_party_metadata fp_repo fp_tag fp_commit fp_branch fp_tag_kind
+                  if ! first_party_metadata=$(go_age::first_party_provenance "$module" "$version"); then
+                    echo "::error file=${sum_file}::Could not verify first-party release provenance for ${module}@${version}"
+                    echo "| \`${safe_module}\` | ${safe_version} | — | :x: first-party provenance unverifiable |" >> "$GITHUB_STEP_SUMMARY"
+                    preflight::record_unverifiable "$safe_module" "$safe_version" \
+                      "first-party proxy, tag, commit, or default-branch provenance mismatch"
+                    failed=true
+                    continue
+                  fi
+                  IFS=$'\t' read -r fp_repo fp_tag fp_commit fp_branch fp_tag_kind <<< "$first_party_metadata"
+                  echo "  FIRST-PARTY: ${module}@${version} repo=${fp_repo} tag=${fp_tag} commit=${fp_commit} default=${fp_branch} tag-kind=${fp_tag_kind} proxy=verified"
+                  echo "| \`${safe_module}\` | ${safe_version} | — | :white_check_mark: first-party provenance |" >> "$GITHUB_STEP_SUMMARY"
+                  skipped_count=$((skipped_count + 1))
+                  continue
+                fi
+
+                local publish_time age_verb="published" metadata
+                if [ -n "$private_repo" ]; then
                   if ! metadata=$(go_age::private_tag_metadata "$private_repo" "$version"); then
                     echo "::error file=${sum_file}::Could not verify private tag provenance for ${module}@${version}"
                     echo "| \`${safe_module}\` | ${safe_version} | — | :x: private tag unverifiable |" >> "$GITHUB_STEP_SUMMARY"
@@ -1269,8 +1534,8 @@ jobs:
             fi
 
             # Go's skip classes are both deliberate: pseudo-version commit pins and
-            # declared first-party exemptions. Outages record an unverifiable
-            # failure, so an all-skipped guard is not appropriate.
+            # provenance-verified first-party releases. Outages and mismatches record an
+            # unverifiable failure, so an all-skipped guard is not appropriate.
             preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS" "$skipped_count"
             echo "All Go dependencies are at least ${MIN_AGE_DAYS} days old"
           }
