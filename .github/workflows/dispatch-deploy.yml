@@ -1,14 +1,23 @@
-# REUSABLE: Fire `repository_dispatch` from a public consumer repo to a
-# private deploy-receiver repo, using the qurl-deploy-dispatcher GitHub
+# REUSABLE: Fire `repository_dispatch` from a public consumer repo to an
+# allowlisted private receiver repo, using the qurl-deploy-dispatcher GitHub
 # App's narrowly-scoped token (contents:write, metadata:read only).
 #
-# This workflow is the single chokepoint for cross-repo deploy
-# triggers — public consumers (qurl-integrations today; future Slack /
+# This workflow is the single chokepoint for cross-repo deploy and protected
+# CI triggers — public consumers (qurl-integrations today; future Slack /
 # Teams / Zapier integrations tomorrow) call it via `uses:` instead of
 # inlining the App-token-mint pattern. Centralisation gives us:
 #   - One audit point for dispatch logic and version pins
 #   - target_repo + event_type allowlist that consumers cannot bypass
 #   - Future integrations get the secure path with a single `uses:` line
+#
+# The "deploy" filename and App slug are historical stable interfaces. The
+# payload remains caller-controlled after this allowlist check. `_dispatch` is
+# dispatcher-owned on every lane and is removed from caller payloads. The
+# protected qURL CLI lane then gets a non-overridable `_dispatch` identity
+# stamped from the reusable-workflow caller context. Each receiver must
+# authenticate the sender, enforce a closed schema, use the stamped run ID to
+# authenticate the exact caller workflow and source authority, and check out
+# only its protected workflow ref.
 #
 # Why it lives here (and ships through the public mirror):
 #   GitHub blocks public repos from calling reusables in private
@@ -45,7 +54,10 @@ on:
           string before passing (e.g. embed github.sha via the
           standard double-curly-brace expression in the caller's own
           workflow file). Keep small — GitHub limit is 10 top-level
-          properties, 64 KB total.
+          properties, 64 KB total. `_dispatch` is dispatcher-owned on every
+          lane and is removed from caller payloads. The qURL CLI
+          customer-journey lane reserves that top-level property for trusted
+          caller identity.
         required: false
         type: string
         default: '{}'
@@ -107,26 +119,49 @@ jobs:
         env:
           TARGET_REPO: ${{ inputs.target_repo }}
           EVENT_TYPE: ${{ inputs.event_type }}
+          DISPATCH_SOURCE_REPOSITORY: ${{ github.repository }}
+          DISPATCH_SOURCE_EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # Allowlist of "<target_repo>:<event_type>" pairs. Edit this
           # array (and only this array) to onboard a new consumer.
           ALLOWLIST=(
             "qurl-integrations-infra:discord-bot-deploy"
+            "qurl-integrations-infra:qurl-cli-customer-journey"
             "qurl-integrations-infra:slack-bot-deploy"
           )
           PAIR="${TARGET_REPO}:${EVENT_TYPE}"
+          allowed=false
           for entry in "${ALLOWLIST[@]}"; do
             if [ "$entry" = "$PAIR" ]; then
-              echo "::notice::allowlist match: ${PAIR}"
-              exit 0
+              allowed=true
+              break
             fi
           done
-          echo "::error::dispatch target/event not in allowlist: ${PAIR}"
-          echo "::error::Allowlist entries:"
-          for entry in "${ALLOWLIST[@]}"; do echo "::error::  - ${entry}"; done
-          echo "::error::To add a new consumer, edit dispatch-deploy.yml ALLOWLIST in the same PR that wires the consumer."
-          exit 1
+          if [ "$allowed" != true ]; then
+            echo "::error::dispatch target/event not in allowlist: ${PAIR}"
+            echo "::error::Allowlist entries:"
+            for entry in "${ALLOWLIST[@]}"; do echo "::error::  - ${entry}"; done
+            echo "::error::To add a new consumer, edit dispatch-deploy.yml ALLOWLIST in the same PR that wires the consumer."
+            exit 1
+          fi
+          # The protected customer-journey lane rejects the caller before the
+          # next step can mint a token. Other allowlisted lanes retain their
+          # existing caller and event contract.
+          if [ "$EVENT_TYPE" = "qurl-cli-customer-journey" ]; then
+            [ "$DISPATCH_SOURCE_REPOSITORY" = "layervai/qurl-integrations" ] || {
+              echo "::error::qURL CLI customer journeys accept only the canonical public CLI repository"
+              exit 1
+            }
+            case "$DISPATCH_SOURCE_EVENT" in
+              push|pull_request) ;;
+              *)
+                echo "::error::qURL CLI customer journeys accept only push or pull_request callers"
+                exit 1
+                ;;
+            esac
+          fi
+          echo "::notice::allowlist and caller match: ${PAIR}"
 
       - name: Mint GitHub App token (scoped to target_repo only)
         id: app-token
@@ -164,6 +199,11 @@ jobs:
           TARGET_REPO: ${{ inputs.target_repo }}
           EVENT_TYPE: ${{ inputs.event_type }}
           CLIENT_PAYLOAD: ${{ inputs.client_payload }}
+          DISPATCH_SOURCE_REPOSITORY: ${{ github.repository }}
+          DISPATCH_SOURCE_EVENT: ${{ github.event_name }}
+          DISPATCH_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          DISPATCH_SOURCE_RUN_ID: ${{ github.run_id }}
+          DISPATCH_SOURCE_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           # Validate client_payload parses as a JSON object before
@@ -176,6 +216,45 @@ jobs:
             echo "::error::client_payload must be a JSON object (got: $(printf '%s' "$CLIENT_PAYLOAD" | jq -r 'type' 2>/dev/null || echo 'invalid JSON'))"
             exit 1
           fi
+          # BEGIN qurl-cli-dispatch-stamp (extracted by tests/dispatch_deploy_test.sh)
+          # `_dispatch` is a dispatcher-owned namespace for every lane. Strip
+          # a caller value even on lanes that do not yet receive a stamp so a
+          # shared receiver can never mistake caller data for trusted identity.
+          CLIENT_PAYLOAD=$(jq -c 'del(._dispatch)' <<<"$CLIENT_PAYLOAD")
+          # The protected CI receiver must distinguish the exact CLI workflow
+          # run from other callers that can use this shared dispatcher. Merge
+          # order makes this stamp non-overridable by client_payload. Repository,
+          # event, run_id, and run_attempt identify the runner-owned caller. The
+          # receiver uses the run identity in an authenticated API lookup and
+          # requires .github/workflows/cli.yml before it accepts artifacts. The
+          # source_sha identifies content and the receiver must also bind it to
+          # the current same-repository PR head or main. Ordinary pull_request
+          # runs from forks do not receive the App secrets, but the receiver
+          # validates the same-repository source independently as defense in depth.
+          if [ "$EVENT_TYPE" = "qurl-cli-customer-journey" ]; then
+            caller_key_count=$(jq 'keys | length' <<<"$CLIENT_PAYLOAD")
+            if ((caller_key_count > 9)); then
+              echo "::error::qURL CLI customer journeys reserve one of GitHub's 10 client_payload slots for trusted dispatch identity"
+              exit 1
+            fi
+            CLIENT_PAYLOAD=$(jq -c \
+              --arg repository "$DISPATCH_SOURCE_REPOSITORY" \
+              --arg event "$DISPATCH_SOURCE_EVENT" \
+              --arg sha "$DISPATCH_SOURCE_SHA" \
+              --argjson run_id "$DISPATCH_SOURCE_RUN_ID" \
+              --argjson run_attempt "$DISPATCH_SOURCE_RUN_ATTEMPT" '
+              . + {
+                _dispatch:{
+                  repository:$repository,
+                  event:$event,
+                  source_sha:$sha,
+                  run_id:$run_id,
+                  run_attempt:$run_attempt
+                }
+              }
+            ' <<<"$CLIENT_PAYLOAD")
+          fi
+          # END qurl-cli-dispatch-stamp
           # Build the full request body and pipe to gh api --input.
           # --argjson reads the value as JSON (preserving object-ness),
           # NOT as a string. This is the fix for the earlier
