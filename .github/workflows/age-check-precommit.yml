@@ -26,9 +26,43 @@ on:
     inputs:
       min_age_days:
         description: "Minimum tag age in days for any newly-pinned pre-commit hook rev"
+        # Still `number` while `age_check_deadline_seconds` below is `string`.
+        # Not an accident: the empty-value reasoning there applies here too,
+        # but this is the SECURITY parameter, where a shim silently falling
+        # back to a default is the wrong failure mode — an empty value should
+        # stop the check, not quietly pick 7. Changing it is its own PR.
         type: number
         required: false
         default: 7
+      age_check_deadline_seconds:
+        description: |
+          Wall clock, measured from the START OF THE CHECK, after which no
+          further rev is looked up at all — the authenticated tiers and the
+          anonymous-git fallback alike. Whole-run elapsed time, not metered
+          fetch time: the thing being defended against is `timeout-minutes`,
+          which measures wall clock too. Past the deadline the remaining revs
+          are recorded unverifiable immediately, so the job exits 1 with
+          annotations rather than being CANCELLED, which would suppress them.
+          A positive integer <= 480; 0, negatives and fractions are rejected
+          with a clear error, and a larger value is clamped with a warning
+          rather than silently ignored. The ceiling exists because the job is
+          killed at `timeout-minutes` (900s) regardless — the check's own
+          clock starts later than the job's, so the difference funds checkout
+          and setup. Worst-case in-flight work is reserved inside the lib, so
+          this value does not have to leave room for it. An empty value means
+          "not supplied" and takes the default, so a shim wiring its own
+          optional input through does not turn the check red.
+        # `string`, not `number`, deliberately. A shim passing its own unset
+        # optional through (`age_check_deadline_seconds: ${{ inputs.x }}`)
+        # hands Actions an empty value, and what a `number`-typed input
+        # coerces that to is Actions' decision, not ours — if it lands on 0
+        # the lib's "0 is rejected" path fires and the check goes red for
+        # exactly the passthrough this input documents as safe. As a string
+        # the empty value reaches the lib intact, which already parses and
+        # validates it.
+        type: string
+        required: false
+        default: "420"
       comment_on_failure:
         description: |
           Post a sticky PR comment listing pins that failed the age check
@@ -51,7 +85,19 @@ jobs:
   age-check:
     name: Check pre-commit hook rev ages
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 15, not 5: in an allow-listed org every changed pin also makes an
+    # anonymous git fetch, and a `pre-commit autoupdate` PR can bump a dozen
+    # hooks. The lib carries its own run deadline so the job exits 1 with
+    # annotations rather than being CANCELLED here — a kill would suppress
+    # both the annotations and the comment step, which is gated on
+    # `!cancelled()`. This is the outer belt for that.
+    #
+    # 15 so the deadline's ceiling (480) leaves 420s for the
+    # `fetch-depth: 0` checkout above. At 10 it left 120s, which is not enough
+    # for a full-history clone of a large monorepo — and a checkout that
+    # overruns is cancelled before the deadline can convert it into an
+    # annotated failure, which is the whole point of having one.
+    timeout-minutes: 15
     permissions:
       contents: read
       # Only used when `comment_on_failure: true`. Caller's job-level
@@ -78,9 +124,33 @@ jobs:
           # so the post-step below can render the data into a comment
           # without redoing classification. Unset → no-op.
           AGE_CHECK_FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
-          # The consumer's default token suffices: pre-commit hooks are
-          # public github.com repos (releases/tags/commits readable by any
-          # token), and non-github hosts fail closed without an API call.
+          PRECOMMIT_AGE_DEADLINE_SECONDS: ${{ inputs.age_check_deadline_seconds }}
+          # Ceiling for the input above, derived from THIS flavour's
+          # `timeout-minutes` (900s) minus an allowance for the setup that
+          # runs before the check's clock starts. Not a consumer input: a
+          # caller cannot see `timeout-minutes`, so it cannot size this.
+          PRECOMMIT_AGE_DEADLINE_MAX_SECONDS: 480
+          # What an EMPTY (not omitted) value falls back to. Kept equal to
+          # this flavour's YAML `default:` above, so a shim forwarding its own
+          # unset optional gets the same deadline as a caller who omits the
+          # input entirely — a YAML default only applies to an OMITTED key.
+          PRECOMMIT_AGE_DEADLINE_DEFAULT_SECONDS: 420
+          # The consumer's default token drives the three authenticated
+          # tiers, but it is NOT sufficient on its own: an org running a
+          # GitHub IP allow list answers 403 to an AUTHENTICATED read from a
+          # hosted runner even for a PUBLIC repo, which used to make this
+          # check permanently red for any hook it publishes. Revs blocked that
+          # way — and revs the API reports absent — now fall back to a
+          # credential-free git read, which an allow list does not gate. No
+          # extra permission or secret is involved.
+          #
+          # TRANSIENT failures (rate limit, 5xx) deliberately do NOT fall back
+          # and still fail closed: the release date may exist and simply be
+          # unreadable this minute, so re-run the job rather than accepting an
+          # older basis. If you are debugging a red check, that is a withheld
+          # fallback, not a broken one — see the tier-4 section of
+          # lib/age-check-precommit.sh. Non-github hosts still fail closed
+          # without any network call at all.
           GH_TOKEN: ${{ github.token }}
         run: |
           # ============================================================================
@@ -642,6 +712,47 @@ jobs:
           #   Day math is the shared `preflight::classify_age` floor, identical to every
           #   other ecosystem.
           #
+          # Anonymous fallback (tier 4 — runs only when tiers 1-3 ALL come back empty):
+          #   An organization with a GitHub IP allow list answers 403 to an
+          #   AUTHENTICATED API read from a GitHub-hosted runner even when the
+          #   repository is PUBLIC. All three tiers above route through `gh api`, so a
+          #   single hook hosted in such an org made this check permanently red with
+          #   the generic reason "gh api unreachable or tag not found" — the message
+          #   that would have explained why having been discarded by a `2>/dev/null`.
+          #   Allow lists gate AUTHENTICATED access; anonymous public git read is
+          #   unaffected. Same root cause and same remedy as the `git ls-remote` tag
+          #   resolution in qurl-reverse-tunnel-server's
+          #   .github/scripts/check-action-pin-comments.sh — and, once layervai/
+          #   ops-routines#107 lands, as lib/age-check-actions.sh (still open at the time
+          #   of writing, so do not read this as describing main).
+          #
+          #   Tier 4 REPRODUCES tiers 2 and 3 and CANNOT reproduce tier 1:
+          #     4a. annotated tag  -> tagger date     (the same bytes as tier 2)
+          #     4b. lightweight tag / SHA rev -> committer date (same bytes as tier 3)
+          #   A GitHub Release is database metadata with no git object behind it, so
+          #   `published_at` has NO anonymous equivalent. The consequence, stated
+          #   plainly rather than buried: where a Release was published LATER than the
+          #   tag it names, tier 4 reports the older tag date and can therefore pass a
+          #   rev that tier 1 would have blocked. The window is bounded and it is the
+          #   deliberate price of verifying a hook the API refuses to discuss at all —
+          #   the tag was publicly fetchable, and already adoptable by `pre-commit
+          #   autoupdate` (which resolves TAGS, not Releases), for exactly as long as
+          #   tier 4 reports. The alternative is a required check that stays red
+          #   forever for every consumer pinning a hook from an allow-listed org.
+          #
+          #   Which is exactly why tier 4 does NOT run on every API failure. The
+          #   authenticated failure is classified first (see the verdict `kind` block
+          #   further down), and a TRANSIENT one — rate limit, 5xx, anything
+          #   unrecognized — fails closed instead of falling through. Otherwise an
+          #   unrelated blip would silently convert a tier-1 block into a tier-4 pass on
+          #   the very rev whose Release was published today; re-running the job is the
+          #   correct and cheap remedy there, and it recovers the real answer. So the
+          #   basis swap above is confined to the one class that a re-run can never fix:
+          #   the structural block this tier exists for.
+          #
+          #   All four tiers must fail for a rev to go unverifiable, and unverifiable
+          #   still fails closed exactly as before.
+          #
           # GITHUB.COM-ONLY (non-github hosts handled explicitly — qurl-service#890):
           #   Age probing uses the GitHub REST API, so only github.com hooks are
           #   verifiable. A non-github host (GitLab/Codeberg/self-hosted) is treated as
@@ -661,7 +772,56 @@ jobs:
           # Expected env vars:
           #   MIN_AGE_DAYS - default 7 (hook revs are source tags, like go/actions)
           #   BASE_REF     - default 'main'
-          #   GH_TOKEN     - required for the `gh api` release/tag/commit lookups
+          #   PRECOMMIT_AGE_DEADLINE_SECONDS - wall clock, measured from the START
+          #                  OF THE CHECK, after which no further rev is looked up at
+          #                  all — the authenticated tiers and tier 4 alike. Default 420.
+          #                  Surfaced by both reusables as the `age_check_deadline_seconds`
+          #                  input. Past it, remaining revs are recorded unverifiable
+          #                  immediately so the job exits 1 with reasons instead of being
+          #                  killed by the job timeout. Must be a POSITIVE INTEGER
+          #                  (`0`, negatives and fractions are rejected up front with a
+          #                  clear error rather than reaching bash arithmetic); values
+          #                  above PRECOMMIT_AGE_DEADLINE_MAX_SECONDS are clamped with a
+          #                  warning, because the job is killed at `timeout-minutes`
+          #                  regardless.
+          #   PRECOMMIT_AGE_DEADLINE_DEFAULT_SECONDS - what an EMPTY (not omitted)
+          #                  deadline falls back to, default 420. Set by each reusable to
+          #                  match its own YAML `default:`, so empty and omitted agree.
+          #                  Not a consumer input.
+          #   PRECOMMIT_AGE_DEADLINE_MAX_SECONDS - the clamp ceiling, default 480. Set by
+          #                  each reusable from its OWN `timeout-minutes` minus an
+          #                  allowance for the work that runs before this clock starts,
+          #                  because those differ per flavour. Not a consumer input.
+          #
+          #                  SIZING IT. A rev is admitted only if it can FINISH by the
+          #                  deadline: the gate reserves PRECOMMIT_AGE_MAX_REV_COST (see
+          #                  that constant for the arithmetic), so in-flight overshoot is
+          #                  accounted for rather than left as headroom to be eroded by
+          #                  the next timeout somebody adds. What the caller still has to
+          #                  fund is the work OUTSIDE this clock — it starts when the
+          #                  SCRIPT does, while `timeout-minutes` starts at JOB start, so
+          #                  checkout and the App-token mint sit outside it. At the
+          #                  shipped 420 against a 600s job that leaves 180s for setup;
+          #                  at the 480 ceiling, 120s.
+          #
+          #                  Whole-run wall clock is deliberate, not an approximation of
+          #                  an anon-git budget: the thing being defended against is the
+          #                  job timeout, which measures wall clock too. Metering only
+          #                  fetch time would let slow `gh api` tiers exhaust the job
+          #                  while the anon budget still read as unspent.
+          #   GH_TOKEN     - used for the authenticated release/tag/commit lookups.
+          #                  NOTE for self-hosted runners: tier 4 deliberately excludes
+          #                  ambient git config, so an `http.proxy` or `http.sslCAInfo`
+          #                  in /etc/gitconfig does NOT apply to it. A runner that reaches
+          #                  github.com only through such a proxy will fail tier 4 with
+          #                  "anonymous git could not reach the host".
+          #                  NOT sufficient on its own: an org with a GitHub IP allow
+          #                  list 403s an authenticated read from a hosted runner even
+          #                  for a public repo. Revs blocked that way (and revs the API
+          #                  reports absent) fall back to an anonymous git read; a
+          #                  TRANSIENT failure — rate limit, 5xx — does not, and fails
+          #                  closed so a re-run can recover the release date. See
+          #                  precommit_age::git_publish_dt and the verdict-kind block.
           #
           # Exit codes:
           #   0 - all newly-added hook revs are SHA/tag-resolvable and >= MIN_AGE_DAYS old
@@ -823,22 +983,717 @@ jobs:
             fi
           }
 
+          # ----- Failure-reason plumbing ----------------------------------------------
+
+          # Path to the file carrying the verdict on the last publish_dt lookup.
+          # A FILE, not just a variable, because `publish_dt` and all four of its tiers
+          # are invoked as `ts=$(...)` — a command substitution runs in a SUBSHELL, so a
+          # plain assignment would be discarded at exactly the moment the caller needs
+          # it. main() creates the file; a stub that replaces `publish_dt` wholesale (as
+          # the tests do) simply leaves it empty and the caller falls back to a generic
+          # reason.
+          #
+          # The FILE is the only channel that actually works. `write_verdict` also sets
+          # the two variables below, but every writer is reached from inside a
+          # command substitution, so with no file path set the assignment dies with the
+          # subshell and NOTHING is recorded — there is no usable "variable-only mode",
+          # and the variables are a local convenience for same-shell reads only. A
+          # direct unit call that skips main() therefore observes an empty verdict; the
+          # tier-4 gate in publish_dt is an allowlist specifically so that empty case
+          # fails CLOSED rather than reading as "no failure observed".
+          #
+          # The verdict is `<kind>\t<reason>`. `kind` classifies an AUTHENTICATED
+          # failure and decides whether tier 4 is allowed to answer at all:
+          #
+          #   blocked   - the authenticated channel is structurally unavailable to this
+          #               runner (an org IP allow list). Permanent: a re-run never helps,
+          #               and anonymous git is unaffected. Tier 4 RUNS.
+          #   absent    - 404. There is no Release / tag / commit to read, so tier 1 has
+          #               no answer being masked. Tier 4 runs and will normally fail too,
+          #               which is the correct outcome with a better reason.
+          #   transient - rate limit, 5xx, or anything unrecognized. Tier 1's
+          #               `published_at` may well exist and simply be unreadable this
+          #               minute. Tier 4 is NOT run: it would silently swap the Release
+          #               basis for the older tag basis (see the header) when a re-run
+          #               would have recovered the real answer. FAIL CLOSED instead.
+          #
+          # The default is deliberately `transient`, the fail-closed class: an
+          # unrecognized message must never quietly loosen the age basis. A new
+          # structural-block wording shows up verbatim in the job log via `log_detail`,
+          # and belongs in the `blocked` arm of `note_api_failure` once observed.
+          # NOT seeded from the environment, matching actions_age. main() is the only
+          # writer and that is load-bearing rather than incidental: a pre-seeded path
+          # would let a caller choose where reasons are written.
+          PRECOMMIT_AGE_REASON_FILE=""
+          PRECOMMIT_AGE_LOOKUP_KIND=""
+          PRECOMMIT_AGE_LOOKUP_REASON=""
+
+          precommit_age::write_verdict() {
+            local kind="$1" reason="$2"
+            PRECOMMIT_AGE_LOOKUP_KIND="$kind"
+            PRECOMMIT_AGE_LOOKUP_REASON="$reason"
+            [ -n "$PRECOMMIT_AGE_REASON_FILE" ] && printf '%s\t%s' "$kind" "$reason" > "$PRECOMMIT_AGE_REASON_FILE"
+            return 0
+          }
+
+          precommit_age::read_verdict() {
+            if [ -n "$PRECOMMIT_AGE_REASON_FILE" ] && [ -s "$PRECOMMIT_AGE_REASON_FILE" ]; then
+              cat "$PRECOMMIT_AGE_REASON_FILE"
+              return 0
+            fi
+            if [ -n "${PRECOMMIT_AGE_LOOKUP_KIND}${PRECOMMIT_AGE_LOOKUP_REASON}" ]; then
+              printf '%s\t%s' "$PRECOMMIT_AGE_LOOKUP_KIND" "$PRECOMMIT_AGE_LOOKUP_REASON"
+            fi
+            return 0
+          }
+
+          # Reasons come from a FIXED vocabulary defined in this file — never from
+          # upstream text — because they are interpolated into markdown and workflow-
+          # command channels that `preflight::record_unverifiable` only partially
+          # escapes. The verbatim upstream error goes to the job log instead, via
+          # `precommit_age::log_detail`. This writer carries no kind (`-`): it is for the
+          # anonymous tier and for the final composed reason, neither of which feeds the
+          # tier-4 gate.
+          precommit_age::set_reason() {
+            precommit_age::write_verdict "-" "$1"
+          }
+
+          precommit_age::get_reason() {
+            local raw; raw=$(precommit_age::read_verdict)
+            printf '%s' "${raw#*$'\t'}"
+          }
+
+          precommit_age::get_api_kind() {
+            local raw; raw=$(precommit_age::read_verdict)
+            [ -z "$raw" ] && return 0
+            printf '%s' "${raw%%$'\t'*}"
+          }
+
+          precommit_age::clear_reason() {
+            PRECOMMIT_AGE_LOOKUP_KIND=""
+            PRECOMMIT_AGE_LOOKUP_REASON=""
+            [ -n "$PRECOMMIT_AGE_REASON_FILE" ] && : > "$PRECOMMIT_AGE_REASON_FILE"
+            return 0
+          }
+
+          # One spelling of the deadline verdict, shared by every path that gives up on
+          # it — the API gate, tier 4's entry check and its bare-SHA recheck. Three
+          # hand-written copies would drift, and one of them already said the wrong thing.
+          PRECOMMIT_AGE_DEADLINE_REASON="run deadline reached before this rev could be checked; re-run, or raise age_check_deadline_seconds if it happens every time"
+
+          # Worst-case wall clock ONE rev can consume once admitted. The deadline gates
+          # whether the NEXT rev starts, so a rev admitted a second before it still runs
+          # to completion — and a ceiling chosen to "leave room" for that silently goes
+          # stale every time a timeout is added to the rev path. It already did once:
+          # the `--filter` retry widened this by two fetches after the ceiling was set.
+          # So RESERVE it explicitly instead, and derive the number from the timeouts:
+          #
+          #   3 x `timeout 30`   authenticated tiers 1-3
+          #   4 x `timeout 20`   tier 4: tag fetch + bare-SHA fetch, each with the
+          #                      one-shot unfiltered retry
+          #
+          # Anything that adds a bounded call to the rev path must add it here too.
+          #
+          # Subtracted ONCE, as headroom — not charged per rev. Admission therefore runs
+          # until `deadline - 170` of ELAPSED check time, so how many revs fit depends on
+          # how slow they are, not on a per-rev allowance: a dozen hooks resolving in
+          # ~1s each use ~12s of a 190-250s window. The reservation only bites when revs
+          # are individually slow, which is exactly the case where the alternative is
+          # the job being cancelled with no annotations at all.
+          PRECOMMIT_AGE_MAX_REV_COST=170
+
+          precommit_age::kind_rank() {
+            case "$1" in
+              blocked)   printf '3' ;;
+              transient) printf '2' ;;
+              absent)    printf '1' ;;
+              *)         printf '0' ;;
+            esac
+          }
+
+          # Record an AUTHENTICATED failure, keeping the highest-ranking verdict seen
+          # across the three tiers. Ranking matters in both directions:
+          #
+          #   - a 404 on tier 2 must not erase an allow-list 403 from tier 1 (tiers 1-2
+          #     legitimately 404 on every lightweight-tag pin, so `absent` is the least
+          #     informative thing we can learn);
+          #   - a transport blip on tier 2 must not erase it either, or the operator
+          #     loses the one signal saying this is a network-position problem rather
+          #     than an outage — and tier 4, the actual remedy, would be skipped.
+          #
+          # `blocked` therefore outranks `transient`: an allow list is permanent, and an
+          # incidental blip alongside it must not reintroduce the permanently-red check
+          # this tier exists to fix.
+          #
+          # ACCEPTED EDGE, stated rather than hidden: if tier 1 fails transiently and a
+          # LATER tier returns the allow-list 403, the verdict is `blocked` and the basis
+          # swap happens on a failure a re-run might have fixed. It is the one gap in
+          # "the swap is confined to the structural block". An allow list 403s all three
+          # tiers uniformly, so this needs a rate limit and an allow list to interleave
+          # within one rev; taking the other side would cost the permanently-red check in
+          # the common case, which is the worse trade.
+          # `-gt`, deliberately, not `-ge`: rate-limit, 5xx and the catch-all all carry
+          # kind `transient` but DIFFERENT reasons, and at equal rank the last writer
+          # would win — a rate limit on tier 1 followed by anything unrecognized on tier
+          # 2 would leave the operator with the generic "gh api unreachable" instead of
+          # the one message that names the remedy. First-most-specific wins instead. The
+          # initial verdict is empty (rank 0) and every real kind ranks >= 1, so the
+          # first observation still always writes, and the blocked > transient > absent
+          # escalation is unaffected.
+          precommit_age::set_api_verdict() {
+            local kind="$1" reason="$2" cur
+            cur=$(precommit_age::get_api_kind)
+            if [ "$(precommit_age::kind_rank "$kind")" -gt "$(precommit_age::kind_rank "$cur")" ]; then
+              precommit_age::write_verdict "$kind" "$reason"
+            fi
+            return 0
+          }
+
+          # Echo an upstream error verbatim into the job log. This is the half of the
+          # old `2>/dev/null` that was worth keeping: an operator reading a red run
+          # needs GitHub's actual words ("IP allow list", "Not Found", a TLS error), not
+          # our paraphrase of them. Plain `echo`, not `::error::`, so it annotates
+          # nothing.
+          #
+          # Collapses colon RUNS rather than substituting pairs. Pair substitution was
+          # not idempotent (`:::` yielded `:.::`, which still contains `::`), which left
+          # the guarantee resting on the label prefix — and therefore on the runner
+          # parsing `::` only at the start of a line, which is not a property worth
+          # betting on. Ported verbatim from actions_age::log_detail so #110's hoist is
+          # a pure move; having two copies defend the same channel differently is worse
+          # than either choice.
+          precommit_age::log_detail() {
+            local label="$1" text="$2"
+            [ -z "$text" ] && return 0
+            # Say so when the text was altered. The collapse is not free: it mangles
+            # legitimate diagnostics carrying `::` — an IPv6 peer in a curl error
+            # (`Failed to connect to 2606:50c0::153`) is exactly the transport failure
+            # this is trying to make legible. Keeping the defang and labelling it beats
+            # presenting altered text as verbatim.
+            case "$text" in
+              *::*) label="${label} (colon runs collapsed)" ;;
+            esac
+            printf '%s\n' "$text" | sed 's/::\{1,\}/:/g' | sed "s/^/  ${label}: /" >&2
+            return 0
+          }
+
           # ----- Separable: tag publish timestamp via GitHub REST ---------------------
 
           # Single field from `gh api <path> --jq <jq>`, or empty on any error.
           # Fail-closed: non-zero exit, empty body, or literal `null` all map to "" so
           # the caller treats the pin as unverifiable rather than adopting it unchecked.
+          #
+          # Stderr is captured rather than discarded so the failure can be CLASSIFIED
+          # (an org IP allow list is a network-position problem, not a missing tag) and
+          # so GitHub's own words reach the job log. The return contract is unchanged —
+          # always 0, value on stdout — because all three call sites below branch on
+          # `[ -z "$ts" ]`, not on exit status.
           precommit_age::gh_api() {
-            local path="$1" jq="$2" out
-            out=$(gh api "$path" --jq "$jq" 2>/dev/null) || out=""
+            local path="$1" jq="$2" out err err_file rc=0
+            # An infrastructure failure must not read like "the API returned 200 with an
+            # empty field": without a verdict the kind stays empty, which is not
+            # `transient`, so tier 4 would run and the fail-closed default would not be
+            # uniform across the ways this function can give up.
+            err_file=$(mktemp) || {
+              precommit_age::set_api_verdict transient "could not allocate a temp file for the API read"
+              printf '%s' ""
+              return 0
+            }
+            # Bounded for the same reason `anon_git` is. The run deadline stops tier 4
+            # ADDING to a slow run, but nothing stopped tiers 1-3 consuming the job
+            # timeout on their own: a PR bumping 15 hooks issues up to 45 calls, and `gh`
+            # rides Go's default transport, which has connection timeouts but no overall
+            # request deadline. A cancelled run suppresses every annotation and the
+            # `!cancelled()` comment step — the outcome the deadline exists to prevent.
+            # An `rc` of 124 falls through the classifier's default to `transient`, which
+            # is the right class: fail closed, and a re-run may well help.
+            out=$(timeout 30 gh api "$path" --jq "$jq" 2>"$err_file") || rc=$?
+            if [ "$rc" -eq 124 ]; then
+              # `timeout` kills without a word, so err_file is empty and the catch-all
+              # arm would fire the classification-drift `::warning::` on ordinary
+              # network slowness. That warning is the one signal that has to stay
+              # meaningful; crying drift over a known class is how it gets ignored.
+              rm -f "$err_file"
+              precommit_age::set_api_verdict transient "gh api call timed out; re-run the job"
+              out=""
+            elif [ "$rc" -ne 0 ]; then
+              err=$(cat "$err_file")
+              rm -f "$err_file"
+              precommit_age::note_api_failure "$err"
+              out=""
+            else
+              rm -f "$err_file"
+            fi
             [ "$out" = "null" ] && out=""
             printf '%s' "$out"
           }
 
+          # Map one `gh api` failure onto a kind + a fixed reason, and decide whether it
+          # deserves a job-log line. A 404 is ORDINARY traffic here — tiers 1 and 2 miss
+          # on every lightweight-tag pin — so it is recorded quietly. Anything else is
+          # genuinely abnormal and is logged verbatim the moment it happens.
+          precommit_age::note_api_failure() {
+            local err="$1"
+            case "$err" in
+              # ORDER MATTERS. Rate limits and a bad token are themselves 403/401
+              # responses, so they are taken out of the running before the status-based
+              # structural arm below can claim them.
+              *"rate limit"*|*"HTTP 429"*)
+                precommit_age::log_detail "gh api" "$err"
+                precommit_age::set_api_verdict transient "gh api rate limit hit; re-run the job"
+                ;;
+              # A missing or invalid token is a KNOWN class, and telling the operator to
+              # add its wording to the `blocked` arm would be wrong advice. Same reason
+              # rc=124 got its own arm: the drift alarm only stays useful while it means
+              # drift. Fail closed rather than route around a misconfiguration.
+              *"gh auth login"*|*"GH_TOKEN"*|*"Bad credentials"*|*"authentication"*)
+                precommit_age::log_detail "gh api" "$err"
+                precommit_age::set_api_verdict transient "gh api rejected the token; check GH_TOKEN"
+                ;;
+              *"Not Found"*|*"HTTP 404"*)
+                precommit_age::set_api_verdict absent "no release, tag, or commit for this rev via the API"
+                ;;
+              # KEYED ON STATUS, not wording. Matching "IP allow list" alone meant a
+              # reworded body would silently demote every allow-listed org to
+              # `transient` — back to the permanently-red required check this whole
+              # change exists to remove, with nothing signalling the regression. A 403
+              # that is not a rate limit is a STRUCTURAL refusal of the AUTHENTICATED
+              # read: an org IP allow list, SAML enforcement, a third-party-application
+              # restriction, "not accessible by integration". Anonymous public git is
+              # unaffected by every one of them, so they share one remedy — and keying
+              # on status degrades in the SAFE direction when GitHub changes its prose.
+              # The wording match survives only to pick the more specific REASON.
+              *"HTTP 403"*|*"IP allow list"*|*"not permitted to access this resource"*)
+                precommit_age::log_detail "gh api" "$err"
+                case "$err" in
+                  *"IP allow list"*|*"not permitted to access this resource"*)
+                    precommit_age::set_api_verdict blocked "org IP allow list blocked the authenticated API read" ;;
+                  *)
+                    precommit_age::set_api_verdict blocked "the authenticated API read was refused (HTTP 403); anonymous git is unaffected" ;;
+                esac
+                ;;
+              # 5xx is the other class where a re-run genuinely recovers tier 1's
+              # answer, so it is named separately for the operator even though it shares
+              # the fail-closed `transient` kind with the default.
+              *"HTTP 5"*)
+                precommit_age::log_detail "gh api" "$err"
+                precommit_age::set_api_verdict transient "gh api server error; re-run the job"
+                ;;
+              *)
+                # LOUD, not just logged. An unrecognized failure on a required check is
+                # how classification drift announces itself, and `log_detail`'s plain
+                # stderr sinks into ordinary job noise — nobody would be looking. Fixed
+                # text only: the upstream words go to the log, never into an annotation.
+                #
+                # `>&2` IS LOAD-BEARING, not style. This function is only ever reached
+                # from `gh_api`, and every gh_api call site is `ts=$(...)`. On stdout the
+                # annotation is not merely invisible — it is CAPTURED INTO `$ts`, which
+                # then reads as a successful tier-1 lookup: tiers 2-3 are skipped by
+                # their `[ -z "$ts" ]` guards, tier 4 is never consulted, and publish_dt
+                # returns 0 with the warning text as the timestamp. The runner parses
+                # workflow commands on stderr too, so this both renders and stays out of
+                # the return value.
+                echo "::warning::Unrecognized gh api failure — classified as transient (fail-closed). If this is a structural block, add its wording to the blocked arm of precommit_age::note_api_failure. Verbatim error is in the job log." >&2
+                precommit_age::log_detail "gh api" "$err"
+                precommit_age::set_api_verdict transient "gh api unreachable"
+                ;;
+            esac
+            return 0
+          }
+
+          # ----- Separable: tag publish timestamp via anonymous git (tier 4) ----------
+
+          # EVERY git invocation on the anonymous path runs through here, so the
+          # scrubbing is uniform and there is exactly one place to harden.
+          #
+          # ANONYMITY IS LOAD-BEARING, NOT TIDINESS: an allow list rejects an
+          # AUTHENTICATED read, so a credential leaking into this fetch would reproduce
+          # the very 403 the fallback exists to route around — and would classify as a
+          # generic failure, hiding why. A fresh temp repo excludes the local
+          # `.git/config` extraheader `actions/checkout` writes; every other channel here
+          # defeats that guard on its own. This list is kept IDENTICAL to
+          # `actions_age::anon_git` in lib/age-check-actions.sh, which carries the full
+          # per-channel derivation and the verification notes; a test asserts the two do
+          # not drift, and layervai/ops-routines#110 will hoist them into one definition.
+          # In brief, and none of these is hypothetical:
+          #
+          #   GIT_CONFIG_COUNT + GIT_CONFIG_KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS
+          #       inject config at COMMAND-LINE precedence, above the files neutralized
+          #       below. Verified here: a planted `http.extraheader: Authorization:
+          #       basic ...` reached the wire and github.com answered HTTP 400.
+          #   GIT_ASKPASS / SSH_ASKPASS
+          #       consulted BEFORE the terminal prompt, so GIT_TERMINAL_PROMPT=0 alone
+          #       does not stop them re-authenticating.
+          #   GIT_DIR / GIT_COMMON_DIR / GIT_WORK_TREE / GIT_INDEX_FILE /
+          #   GIT_OBJECT_DIRECTORY / GIT_ALTERNATE_OBJECT_DIRECTORIES / GIT_NAMESPACE
+          #       outrank `git -C`. Verified: with GIT_DIR set, `anon_git init -q
+          #       "$work"` never creates $work/.git at all — it initializes GIT_DIR, so
+          #       the fetch then runs inside the consumer checkout, the one repo on the
+          #       machine carrying actions/checkout's extraheader.
+          #   HOME (via ~/.netrc), XDG_CONFIG_HOME
+          #       NOT a git-config channel: git hands libcurl CURL_NETRC_OPTIONAL, so
+          #       ~/.netrc is read independently of git config and `-c
+          #       credential.helper=` does not apply to it. Pointed at a FRESH EMPTY
+          #       DIRECTORY the caller allocates, never at an ambient override — see
+          #       git_publish_dt.
+          #   GIT_EXEC_PATH
+          #       the dispatch table for every git subcommand and remote helper —
+          #       `git-remote-https` and `git-fetch` are resolved through it. Strictly
+          #       larger than the template-dir door below: a planted directory gets code
+          #       execution on the FIRST call here, with no ref update needed to trigger
+          #       it. Config-free, so none of the lines above touch it.
+          #   GIT_TEMPLATE_DIR
+          #       a config-free route to the same place `init.templateDir` reaches, so
+          #       neutralizing the config channels alone does NOT stop a planted
+          #       `reference-transaction` hook from firing on the fetch's ref update —
+          #       which is the outcome routing `git init` through this wrapper is
+          #       supposed to prevent.
+          #   GIT_SSL_NO_VERIFY
+          #       age-check-actions.sh can leave this alone: it fetches a 40-hex SHA, so
+          #       content-addressing means a MITM can only make the fetch FAIL, never
+          #       substitute a different date — TLS is availability there, not
+          #       integrity. THAT ARGUMENT DOES NOT HOLD HERE. Tier 4's primary path
+          #       fetches `refs/tags/<rev>`, a NAME, and reads the date off whatever
+          #       object comes back; with verification disabled the tagger date this
+          #       tier trusts would be attacker-supplied. Scrubbed in both files anyway,
+          #       so the one wrapper stays one wrapper.
+          #
+          # `-c http.extraheader=` is git's documented reset for that multi-valued key.
+          # Belt-and-braces once the channels above are shut, but it names the
+          # actions/checkout vector explicitly rather than leaving it to inference.
+          #
+          # The READS matter as much as the fetch: `--filter=blob:none` makes the temp
+          # repo a promisor, so an object read that missed locally would hit the network
+          # — unbounded and unscrubbed without this. `timeout` bounds each call. 20s, not
+          # 30: tier 4 can make two attempts per rev, once per changed pin. The aggregate
+          # bound is `PRECOMMIT_AGE_DEADLINE_SECONDS` (see git_publish_dt), with the
+          # reusable's `timeout-minutes` as the outer belt — not the other way round, and
+          # deliberately not the job timeout alone, because a timeout kill cancels the
+          # run and suppresses every annotation.
+          #
+          # PRECOMMIT_AGE_ANON_HOME below is NOT seeded from the environment,
+          # deliberately. Every call site sets it as a `local` pointing at a fresh empty
+          # directory it just allocated, and dynamic scoping means that local wins. Read
+          # from the ambient environment, though, the value would be attacker-choosable,
+          # and pointing HOME at a directory holding a `.netrc` reopens the one channel
+          # `-c credential.helper=` demonstrably does not cover. Clearing it at module
+          # scope makes the caller's local the ONLY way it can be set, so the guarantee
+          # does not depend on every future call site remembering to shadow it.
+          PRECOMMIT_AGE_ANON_HOME=""
+
+          precommit_age::anon_git() {
+            env -u GIT_ASKPASS -u SSH_ASKPASS -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
+              -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_OBJECT_DIRECTORY \
+              -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_INDEX_FILE -u GIT_NAMESPACE \
+              -u GIT_TEMPLATE_DIR -u GIT_SSL_NO_VERIFY -u GIT_EXEC_PATH \
+              -u GIT_SSL_CAINFO -u GIT_SSL_CAPATH -u GIT_SSL_CERT -u GIT_SSL_KEY \
+              -u GIT_SSL_VERSION -u GIT_SSL_CIPHER_LIST \
+              -u SSL_CERT_FILE -u SSL_CERT_DIR -u CURL_CA_BUNDLE \
+              -u GIT_TRACE -u GIT_TRACE2 -u GIT_TRACE2_EVENT -u GIT_TRACE2_PERF \
+              -u GIT_TRACE_CURL -u GIT_TRACE_PACKET -u GIT_TRACE_PACKFILE \
+              -u GIT_TRACE_SETUP -u GIT_TRACE_PERFORMANCE -u GIT_TRACE_SHALLOW \
+              -u GIT_TRACE_PACK_ACCESS -u GIT_TRACE_REFS -u GIT_TRACE_FSMONITOR \
+              -u SSLKEYLOGFILE -u GIT_SSH -u GIT_SSH_COMMAND -u GIT_PROXY_COMMAND \
+              HOME="${PRECOMMIT_AGE_ANON_HOME:-/nonexistent}" \
+              XDG_CONFIG_HOME="${PRECOMMIT_AGE_ANON_HOME:-/nonexistent}" \
+              GIT_TERMINAL_PROMPT=0 \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_SYSTEM=/dev/null \
+              timeout 20 git -c credential.helper= -c http.extraheader= "$@"
+          }
+
+          # One credential-free `git fetch` into <work>. Everything after <work> and
+          # <err_file> is handed to `git fetch` verbatim; its stderr lands in <err_file>.
+          #
+          # `--filter=blob:none` is NOT redundant with `--depth=1`: depth bounds how much
+          # HISTORY is sent, the filter bounds how much CONTENT. Depth-1 alone still
+          # ships the pinned commit's complete tree, which for a large action repo is
+          # megabytes we never read — this tier only ever runs `cat-file -t`,
+          # `for-each-ref` and `log -1`, none of which touch a blob, so no lazy fetch can
+          # fire against the promisor remote the filter creates. A server without
+          # partial-clone support ignores it with a warning rather than failing.
+          precommit_age::anon_fetch() {
+            local work="$1" err_file="$2"
+            shift 2
+            local rc=0
+            precommit_age::anon_git -C "$work" \
+              fetch --quiet --depth=1 --no-tags --filter=blob:none "$@" 2>"$err_file" || rc=$?
+            [ "$rc" -eq 0 ] && return 0
+
+            # The comment above is true of SERVERS — they ignore an unsupported filter
+            # with a warning. It is NOT true of older CLIENTS, which refuse `--filter`
+            # outright unless the remote is configured with `extensions.partialClone`.
+            # Without this retry tier 4 is DEAD on a self-hosted runner with an older
+            # git image: every rev reports "anonymous git fallback failed" and the check
+            # is permanently red for an allow-listed org — the exact symptom this whole
+            # change removes, wearing a different message. Ported from
+            # actions_age::git_committer_date.
+            local fetch_err; fetch_err=$(cat "$err_file")
+            local filter_rejected=false
+            case "$fetch_err" in
+              *"--filter"*|*"filtering not recognized"*|*"extensions.partialClone"*|*"partialclone"*)
+                filter_rejected=true ;;
+              # The case the retry was actually written for. git's parse-options strips
+              # the leading `--` before formatting, so a client too old to know the
+              # option emits `error: unknown option \`filter=blob:none'` — which matches
+              # none of the patterns above. Verified on git 2.43.
+              *"unknown option"*"filter"*)
+                filter_rejected=true ;;
+            esac
+            [ "$filter_rejected" = true ] || return "$rc"
+
+            precommit_age::log_detail "anonymous git" "$fetch_err"
+            echo "  retrying the anonymous fetch without --filter (server or client lacks partial clone)" >&2
+            rc=0
+            precommit_age::anon_git -C "$work" \
+              fetch --quiet --depth=1 --no-tags "$@" 2>"$err_file" || rc=$?
+            return "$rc"
+          }
+
+          # Map one anonymous-fetch failure onto the fixed reason vocabulary.
+          precommit_age::classify_git_error() {
+            case "$1" in
+              # `couldn't find remote ref` is git's answer for a tag the remote does not
+              # publish; `upload-pack: not our ref` is the same answer for a SHA. Either
+              # way the rev is absent upstream — distinct from "we could not reach the
+              # repository at all".
+              *"couldn't find remote ref"*|*"not our ref"*)
+                precommit_age::set_reason "rev not found in the public repository" ;;
+              # The server HAS the object but will not serve it directly — a mirror or a
+              # GHES without `uploadpack.allowAnySHA1InWant`. Distinct from absent,
+              # because the remedy is different: nothing about the rev is wrong.
+              *"unadvertised object"*)
+                precommit_age::set_reason "the public repository does not serve unadvertised objects" ;;
+              *"could not read Username"*|*"Authentication failed"*|*"Repository not found"*)
+                precommit_age::set_reason "repository is not publicly readable and the API read failed" ;;
+              # `anon_git` deliberately excludes ambient git config, so a runner that
+              # reaches github.com only through an `http.proxy` or a custom
+              # `http.sslCAInfo` in /etc/gitconfig cannot connect here. Name it rather
+              # than let this tier's own scrubbing surface as a generic failure.
+              *"Could not resolve host"*|*"Failed to connect"*|*"unable to access"*|*"SSL certificate problem"*|*"Connection timed out"*)
+                precommit_age::set_reason "anonymous git could not reach the host (this tier excludes ambient git transport config such as http.proxy)" ;;
+              *)
+                precommit_age::set_reason "anonymous git fallback failed" ;;
+            esac
+            return 0
+          }
+
+          # Tier 4 — resolve the rev's publish moment with NO credentials. Echo an
+          # ISO-8601 timestamp, or return 1 having recorded a reason.
+          #
+          # WHY A FETCH AND NOT `git ls-remote`: ls-remote is the right primitive for
+          # resolving a tag to a SHA, but it publishes no DATES, and a date is the only
+          # thing this check wants. So we fetch the one ref and read the timestamp off
+          # the object itself. That also sidesteps, structurally, the annotated-tag trap
+          # documented in qurl-reverse-tunnel-server's check-action-pin-comments.sh
+          # (`git/ref/tags/<tag>` returns the TAG-OBJECT sha, not the commit, so the
+          # peeled `refs/tags/<tag>^{}` line is the one to read): we never compare SHAs
+          # at all, we ask `cat-file -t` what kind of object the ref names and read the
+          # matching date field. `git log -1` peels an annotated tag on its own, so the
+          # lightweight path doubles as the fallback for a tag object with no tagger.
+          #
+          # WHY IT IS NOT WEAKER THAN THE API for the tiers it covers: git is content-
+          # addressed and these are the same objects the REST API reads its answer from.
+          # `%(taggerdate:iso-strict)` is the byte-for-byte source of tier 2's
+          # `.tagger.date`; `%cI` is tier 3's `.commit.committer.date`. Both are
+          # author-controlled in either tier; the trust model does not change. What
+          # tier 4 CANNOT do is stand in for tier 1 — see the header, and see the
+          # `transient` gate in publish_dt that keeps that substitution from happening
+          # on a failure a re-run would have fixed.
+          precommit_age::git_publish_dt() {
+            local slug="$1" rev="$2"
+            local work err_file err rc=0 obj_type ts="" basis=""
+
+            # RUN DEADLINE. `timeout 20` bounds ONE fetch, but in an allow-listed
+            # org EVERY changed pin reaches tier 4, a `pre-commit autoupdate` PR
+            # routinely bumps 5-15 hooks, and each can cost two fetches. Left unbounded
+            # that reaches the reusable's job timeout — and a timeout KILL is strictly
+            # worse than a slow job: the run is CANCELLED, so the `::error` annotations
+            # never render and the comment step (gated on `!cancelled()`) never posts.
+            # The operator would get less signal than the permanently-red check this
+            # whole change exists to fix. Past the deadline the remaining revs are
+            # recorded unverifiable immediately, so the job still exits 1 with reasons.
+            if [ -n "${PRECOMMIT_AGE_DEADLINE:-}" ] && \
+               [ "$(date +%s)" -ge "$PRECOMMIT_AGE_DEADLINE" ]; then
+              # Name the knob: a re-run only helps if the exhaustion was caused by
+              # transient slowness. A PR bumping enough pins to exhaust the budget
+              # DETERMINISTICALLY needs a bigger budget, not another attempt, and the
+              # operator should not have to guess which case they are in.
+              precommit_age::set_reason "$PRECOMMIT_AGE_DEADLINE_REASON"
+              return 1
+            fi
+
+            work=$(mktemp -d) || { precommit_age::set_reason "anonymous git fallback could not init a workspace"; return 1; }
+            err_file=$(mktemp) || {
+              rm -rf "$work"
+              precommit_age::set_reason "anonymous git fallback could not init a workspace"
+              return 1
+            }
+            # An empty directory to stand in for $HOME, so no ambient ~/.netrc,
+            # ~/.gitconfig or XDG config is reachable from any call in this tier. A
+            # `local` deliberately SHADOWS any ambient PRECOMMIT_AGE_ANON_HOME: read
+            # from the environment it would be attacker-choosable, and pointing it at a
+            # directory containing a .netrc reopens exactly the channel the wrapper
+            # singles out as not covered by `-c credential.helper=`.
+            local anon_home
+            anon_home=$(mktemp -d) || {
+              rm -rf "$work" "$err_file"
+              precommit_age::set_reason "anonymous git fallback could not init a workspace"
+              return 1
+            }
+            local PRECOMMIT_AGE_ANON_HOME="$anon_home"
+
+            if ! precommit_age::anon_git init -q "$work" >/dev/null 2>&1; then
+              rm -rf "$work" "$err_file" "${anon_home:-}"
+              precommit_age::set_reason "anonymous git fallback could not init a workspace"
+              return 1
+            fi
+
+            # TAG FIRST, even for a hex-shaped rev: git's own rev resolution prefers
+            # `refs/tags/<name>` over an object id, so this matches how `pre-commit`
+            # itself would check the rev out. `slug` and `rev` reached here through
+            # `github_slug` and `is_valid_tag`, whose character classes exclude every
+            # refspec and URL metacharacter (no `:`, `^`, `~`, `*`, whitespace, and no
+            # leading `-`), and both are passed as single argv elements.
+            precommit_age::anon_fetch "$work" "$err_file" \
+              "https://github.com/${slug}.git" "refs/tags/${rev}:refs/tags/${rev}" || rc=$?
+
+            if [ "$rc" -eq 0 ]; then
+              obj_type=$(precommit_age::anon_git -C "$work" cat-file -t "refs/tags/${rev}" 2>/dev/null) || obj_type=""
+              if [ "$obj_type" = "tag" ]; then
+                # 4a — annotated tag. Re-pointing an annotated tag writes a NEW tag
+                # object with a new tagger date, which is why tiers 2 and 4a are a
+                # faithful "when did this become adoptable" and tier 3/4b is not.
+                # `for-each-ref <pattern>` matches at `/` boundaries, so this would also
+                # match `refs/tags/<rev>/x`. Safe twice over: is_valid_tag excludes `/`
+                # from `rev`, and the temp repo holds exactly the one ref just fetched.
+                ts=$(precommit_age::anon_git -C "$work" for-each-ref --format='%(taggerdate:iso-strict)' "refs/tags/${rev}" 2>/dev/null) || ts=""
+                basis="the annotated tag object"
+              fi
+              if [ -z "$ts" ]; then
+                # 4b — lightweight tag (or a tag object carrying no tagger line, which
+                # `log -1` peels through). Same freshness caveat as tier 3.
+                ts=$(precommit_age::anon_git -C "$work" log -1 --format=%cI "refs/tags/${rev}" 2>/dev/null) || ts=""
+                basis="the tagged commit (lightweight tag — freshness may be understated)"
+              fi
+            else
+              err=$(cat "$err_file")
+              # A `rev:` is conventionally a tag, but pre-commit accepts a full SHA and
+              # tier 3 resolves one, so the fallback covers the same input space rather
+              # than silently narrowing it. Abbreviated SHAs are excluded: GitHub only
+              # serves a fetch for a full object id.
+              #
+              # The tag-namespace miss above is EXPECTED for a SHA rev, so it is NOT
+              # logged before this attempt — same discipline as the 404s on API tiers 1
+              # and 2. Printing it would put `fatal: couldn't find remote ref` in the log
+              # of a run that then succeeds, which reads as a failure and is not one.
+              # Re-checked here, not just on entry: otherwise a rev starting one second
+              # before the deadline could run BOTH fetches and overshoot by two full
+              # `timeout 20`s. With the recheck the overshoot is bounded by one.
+              local sha_skipped_for_deadline=0
+              if [[ "$rev" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] && \
+                 [ -n "${PRECOMMIT_AGE_DEADLINE:-}" ] && \
+                 [ "$(date +%s)" -ge "$PRECOMMIT_AGE_DEADLINE" ]; then
+                # Tracked, not silently skipped: `err` still holds the TAG fetch's
+                # "couldn't find remote ref", and letting that reach classify_git_error
+                # would tell the reviewer their SHA pin is bogus when it was never even
+                # attempted.
+                sha_skipped_for_deadline=1
+              elif [[ "$rev" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+                : > "$err_file"
+                rc=0
+                precommit_age::anon_fetch "$work" "$err_file" \
+                  "https://github.com/${slug}.git" "$rev" || rc=$?
+                if [ "$rc" -eq 0 ]; then
+                  # Ask what we actually got, exactly as the tag path above does. `rev`
+                  # is validated as 40/64-hex, NOT as a *commit*, and `git log` silently
+                  # PEELS a tag object to its commit — so an annotated tag object created
+                  # today over a year-old commit, pinned by the tag object's own SHA,
+                  # would be dated from the old commit and pass. Every authenticated tier
+                  # fails closed there, and before tier 4 existed the rev was simply
+                  # unverifiable, so skipping this check would loosen the gate relative
+                  # to base. Read by `$rev` rather than FETCH_HEAD for the same reason
+                  # the sibling does: it states the content-addressed invariant at the
+                  # point the security argument leans on it, and FETCH_HEAD here has
+                  # already been touched by the failed tag fetch.
+                  obj_type=$(precommit_age::anon_git -C "$work" cat-file -t "$rev" 2>/dev/null) || obj_type=""
+                  if [ "$obj_type" != "commit" ]; then
+                    precommit_age::log_detail "anonymous git" "pinned rev resolved to a ${obj_type:-unknown} object, not a commit"
+                    rm -rf "$work" "$err_file" "${anon_home:-}"
+                    precommit_age::set_reason "pinned SHA is not a commit object"
+                    return 1
+                  fi
+                  ts=$(precommit_age::anon_git -C "$work" log -1 --format=%cI "$rev" 2>/dev/null) || ts=""
+                  basis="the pinned commit"
+                  # The SHA fetch SUCCEEDED, so the tag-namespace miss still sitting in
+                  # `err` is stale. Left there it would report "rev not found" for a rev
+                  # we just fetched, and print the very line the comment above says must
+                  # not appear once the SHA attempt is made.
+                  err=""
+                else
+                  err=$(cat "$err_file")
+                fi
+              fi
+              if [ -z "$ts" ]; then
+                # Only now, with no attempt left to make, is the error worth the log.
+                if [ "$sha_skipped_for_deadline" -eq 1 ]; then
+                  precommit_age::set_reason "$PRECOMMIT_AGE_DEADLINE_REASON"
+                elif [ "$rc" -eq 124 ]; then
+                  # `timeout` kills the fetch without a word, leaving err_file empty —
+                  # the one failure that would otherwise reach the operator with no
+                  # signal whatsoever.
+                  precommit_age::set_reason "anonymous git fetch timed out"
+                elif [ -n "$err" ]; then
+                  precommit_age::log_detail "anonymous git" "$err"
+                  precommit_age::classify_git_error "$err"
+                else
+                  precommit_age::set_reason "anonymous git fetch produced no publish date"
+                fi
+                rm -rf "$work" "$err_file" "${anon_home:-}"
+                return 1
+              fi
+            fi
+
+            rm -rf "$work" "$err_file" "${anon_home:-}"
+            if [ -z "$ts" ]; then
+              precommit_age::set_reason "anonymous git fetch produced no publish date"
+              return 1
+            fi
+            echo "  ANON-GIT: resolved ${slug}@${rev} from ${basis} with no credentials" >&2
+            # `%cI` / `:iso-strict` preserve the object's original UTC offset
+            # (`...+06:00`), unlike the API's always-`Z` form. `date -d` inside
+            # `preflight::iso8601_to_epoch` normalizes the offset, so the measured age
+            # is identical either way.
+            printf '%s' "$ts"
+          }
+
           # Best-effort ISO-8601 timestamp the tag became public; return 1 if
-          # unverifiable. Three tiers (see header for the age-basis rationale).
+          # unverifiable. Four tiers: three authenticated, then a credential-free git
+          # read (see header for the age-basis rationale and what tier 4 cannot cover).
           precommit_age::publish_dt() {
-            local slug="$1" tag="$2" ts ref obj_type sha
+            local slug="$1" tag="$2" ts ref obj_type sha api_reason api_kind git_reason
+            # The reason is per-rev state and this function is the only writer's entry
+            # point, so reset it here rather than in main()'s loop — a stale reason from
+            # the previous hook would otherwise be reported against this one.
+            precommit_age::clear_reason
+
+            # The deadline gates the AUTHENTICATED tiers too, not just tier 4. Bounding
+            # tier 4 alone was not enough: `timeout 30` bounds one `gh api` call, but a
+            # PR bumping 15 hooks issues up to 45 of them, and 45 x 30s is well past the
+            # reusable's `timeout-minutes` — the run would be CANCELLED before tier 4
+            # ever observed the deadline it owns, which is the annotations-suppressed
+            # outcome the whole mechanism exists to prevent. Past it, a rev costs no
+            # network at all and is recorded unverifiable immediately.
+            # Admit a rev only if it can FINISH by the deadline, not merely start before
+            # it. Without the reservation the deadline bounds admission while the job
+            # timeout bounds completion, and the gap between them is exactly the
+            # cancelled-run-with-no-annotations mode this exists to prevent.
+            if [ -n "${PRECOMMIT_AGE_DEADLINE:-}" ] && \
+               [ "$(date +%s)" -ge "$((PRECOMMIT_AGE_DEADLINE - PRECOMMIT_AGE_MAX_REV_COST))" ]; then
+              precommit_age::set_reason "$PRECOMMIT_AGE_DEADLINE_REASON"
+              return 1
+            fi
+
             # 1. GitHub Release publish date — the tag-pin freshness signal.
             ts=$(precommit_age::gh_api "repos/${slug}/releases/tags/${tag}" '.published_at // empty')
             # 2. Annotated tag -> tagger date. One ref lookup returns both the object
@@ -869,16 +1724,177 @@ jobs:
             if [ -z "$ts" ]; then
               ts=$(precommit_age::gh_api "repos/${slug}/commits/${tag}" '.commit.committer.date // empty')
             fi
-            [ -n "$ts" ] || return 1
-            printf '%s' "$ts"
+            if [ -n "$ts" ]; then
+              printf '%s' "$ts"
+              return 0
+            fi
+
+            # 4. Anonymous git — the authenticated tiers are all unreachable. See the
+            #    header for what this tier can and cannot stand in for.
+            api_reason=$(precommit_age::get_reason)
+            api_kind=$(precommit_age::get_api_kind)
+            [ -n "$api_reason" ] || api_reason="gh api returned no release, tag, or commit date"
+
+            # A TRANSIENT authenticated failure is the one class where handing over to
+            # tier 4 would quietly downgrade the age BASIS: tier 1's `published_at` may
+            # exist and merely be unreadable this minute, and re-running the job
+            # recovers it. Fail closed and say so instead. `absent` carries no such risk
+            # (a 404 on releases/tags means there IS no Release, so nothing is masked),
+            # and `blocked` is the permanent condition this tier exists for — the one
+            # place the basis swap is a deliberate, documented trade.
+            # An ALLOWLIST, not `[ "$api_kind" = transient ]`. Only the two classes
+            # proven safe above may hand over; everything else — including an EMPTY kind
+            # — fails closed. That empty case is real, not defensive padding: every
+            # verdict is written from inside a `ts=$(...)` subshell, so if the reason
+            # FILE is unset (a direct unit call that skips main()) nothing is recorded at
+            # all, and a denylist would read "no failure observed" and run tier 4. The
+            # fail-closed default then inverted precisely where it matters — a
+            # rate-limited lookup would resolve off the author-controlled tag date.
+            if [ "$api_kind" != "blocked" ] && [ "$api_kind" != "absent" ]; then
+              precommit_age::set_reason "${api_reason}; not retried anonymously because a re-run may recover the release date"
+              return 1
+            fi
+
+            echo "  API tiers failed (${api_reason}); retrying anonymously over git" >&2
+            if ts=$(precommit_age::git_publish_dt "$slug" "$tag"); then
+              printf '%s' "$ts"
+              return 0
+            fi
+
+            # All four tiers failed: report the authenticated and anonymous verdicts
+            # together so the operator can tell an allow-list rejection from a genuinely
+            # absent rev without reverse-engineering it from a runner log. Tier 4's
+            # reason comes back through get_reason (the FILE) for the same reason the
+            # API tiers' did — the call above ran in a command-substitution subshell, so
+            # the variable it assigned is already gone by the time control reaches here.
+            git_reason=$(precommit_age::get_reason)
+            precommit_age::set_reason "${api_reason}; ${git_reason}"
+            return 1
           }
 
           # ----- Main -----------------------------------------------------------------
 
           precommit_age::main() {
-            preflight::require_tools gh awk sed grep sort
+            # `git` was always a hard dependency (every diff goes through it) but was
+            # never declared; `timeout` bounds the anonymous-git tier, and `mktemp`
+            # backs the reason file, the gh_api stderr capture and the tier-4 workspace.
+            # All ship in the same GNU coreutils/git baseline the GNU-date probe below
+            # already assumes, so declaring them costs nothing and fails legibly if
+            # absent.
+            # `cat`/`rm` back the reason file and the tier-4 workspace. `tr`/`head` are
+            # also on the path but belong to _preflight.sh's own contract, shared with
+            # every other ecosystem — they should be declared there, not only here.
+            preflight::require_tools gh git timeout mktemp env cat rm awk sed grep sort
             preflight::require_gnu_date
             preflight::validate_min_age_days
+
+            # Carries the publish_dt failure reason across the command-substitution
+            # subshell boundary — see the PRECOMMIT_AGE_REASON_FILE comment above.
+            PRECOMMIT_AGE_REASON_FILE=$(mktemp)
+            trap 'rm -f "$PRECOMMIT_AGE_REASON_FILE"' EXIT
+
+            # Wall-clock ceiling for tier 4, stamped here so it covers the WHOLE check —
+            # see the run-deadline note in git_publish_dt for why that is the right
+            # measure rather than metered fetch time. Read-only in the subshells that
+            # check it, so a plain exported variable is enough (unlike the reason, which
+            # is written there).
+            #
+            # Validated before it reaches `$(( ))`: bash evaluates array subscripts
+            # inside arithmetic, so an unvalidated `a[$(...)]` would be a command-
+            # execution surface, and a merely non-numeric value would abort the step
+            # under `set -e` with no annotations, no summary and no comment — the exact
+            # outcome the deadline exists to prevent. Same discipline, and the same
+            # `10#` base-10 guard against leading zeros, as validate_min_age_days.
+            # 420, not 180. The deadline gates the AUTHENTICATED tiers too, so it bounds
+            # every run now, not just the ones reaching tier 4 — and at 180 against a
+            # 600s job it would fail a check that PASSED before this PR (base had no
+            # deadline and `timeout-minutes: 5`, so a 200s run passed; at 180 the same
+            # run records its remaining pins unverifiable and exits 1). 420 leaves the
+            # job ~3 minutes for checkout and setup, keeping the never-CANCELLED property
+            # without inventing a regression window.
+            # UNSET and EMPTY mean different things here, and telling them apart is what
+            # protects consumers who have not re-pinned.
+            #
+            # The internal reusable checks out ops-routines at `ref: main`, so it runs
+            # the LATEST lib — but fleet shims pin the WORKFLOW by SHA. A shim still on a
+            # pre-deadline pin therefore gets the new tier 4 (an extra anonymous fetch
+            # per blocked or absent rev) under that old workflow's `timeout-minutes: 5`,
+            # with neither of these variables in its step `env:`. That is strictly more
+            # wall clock inside a 300s cap, and before this change those consumers at
+            # least failed FAST — a 403 went straight to fail-closed. Cancelling them
+            # with no annotations would be a worse outcome than the bug being fixed.
+            #
+            # Every current reusable SETS the variable (possibly to empty, per the
+            # `type: string` rationale), so a fully unset one uniquely identifies an old
+            # pin — and gets a deadline sized for a 300s job rather than a 600s one.
+            # Empty, by contrast, is an ordinary shim passing through its own unset
+            # optional, and takes the caller's default. Deliberately unlike MIN_AGE_DAYS,
+            # which rejects empty: that is a security parameter where fail-closed is the
+            # right answer, and a tuning knob is not.
+            # The EMPTY fallback is per-flavour, from the same env the ceiling comes
+            # from. A hardcoded one could not be right for both: the two reusables
+            # declare different YAML `default:`s (420 public, 360 internal), a YAML
+            # default applies only when the input is OMITTED, and empty is precisely the
+            # passthrough case `type: string` exists to protect. One constant would make
+            # empty and omitted produce DIFFERENT deadlines on at least one flavour —
+            # and on the internal one the empty value would have been the LARGER, so a
+            # shim forwarding an unset optional would silently outrank a caller who
+            # omitted the input entirely.
+            local anon_deadline_raw anon_deadline_ceiling_default anon_deadline_default
+            anon_deadline_default="${PRECOMMIT_AGE_DEADLINE_DEFAULT_SECONDS:-420}"
+            [ -z "$anon_deadline_default" ] && anon_deadline_default=420
+            if ! [[ "$anon_deadline_default" =~ ^[0-9]+$ ]] || [ "$((10#$anon_deadline_default))" -lt 1 ]; then
+              echo "::error::PRECOMMIT_AGE_DEADLINE_DEFAULT_SECONDS must be a positive integer (got: ${anon_deadline_default:-<unset>})"
+              exit 1
+            fi
+            if [ -z "${PRECOMMIT_AGE_DEADLINE_SECONDS+set}" ]; then
+              anon_deadline_raw=180
+              anon_deadline_ceiling_default=180
+            else
+              anon_deadline_raw="${PRECOMMIT_AGE_DEADLINE_SECONDS:-$anon_deadline_default}"
+              anon_deadline_ceiling_default=480
+              [ -z "$anon_deadline_raw" ] && anon_deadline_raw="$anon_deadline_default"
+            fi
+            if ! [[ "$anon_deadline_raw" =~ ^[0-9]+$ ]] || [ "$((10#$anon_deadline_raw))" -lt 1 ]; then
+              echo "::error::PRECOMMIT_AGE_DEADLINE_SECONDS must be a positive integer (got: ${anon_deadline_raw:-<unset>})"
+              exit 1
+            fi
+            # CLAMPED, because the deadline is a caller-settable workflow input while
+            # `timeout-minutes: 10` in both reusables is not. A consumer who reads "raise
+            # it if you have a lot of hooks" and passes 900 would get a job GUARANTEED to
+            # be cancelled at 600s — silently, since the deadline never fires — which is
+            # the annotation-suppressing outcome this whole mechanism exists to avoid.
+            # The advice "keep it under timeout-minutes" cannot be followed from where it
+            # is read: that line is not visible in the caller's workflow.
+            #
+            # 450 = 600s job budget - ~110s of in-flight overshoot (see the sizing note
+            # in the header) - a margin for checkout and setup. IF `timeout-minutes`
+            # CHANGES IN EITHER REUSABLE, THIS CEILING MUST CHANGE WITH IT.
+            # PER-FLAVOUR, because the ceiling is a function of the CALLER's job budget
+            # and those differ. A single hardcoded number was wrong in both directions
+            # at once: too high for whichever flavour has the smaller `timeout-minutes`,
+            # and too low for the other, which then had the largest job budget and the
+            # smallest usable deadline. Each reusable now declares its own, derived from
+            # its own timeout minus an allowance for the work that happens BEFORE this
+            # clock starts (checkout, and for the internal flavour a token mint and a
+            # second checkout). The default here is the conservative one, for a direct
+            # invocation that sets nothing.
+            #
+            # The reservation above — not this ceiling — is what covers in-flight
+            # overshoot; this funds only what sits outside the deadline's clock.
+            local anon_deadline_max="${PRECOMMIT_AGE_DEADLINE_MAX_SECONDS:-$anon_deadline_ceiling_default}"
+            [ -z "$anon_deadline_max" ] && anon_deadline_max="$anon_deadline_ceiling_default"
+            if ! [[ "$anon_deadline_max" =~ ^[0-9]+$ ]] || [ "$((10#$anon_deadline_max))" -lt 1 ]; then
+              echo "::error::PRECOMMIT_AGE_DEADLINE_MAX_SECONDS must be a positive integer (got: ${anon_deadline_max:-<unset>})"
+              exit 1
+            fi
+            anon_deadline_max=$((10#$anon_deadline_max))
+            if [ "$((10#$anon_deadline_raw))" -gt "$anon_deadline_max" ]; then
+              echo "::warning::age_check_deadline_seconds=${anon_deadline_raw} exceeds the ${anon_deadline_max}s ceiling and was clamped. The job is killed at timeout-minutes (600s) regardless, and a kill suppresses every annotation and the PR comment — which is what this deadline exists to prevent."
+              anon_deadline_raw="$anon_deadline_max"
+            fi
+            PRECOMMIT_AGE_DEADLINE=$(( $(date +%s) + 10#$anon_deadline_raw ))
+            export PRECOMMIT_AGE_DEADLINE
 
             local base_ref="origin/${BASE_REF}"
             preflight::verify_base_ref "$base_ref"
@@ -945,10 +1961,27 @@ jobs:
 
                 local ts
                 if ! ts=$(precommit_age::publish_dt "$slug" "$rev"); then
-                  echo "::error file=${file}::Could not verify age for ${slug}@${rev} (no release/tag/commit date via gh api)."
-                  echo "| \`${safe_slug}\` | \`${safe_rev}\` | — | :x: api unreachable |" >> "$GITHUB_STEP_SUMMARY"
-                  preflight::record_unverifiable "$safe_slug" "$safe_rev" \
-                    "gh api unreachable or tag not found"
+                  # Every tier — authenticated and anonymous — failed. The reason is
+                  # composed from this file's fixed vocabulary, so it is safe to
+                  # interpolate and it names WHICH wall was hit: an org IP allow list
+                  # reads very differently from a deleted tag, and the next person
+                  # should not have to reverse-engineer that from a runner log.
+                  local reason; reason=$(precommit_age::get_reason)
+                  [ -n "$reason" ] || reason="gh api unreachable or tag not found"
+                  echo "::error file=${file}::Could not verify age for ${slug}@${rev} (${reason})."
+                  # Carry the reason into the cell. The step summary is the first thing
+                  # a reviewer opens, and a bare "unverifiable" says less than the row
+                  # said before this change — the whole point of the plumbing is that an
+                  # allow list reads differently from a deleted tag. Safe to interpolate:
+                  # every reason is from this file's fixed vocabulary, so none contains
+                  # the `|` that would split the table row.
+                  # The `|` strip is STRUCTURAL, not decoration: every reason is from
+                  # this file's fixed vocabulary and pipe-free today, but that invariant
+                  # would otherwise live only in a comment, and one `|` splits the table
+                  # row. Mirrors what record_unverifiable already does to this string.
+                  local safe_reason; safe_reason=$(printf '%s' "$reason" | tr -d '|')
+                  echo "| \`${safe_slug}\` | \`${safe_rev}\` | — | :x: ${safe_reason} |" >> "$GITHUB_STEP_SUMMARY"
+                  preflight::record_unverifiable "$safe_slug" "$safe_rev" "$reason"
                   failed=true
                   continue
                 fi

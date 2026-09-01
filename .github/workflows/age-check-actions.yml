@@ -922,30 +922,148 @@ jobs:
           #     happy path, but a self-hosted runner with a netrc entry would hand
           #     credentials to exactly the host this tier routes around.
           #
-          # GIT_TRACE / GIT_TRACE2* are deliberately NOT scrubbed either: they add
-          # stderr noise, never credentials. The noise reaches log_detail and could in
-          # principle match a classification arm, which is a cosmetic risk on a
-          # self-hosted runner that sets them, not a security one.
+          # The GIT_TRACE* write primitives are scrubbed — every documented one that can
+          # be reached from a normal runner, which is NOT the same claim as "in full",
+          # and the difference is the point. An earlier version of this paragraph did
+          # assert completeness and was wrong twice over; enumerating a family by hand is
+          # the failure mode #110's `env -i` allowlist exists to end, and until that
+          # lands this list is a best effort, not a closed set. GIT_TRACE_REFS is worth
+          # naming: it fires on the ref update this tier's own fetch performs.
+          #
+          # GIT_SSH / GIT_SSH_COMMAND / GIT_PROXY_COMMAND go too. They are unreachable
+          # today — the remote is a hard-coded `https://` URL and every `insteadOf`
+          # channel is shut — so this is the same uniformity argument as
+          # GIT_SSL_VERSION below, not a live hole.
+          #
+          # The reversal that started this list, reversing an earlier call that
+          # weighed only the stderr noise they add. Every one of them takes git's trace
+          # value convention, where an absolute path means "append trace output to this
+          # file" — so each is a primitive for making git WRITE attacker-chosen files.
+          # GIT_TRACE_CURL additionally echoes request headers and GIT_TRACE_PACKFILE
+          # writes the raw packfile. SSLKEYLOGFILE is the same shape one layer down:
+          # libcurl/OpenSSL writes to an attacker-chosen path, and the content is key
+          # material. None is an integrity break — no credential is on the wire by
+          # construction — but a write side-effect is not "cosmetic". Listing only the
+          # handful one happens to think of makes the rationale read as complete when it
+          # is not, which is exactly the denylist failure #110 exists to end.
+          #
+          # GIT_SSL_VERSION / GIT_SSL_CIPHER_LIST are also scrubbed, and unlike the
+          # trust-anchor four they carry NO integrity argument: github.com will not
+          # negotiate down to anything trivially breakable, so weakening them can only
+          # cause a failure. They are here for uniformity — "no ambient TLS
+          # configuration" is one sentence, where "no ambient TLS configuration except
+          # the two that only affect negotiation" is a rule nobody will maintain. The
+          # cost is that a runner setting them for a local TLS policy sees this tier
+          # negotiate differently from the rest of its jobs; it fails closed if that
+          # matters.
           #
           # XDG_CONFIG_HOME is belt-and-braces (already shadowed by GIT_CONFIG_GLOBAL),
           # kept so "no ambient config, no ambient credentials" needs no per-variable
-          # argument. GIT_SSL_NO_VERIFY / GIT_SSL_CAINFO are deliberately NOT scrubbed:
-          # content-addressing means a MITM can only make the fetch fail, never
-          # substitute a different date, so TLS is availability here, not integrity.
+          # argument.
+          #
+          # GIT_EXEC_PATH is the dispatch table for every git subcommand and remote
+          # helper, so a planted directory gets code execution on the first call — a
+          # strictly larger door than the template one below, and equally config-free.
+          #
+          # GIT_TEMPLATE_DIR is a config-free route to what `init.templateDir` reaches,
+          # so neutralizing the config channels alone would not stop a planted
+          # `reference-transaction` hook firing on the fetch's ref update.
+          #
+          # GIT_SSL_NO_VERIFY *is* scrubbed, though the availability-not-integrity
+          # argument still holds HERE: this file fetches a 40-hex SHA, so a MITM can only
+          # make the fetch fail, never substitute a different date. It does NOT hold for
+          # the sibling tier in lib/age-check-precommit.sh, which fetches `refs/tags/
+          # <rev>` — a NAME — and reads the date off whatever object arrives. The two
+          # wrappers are kept identical (a test asserts it; #110 will hoist them into
+          # one), so the stricter requirement wins.
+          #
+          # GIT_SSL_CAINFO / GIT_SSL_CAPATH are scrubbed for the SAME reason, and an
+          # earlier version of this comment had it backwards: these replace the TRUST
+          # ANCHOR SET, not the path to the usual one, so a bundle carrying an attacker
+          # CA makes a forged github.com certificate VALIDATE. That is not a failure, it
+          # is a silent success against the wrong peer — the identical integrity break
+          # GIT_SSL_NO_VERIFY is scrubbed to prevent, reached through a different door.
+          # GIT_SSL_CERT / GIT_SSL_KEY go too: they put a CLIENT CERTIFICATE on the wire,
+          # which cannot coexist with a wrapper whose contract is "no credential reaches
+          # the fetch". All four are read straight from the environment by git's HTTP
+          # layer, so neutralizing the config channels does not cover them.
+          #
+          # SSL_CERT_FILE / SSL_CERT_DIR / CURL_CA_BUNDLE join the scrub list: libcurl
+          # reads them from the environment and they replace the same trust anchor set
+          # GIT_SSL_CAINFO does, so leaving them out would have made the argument above
+          # depend on which TLS backend the image was built against — a build detail,
+          # where everything else here is structural. Cost is nil on a runner whose curl
+          # has the system store compiled in, which is every supported one.
+          #
+          # http_proxy / https_proxy / ALL_PROXY are DELIBERATELY NOT scrubbed, and this
+          # is the one place availability is allowed to win. They are read by libcurl,
+          # so nothing above covers them, and a proxy URL can carry credentials that
+          # libcurl puts on the wire as `Proxy-Authorization` — which does sit awkwardly
+          # against "no credential reaches the fetch". But scrubbing them would remove
+          # the only route by which a proxied self-hosted runner can reach github.com AT
+          # ALL, turning a working configuration into a permanently red check: the exact
+          # failure class this tier exists to remove, re-created in the name of tidiness.
+          # The residual is bounded — TLS verification is intact (see the four variables
+          # above), so a proxy cannot forge github.com; a proxy credential reaches the
+          # proxy its own operator configured, not an attacker-chosen host.
+          #
+          # KNOWN CONSEQUENCE of scrubbing the trust anchors, stated so nobody has to
+          # discover it from a bare fetch failure: those five variables are also how a
+          # TLS-INTERCEPTING corporate proxy supplies its own CA when it is not in the
+          # system store — so the very runner shape the proxy carve-out above protects
+          # is the one most likely to break on this scrub. It fails closed rather than
+          # wrong, which is the correct direction, but the fix is to install that CA in
+          # the system trust store rather than pass it through the environment.
+          #
+          # ACCEPTED OUT OF SCOPE, so this enumeration is not mistaken for exhaustive:
+          # `git` and `timeout` are still resolved through the ambient PATH, and
+          # LD_PRELOAD is untouched. Either is a strictly larger code-execution door than
+          # GIT_EXEC_PATH, reached with less setup. Closing them means absolute binary
+          # paths and a scrubbed PATH, which is a different change with its own failure
+          # modes; scrubbing GIT_EXEC_PATH closes one member of that class, not the
+          # class. A hostile co-tenant STEP in the consumer's job is outside the model
+          # this wrapper defends — it defends against ambient config and credentials
+          # that a normal job (notably actions/checkout) leaves lying around.
+          #
+          # `-c http.extraheader=` is git's documented reset for that multi-valued key.
+          # Redundant once every channel above is shut — there is nowhere left for the
+          # key to come from — but it names the actions/checkout vector explicitly
+          # instead of leaving it to inference, and keeps this wrapper identical to
+          # `precommit_age::anon_git`, which a test now asserts.
           #
           # The reads matter as much as the fetch: `--filter=blob:none` makes the temp
           # repo a promisor, so an object read that missed locally would hit the network
           # — unbounded and unscrubbed without this. `timeout` bounds each call.
+          #
+          # ACTIONS_AGE_ANON_HOME below is NOT seeded from the environment,
+          # deliberately. Every call site sets it as a `local` pointing at a fresh empty
+          # directory it just allocated, and dynamic scoping means that local wins. Read
+          # from the ambient environment, though, the value would be attacker-choosable,
+          # and pointing HOME at a directory holding a `.netrc` reopens the one channel
+          # `-c credential.helper=` demonstrably does not cover. Clearing it at module
+          # scope makes the caller's local the ONLY way it can be set, so the guarantee
+          # does not depend on every future call site remembering to shadow it.
+          ACTIONS_AGE_ANON_HOME=""
+
           actions_age::anon_git() {
             env -u GIT_ASKPASS -u SSH_ASKPASS -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
               -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_OBJECT_DIRECTORY \
               -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_INDEX_FILE -u GIT_NAMESPACE \
+              -u GIT_TEMPLATE_DIR -u GIT_SSL_NO_VERIFY -u GIT_EXEC_PATH \
+              -u GIT_SSL_CAINFO -u GIT_SSL_CAPATH -u GIT_SSL_CERT -u GIT_SSL_KEY \
+              -u GIT_SSL_VERSION -u GIT_SSL_CIPHER_LIST \
+              -u SSL_CERT_FILE -u SSL_CERT_DIR -u CURL_CA_BUNDLE \
+              -u GIT_TRACE -u GIT_TRACE2 -u GIT_TRACE2_EVENT -u GIT_TRACE2_PERF \
+              -u GIT_TRACE_CURL -u GIT_TRACE_PACKET -u GIT_TRACE_PACKFILE \
+              -u GIT_TRACE_SETUP -u GIT_TRACE_PERFORMANCE -u GIT_TRACE_SHALLOW \
+              -u GIT_TRACE_PACK_ACCESS -u GIT_TRACE_REFS -u GIT_TRACE_FSMONITOR \
+              -u SSLKEYLOGFILE -u GIT_SSH -u GIT_SSH_COMMAND -u GIT_PROXY_COMMAND \
               HOME="${ACTIONS_AGE_ANON_HOME:-/nonexistent}" \
               XDG_CONFIG_HOME="${ACTIONS_AGE_ANON_HOME:-/nonexistent}" \
               GIT_TERMINAL_PROMPT=0 \
               GIT_CONFIG_GLOBAL=/dev/null \
               GIT_CONFIG_SYSTEM=/dev/null \
-              timeout 30 git -c credential.helper= "$@"
+              timeout 30 git -c credential.helper= -c http.extraheader= "$@"
           }
 
           actions_age::git_committer_date() {
@@ -1357,7 +1475,7 @@ jobs:
             # Carries the committer-date failure reason across the command-substitution
             # subshell boundary — see the ACTIONS_AGE_REASON_FILE comment above.
             #
-            # This is the ONLY EXIT trap set anywhere in lib/, and `trap ... EXIT`
+            # This is the only EXIT trap set in THIS file, and `trap ... EXIT`
             # replaces rather than appends. If a future caller or sibling helper ever
             # installs one, this line silently disables it — chain them explicitly
             # instead of adding a second unconditional `trap`.
