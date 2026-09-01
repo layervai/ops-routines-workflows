@@ -616,7 +616,22 @@ jobs:
           # Expected env vars:
           #   MIN_AGE_DAYS - default 7
           #   BASE_REF     - default 'main'
-          #   GH_TOKEN     - required for gh api commit lookups
+          #   GH_TOKEN     - used for the authenticated commit lookup. NOT sufficient on
+          #                  its own: an org with a GitHub IP allow list 403s an
+          #                  authenticated read from a hosted runner even for a public
+          #                  repo, so each pin falls back to an anonymous git fetch of
+          #                  the exact SHA. See actions_age::git_committer_date.
+          #                  A consequence worth knowing on self-hosted runners: that
+          #                  fallback deliberately runs with the ambient git config
+          #                  excluded, so `http.proxy` / `http.sslCAInfo` kept in
+          #                  /etc/gitconfig or ~/.gitconfig do NOT apply to it. On a
+          #                  runner that reaches the server only via such a proxy the
+          #                  fallback cannot connect, and the pin fails closed with a
+          #                  reason naming the host as unreachable. Note this applies to
+          #                  git-config proxies only: `https_proxy` / `HTTPS_PROXY` /
+          #                  `ALL_PROXY` are environment variables, are NOT scrubbed,
+          #                  and git still honours them — so most proxied runners are
+          #                  unaffected.
           #   ACTIONS_AGE_TRUSTED_OWNER - caller repository owner; self-reference pins
           #                  may skip age only inside this owner and after provenance
           #   AGE_CHECK_SKIP_SELF_REFS - trusted reusable repositories whose exact pins
@@ -702,16 +717,573 @@ jobs:
 
           # ----- Separable: GitHub commit timestamp -----------------------------------
 
-          actions_age::committer_date() {
-            local owner="$1" repo="$2" sha="$3"
-            if ! gh api "/repos/${owner}/${repo}/commits/${sha}" --jq '.commit.committer.date // empty' 2>/dev/null; then
-              return 1
-            fi
+          # Path to the file carrying the reason the last committer-date lookup failed.
+          # A FILE, not just a variable, because `committer_date` and its two tiers are
+          # invoked as `ts=$(...)` — a command substitution runs in a SUBSHELL, so a
+          # plain assignment would be discarded at exactly the moment the caller needs
+          # it. main() creates one up front; `committer_date` allocates its own when the
+          # path is empty (see the wrapper below), so there is NO variable-only mode to
+          # get wrong — every path that can set a reason has a file behind it. A stub
+          # that replaces `committer_date` wholesale (as the tests do) writes no reason
+          # at all, and the caller falls back to a generic one.
+          # NOT seeded from the environment. main() is the only writer, and that is
+          # load-bearing rather than incidental: a pre-seeded path would let a caller
+          # choose where reasons are written, and the sibling cache below is worse.
+          ACTIONS_AGE_REASON_FILE=""
+          ACTIONS_AGE_LOOKUP_REASON=""
+
+          # Per-run memo for committer-date lookups, keyed `owner@repo@sha`. A FILE tree
+          # for the same reason the reason is a file: lookups run inside `ts=$(...)`, so
+          # an associative array would not survive back to main().
+          #
+          # `added_uses` dedupes per FILE, so one pin repeated across N changed workflow
+          # files costs N lookups — and the anonymous tier turns each of those into a
+          # network fetch. A Dependabot bump touching one action across several
+          # workflows is exactly that shape. `@` is the separator because owner and repo
+          # are validated to `[A-Za-z0-9._-]`, which cannot contain it, so distinct pins
+          # cannot collide on a key.
+          #
+          # Failures are memoized too, and that is the more valuable half: `timeout 30`
+          # is PER INVOCATION, and one pin can spend it on `gh api`, the filtered fetch,
+          # the unfiltered retry, `cat-file` and `log`. Against a black-holing host the
+          # per-pin ceiling is minutes, not 30s, so an unreachable pin repeated across N
+          # files is the worst tail this check has. Scope is one job, so nothing is
+          # cached across runs.
+          # NOT seeded from the environment, and this one is security-relevant: a
+          # pre-seeded directory holding `owner@repo@sha` files with `ok\n<ancient
+          # timestamp>` would let a pin skip BOTH tiers entirely, because the memo
+          # replay returns before either runs. main() overwrites it with a fresh
+          # `mktemp -d` before any lookup; keeping the env fallback would have made
+          # that overwrite the only thing standing between a hostile environment and a
+          # forged age.
+          ACTIONS_AGE_CACHE_DIR=""
+
+          # Reasons come from a FIXED vocabulary defined in this file — never from
+          # upstream text — because they are interpolated into markdown and workflow-
+          # command channels that `preflight::record_unverifiable` only partially
+          # escapes. The verbatim upstream error goes to the job log instead, via
+          # `actions_age::log_detail`.
+          actions_age::set_reason() {
+            ACTIONS_AGE_LOOKUP_REASON="$1"
+            [ -n "$ACTIONS_AGE_REASON_FILE" ] && printf '%s' "$1" > "$ACTIONS_AGE_REASON_FILE"
+            return 0
           }
 
+          actions_age::get_reason() {
+            if [ -n "$ACTIONS_AGE_REASON_FILE" ] && [ -s "$ACTIONS_AGE_REASON_FILE" ]; then
+              cat "$ACTIONS_AGE_REASON_FILE"
+              return 0
+            fi
+            printf '%s' "$ACTIONS_AGE_LOOKUP_REASON"
+          }
+
+          actions_age::clear_reason() {
+            ACTIONS_AGE_LOOKUP_REASON=""
+            [ -n "$ACTIONS_AGE_REASON_FILE" ] && : > "$ACTIONS_AGE_REASON_FILE"
+            return 0
+          }
+
+          # Echo an upstream error verbatim into the job log. This is the half of the
+          # old `2>/dev/null` that was worth keeping: an operator reading a red run
+          # needs GitHub's actual words ("IP allow list", "Not Found", a TLS error),
+          # not our paraphrase of them. Plain `echo`, not `::error::`, so it annotates
+          # nothing; `::` is defanged so crafted upstream text cannot open a workflow
+          # command on the log channel.
+          #
+          # Collapse RUNS of colons rather than substituting pairs. Pair substitution
+          # was not idempotent (`:::` yielded `:.::`, which still contains `::`), which
+          # left the guarantee resting on the label prefix — and therefore on the
+          # runner parsing `::` only at the start of a line, which is not a property
+          # worth betting on. `s/::\{1,\}/:/g` cannot leave a `::` behind at any
+          # position, so the invariant holds without any assumption about the parser.
+          # The prefix stays for legibility; it is no longer load-bearing.
+          actions_age::log_detail() {
+            local label="$1" text="$2"
+            [ -z "$text" ] && return 0
+            # Say so when the text was altered. The collapse is not free: it mangles
+            # legitimate diagnostics carrying `::` — an IPv6 peer in a curl error
+            # (`Failed to connect to 2606:50c0::153`) is exactly the transport failure
+            # this change is trying to make legible. Keeping the defang and labelling it
+            # beats presenting altered text as verbatim.
+            case "$text" in
+              *::*) label="${label} (colon runs collapsed)" ;;
+            esac
+            printf '%s\n' "$text" | sed 's/::\{1,\}/:/g' | sed "s/^/  ${label}: /" >&2
+            return 0
+          }
+
+          # Tier 1 — authenticated REST. Still first because it is the only tier that
+          # can read a pin from a PRIVATE repository the workflow token has access to.
+          # Captures stderr instead of discarding it so the caller can classify the
+          # failure and log GitHub's own words.
+          actions_age::api_committer_date() {
+            local owner="$1" repo="$2" sha="$3"
+            local err_file out err rc=0
+            # Mirror of the tier-2 guard below: without a reason here, clear_reason has
+            # already emptied the file, so `api_reason` comes back "" and the composed
+            # reason ships as a leading "; " — non-empty, so main()'s generic fallback
+            # never fires.
+            err_file=$(mktemp) || {
+              actions_age::set_reason "API lookup could not allocate a workspace"
+              return 1
+            }
+            # Bounded like tier 2. `gh` has internal timeouts, but leaving one tier
+            # unbounded while the other is capped is an asymmetry with no rationale.
+            out=$(timeout 30 gh api "/repos/${owner}/${repo}/commits/${sha}" \
+              --jq '.commit.committer.date // empty' 2>"$err_file") || rc=$?
+            err=$(cat "$err_file")
+            rm -f "$err_file"
+
+            if [ "$rc" -ne 0 ]; then
+              actions_age::log_detail "gh api" "$err"
+              # An org-level GitHub IP allow list answers 403 to an AUTHENTICATED read
+              # from a GitHub-hosted runner even when the repository is public. That is
+              # the case the tier-2 fallback below exists for, so name it distinctly: it
+              # is a network-position problem, not a missing commit, and the operator
+              # should not go looking for a deleted SHA.
+              case "$err" in
+                *"IP allow list"*)          actions_age::set_reason "org IP allow list blocked the authenticated API read" ;;
+                # Also served as 403, and at fleet scale a likelier tier-1 failure than
+                # an allow list. Without its own arm it read as "unreachable", and the
+                # aggregate warning then sent the operator to audit a healthy token.
+                *"rate limit"*|*"Rate Limit"*|*"secondary rate"*)
+                                            actions_age::set_reason "GitHub API rate limit reached" ;;
+                # A 404 also covers "the token cannot see this repository", so do not
+                # assert the commit is missing: composed with tier 2's reason it would
+                # otherwise read "commit not found via API; repository is not publicly
+                # readable", which contradicts itself.
+                *"Not Found"*|*"HTTP 404"*) actions_age::set_reason "commit not found or not visible to this token" ;;
+                *)                          actions_age::set_reason "gh api unreachable" ;;
+              esac
+              return 1
+            fi
+
+            if [ -z "$out" ]; then
+              actions_age::set_reason "gh api returned no committer date"
+              return 1
+            fi
+            printf '%s\n' "$out"
+          }
+
+          # ----- Tier 2: anonymous git ------------------------------------------------
+          #
+          # WHY THIS EXISTS: an organization with a GitHub IP allow list (aquasecurity,
+          # which publishes trivy-action, is the case that found this) answers 403 to an
+          # authenticated API read from a GitHub-hosted runner even for a public repo.
+          # Allow lists gate *authenticated* access; anonymous public git read is
+          # unaffected. Same root cause and same remedy as the `git ls-remote` tag
+          # resolution in qurl-reverse-tunnel-server's check-action-pin-comments.sh.
+          #
+          # WHY IT IS NOT WEAKER THAN THE API: git is content-addressed. We ask for one
+          # 40-hex object and git verifies that what came back hashes to exactly that
+          # SHA, so the commit whose date we read is provably the commit that is pinned.
+          # The date is the committer field of that object — the very same bytes the
+          # REST API reports as `.commit.committer.date`. Author-controlled in both
+          # tiers; the trust model does not change.
+          #
+          # SCOPE OF THAT GUARANTEE: it establishes that the date belongs to the SHA
+          # that was pinned — the claim this check actually rests on. It does NOT
+          # establish that the SHA is reachable from a branch or tag of the named repo:
+          # GitHub serves fork-network objects through the parent's URL, so a fork-only
+          # commit resolves here. Tier 1 behaves the same way (`/repos/O/R/commits/SHA`
+          # also resolves across the fork network), so this is neither introduced nor
+          # worsened by the fallback. The self-reference seam is the one place ancestry
+          # is proven, and it still does that through the API.
+          #
+          # The anonymity mechanism — which is load-bearing, not tidiness — is stated
+          # once, over `anon_git` below. Do not re-argue it at the call sites.
+
+          # THE anonymity boundary. Every git invocation in tier 2 goes through here, so
+          # the invariant holds STRUCTURALLY rather than by an argument repeated at each
+          # call site. If a credential leaks into the fetch, the allow list rejects it
+          # again and the whole tier is useless.
+          #
+          # A fresh temp repo excludes the local `.git/config` extraheader that
+          # `actions/checkout` writes. Everything else is an environment channel, and
+          # each was verified to defeat the obvious guard:
+          #
+          #   GIT_CONFIG_COUNT + GIT_CONFIG_KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS
+          #     inject config past GIT_CONFIG_GLOBAL/SYSTEM=/dev/null — either can
+          #     carry the very `http.extraheader` actions/checkout uses.
+          #   GIT_ASKPASS / SSH_ASKPASS
+          #     consulted BEFORE the terminal prompt, so GIT_TERMINAL_PROMPT=0 does
+          #     not stop them re-authenticating.
+          #   GIT_DIR / GIT_COMMON_DIR
+          #     `git -C <path>` does not override either. GIT_DIR wins over discovery;
+          #     GIT_COMMON_DIR redirects non-worktree files (config among them) and is
+          #     not gated on discovery at all. Both hand back a planted extraheader.
+          #   HOME (via ~/.netrc)
+          #     not a git-config channel at all: git hands libcurl
+          #     CURL_NETRC_OPTIONAL, so ~/.netrc is consulted independently of git
+          #     config, and `-c credential.helper=` does not apply since netrc is not
+          #     a helper. Verified on git 2.43 — against a server that challenges, a
+          #     planted ~/.netrc puts `Authorization: Basic` on the wire; an empty HOME
+          #     puts none. A public repo never challenges, so this cannot fire on the
+          #     happy path, but a self-hosted runner with a netrc entry would hand
+          #     credentials to exactly the host this tier routes around.
+          #
+          # GIT_TRACE / GIT_TRACE2* are deliberately NOT scrubbed either: they add
+          # stderr noise, never credentials. The noise reaches log_detail and could in
+          # principle match a classification arm, which is a cosmetic risk on a
+          # self-hosted runner that sets them, not a security one.
+          #
+          # XDG_CONFIG_HOME is belt-and-braces (already shadowed by GIT_CONFIG_GLOBAL),
+          # kept so "no ambient config, no ambient credentials" needs no per-variable
+          # argument. GIT_SSL_NO_VERIFY / GIT_SSL_CAINFO are deliberately NOT scrubbed:
+          # content-addressing means a MITM can only make the fetch fail, never
+          # substitute a different date, so TLS is availability here, not integrity.
+          #
+          # The reads matter as much as the fetch: `--filter=blob:none` makes the temp
+          # repo a promisor, so an object read that missed locally would hit the network
+          # — unbounded and unscrubbed without this. `timeout` bounds each call.
+          actions_age::anon_git() {
+            env -u GIT_ASKPASS -u SSH_ASKPASS -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_COUNT \
+              -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE -u GIT_OBJECT_DIRECTORY \
+              -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_INDEX_FILE -u GIT_NAMESPACE \
+              HOME="${ACTIONS_AGE_ANON_HOME:-/nonexistent}" \
+              XDG_CONFIG_HOME="${ACTIONS_AGE_ANON_HOME:-/nonexistent}" \
+              GIT_TERMINAL_PROMPT=0 \
+              GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_CONFIG_SYSTEM=/dev/null \
+              timeout 30 git -c credential.helper= "$@"
+          }
+
+          actions_age::git_committer_date() {
+            local owner="$1" repo="$2" sha="$3"
+            local work err_file err rc=0 ts
+            # NOTE: these two branches are argued-correct rather than test-covered —
+            # provoking a `mktemp` failure in the suite is not worth the machinery.
+            # Set a reason on BOTH allocation failures. Falling through without one
+            # leaves tier 1's text in the file, and the composed reason then reads
+            # "gh api unreachable; gh api unreachable" — pointing the operator at the
+            # API when the actual failure was local.
+            work=$(mktemp -d) || {
+              actions_age::set_reason "anonymous git fallback could not allocate a workspace"
+              return 1
+            }
+            err_file=$(mktemp) || {
+              rm -rf "$work"
+              actions_age::set_reason "anonymous git fallback could not allocate a workspace"
+              return 1
+            }
+            # An empty directory to stand in for $HOME, so no ambient ~/.netrc,
+            # ~/.gitconfig or XDG config is reachable from any call in this tier.
+            local anon_home
+            anon_home=$(mktemp -d) || {
+              rm -rf "$work" "$err_file"
+              actions_age::set_reason "anonymous git fallback could not allocate a workspace"
+              return 1
+            }
+            local ACTIONS_AGE_ANON_HOME="$anon_home"
+            # Structural cleanup: this function runs inside `ts=$(...)`, and a
+            # command-substitution subshell resets traps, so main()'s EXIT trap does not
+            # cover these. RETURN fires on every `return` below, and is NOT inherited by
+            # the nested anon_git/set_reason calls, so it runs exactly once. It is the
+            # only cleanup path below this line; the allocation branches above clean up
+            # explicitly because they precede it.
+            #
+            # It does NOT cover an errexit abort: under `set -e` the subshell exits
+            # rather than returning, and these temps would leak. Accepted — they are
+            # runner-scoped, and every command below is either guarded or a `return`.
+            trap 'rm -rf "$work" "$anon_home"; rm -f "$err_file"' RETURN
+
+            if ! actions_age::anon_git init -q "$work" >/dev/null 2>&1; then
+              actions_age::set_reason "anonymous git fallback could not init a workspace"
+              return 1
+            fi
+
+            # `--filter=blob:none` skips file contents; a server without partial-clone
+            # support ignores it with a warning rather than failing. `--depth=1` keeps
+            # it to the single pinned commit. `timeout` bounds a hung TLS session so one
+            # unreachable host cannot burn the whole job's budget: a measured
+            # single-commit fetch is ~0.6s even for a large action repo, so 30s leaves
+            # ~50x headroom. The bound matters because a missing or expired GH_TOKEN
+            # sends EVERY added pin down this path.
+            # Hardcoding github.com here would let the two tiers target DIFFERENT
+            # servers on GHES, where a name collision between an enterprise org/repo and
+            # a public one would date the wrong repository's object. GITHUB_SERVER_URL
+            # is the best available signal for the host the run belongs to.
+            #
+            # It is NOT a guarantee that the tiers agree: `gh` resolves its host from
+            # GH_HOST, else the current repo's git remote, else github.com — it never
+            # reads GITHUB_SERVER_URL. In a checked-out GHES job the two agree via the
+            # remote; a job with no checkout, or one setting GH_HOST explicitly, can
+            # still diverge. Closer than a hardcoded host, not a pinned invariant.
+            local server="${GITHUB_SERVER_URL:-https://github.com}"
+            server="${server%/}"
+
+            # `--filter=blob:none` is worth ~2x wall time and ~19x transferred bytes on
+            # a large action repo (measured: codeql-action 1.17s/2188KB -> 0.62s/116KB),
+            # but older git refuses `--filter` unless the remote is configured with
+            # `extensions.partialClone`. Retry once without it rather than let the whole
+            # fallback become a no-op on an older self-hosted image.
+            actions_age::anon_git -C "$work" \
+              fetch --quiet --depth=1 --no-tags --filter=blob:none \
+              "${server}/${owner}/${repo}.git" "$sha" >/dev/null 2>"$err_file" || rc=$?
+            # Match git's actual filter-rejection wording, not a bare `filter`: on a
+            # transport error git embeds the URL, and `dorny/paths-filter` is one of the
+            # most widely-pinned actions in the fleet. A substring match would log a
+            # misleading "lacks partial clone" and burn a second doomed fetch, up to the
+            # 30s bound, on every unreachable pin from that repo.
+            local fetch_err; fetch_err=$(cat "$err_file")
+            local filter_rejected=false
+            case "$fetch_err" in
+              *"--filter"*|*"filtering not recognized"*|*"extensions.partialClone"*|*"partialclone"*)
+                filter_rejected=true ;;
+              # The case the retry was actually written for. git's parse-options strips
+              # the leading `--` before formatting, so a client too old to know the
+              # option emits `error: unknown option \`filter=blob:none'` — which matches
+              # none of the patterns above. Verified on git 2.43.
+              *"unknown option"*"filter"*)
+                filter_rejected=true ;;
+            esac
+            if [ "$rc" -ne 0 ] && [ "$filter_rejected" = true ]; then
+              actions_age::log_detail "anonymous git" "$fetch_err"
+              echo "  retrying the anonymous fetch without --filter (server or client lacks partial clone)" >&2
+              rc=0
+              actions_age::anon_git -C "$work" \
+                fetch --quiet --depth=1 --no-tags \
+                "${server}/${owner}/${repo}.git" "$sha" >/dev/null 2>"$err_file" || rc=$?
+            fi
+
+            err=$(cat "$err_file")
+
+            if [ "$rc" -ne 0 ]; then
+              actions_age::log_detail "anonymous git" "$err"
+              # `timeout` kills with 124 and produces NO stderr, so without this the
+              # case below falls to the generic bucket — losing the one failure mode
+              # where "re-run it" is the right advice.
+              if [ "$rc" -eq 124 ]; then
+                actions_age::set_reason "anonymous git fetch exceeded its 30s bound"
+                return 1
+              fi
+              case "$err" in
+                # `upload-pack: not our ref` is git's answer for a SHA the remote does
+                # not have: a deleted or rewritten commit, or one that only exists on a
+                # fork. Distinct from "we could not reach the repository at all".
+                # `not our ref` is the protocol-v2 wording; `unadvertised object` is the
+                # v0 equivalent, reachable with an older client or an overridden
+                # GIT_PROTOCOL. Both mean the same thing to an operator.
+                *"not our ref"*|*"not a valid object name"*|*"unadvertised object"*)
+                  actions_age::set_reason "commit not found in the public repository" ;;
+                *"could not read Username"*|*"Authentication failed"*|*"Repository not found"*)
+                  actions_age::set_reason "repository is not publicly readable and the API read failed" ;;
+                # This tier deliberately runs with the ambient git config excluded, so a
+                # runner that reaches github.com only through an `http.proxy` or a
+                # custom `http.sslCAInfo` in /etc/gitconfig cannot connect here. Name it
+                # rather than let it fall into the generic bucket, which would tell the
+                # operator nothing about the cause.
+                *"Could not resolve host"*|*"Failed to connect"*|*"unable to access"*|*"SSL certificate problem"*|*"Connection timed out"*)
+                  actions_age::set_reason "anonymous git could not reach the host (this tier excludes ambient git transport config such as http.proxy)" ;;
+                *)
+                  actions_age::set_reason "anonymous git fallback failed" ;;
+              esac
+              return 1
+            fi
+
+            # Read by the PINNED SHA, not FETCH_HEAD: it states the content-addressed
+            # invariant at the point the security argument relies on it, rather than
+            # trusting that FETCH_HEAD in a fresh temp repo can only be the requested
+            # object. The type check closes the one place tier 2 could be laxer than
+            # tier 1 — `ref_part` is validated as 40-hex, not as a *commit*, and
+            # `git log` silently peels a tag object to its commit where the API would
+            # 404. Fail closed rather than date a different object.
+            local obj_type
+            obj_type=$(actions_age::anon_git -C "$work" cat-file -t "$sha" 2>/dev/null) || obj_type=""
+            if [ "$obj_type" != "commit" ]; then
+              actions_age::set_reason "pinned SHA is not a commit object"
+              return 1
+            fi
+            ts=$(actions_age::anon_git -C "$work" log -1 --format=%cI "$sha" 2>/dev/null) || rc=$?
+            if [ "$rc" -ne 0 ] || [ -z "$ts" ]; then
+              actions_age::set_reason "anonymous git fetch produced no committer date"
+              return 1
+            fi
+            # `%cI` is strict ISO-8601 and preserves the commit's original UTC offset
+            # (`...+06:00`), unlike the API's always-`Z` form. `date -d` inside
+            # `preflight::iso8601_to_epoch` normalizes the offset, so the measured age
+            # is identical either way.
+            printf '%s\n' "$ts"
+          }
+
+          # Resolve a pinned SHA's committer date: authenticated first, anonymous
+          # second. The fallback runs on ANY tier-1 failure, not only the allow-list
+          # 403 — a genuinely missing commit fails both tiers anyway, and routing
+          # transient API outages through it makes the gate more AVAILABLE without
+          # making it more PERMISSIVE. Both tiers must fail for a pin to go
+          # unverifiable, and unverifiable still fails the check exactly as before.
+          #
+          # Thin wrapper over _impl that guarantees a reason file exists. Without it a
+          # caller that never set ACTIONS_AGE_REASON_FILE (a direct unit call, or a
+          # future consumer of this lib) would lose every reason to the same subshell
+          # boundary the file exists to defeat, and _impl would compose the two empty
+          # halves into a meaningless `"; "` — non-empty, so main()'s `[ -n ]` guard
+          # would happily report it. The reason is copied back into the variable before
+          # the file is dropped, so a direct caller can read it afterwards — but only if
+          # it did NOT invoke this in a command substitution, which discards variables
+          # at its own boundary no matter what happens inside. A caller that needs both
+          # the timestamp and the reason should set ACTIONS_AGE_REASON_FILE and read
+          # `actions_age::get_reason`, which is exactly what main() does.
+          actions_age::committer_date() {
+            # Validate BEFORE allocating anything, and unconditionally — not nested in
+            # the memo branch. Two reasons the previous placement was wrong:
+            #
+            #  - `is_valid_repo_slug "$1/$2"` cannot police `$2`, because the slug
+            #    pattern deliberately permits `/` in the second component for monorepo
+            #    action paths (`actions/cache/save`). A repo of `cache/save` validated
+            #    fine and produced a cache path under a directory that does not exist.
+            #    main() is safe (it splits at the first `/` before calling), but this
+            #    guard exists for the standalone caller, and for them it did not hold.
+            #  - Nested in the memo branch, a caller that set no cache dir got NO
+            #    validation at all before owner/repo/sha reached `gh api` and `git
+            #    fetch`. The memo key is one consumer of this check, not its purpose.
+            #
+            # Placed ahead of the reason-file allocation so there is nothing to tear
+            # down on this path.
+            if [[ ! "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+              || [[ ! "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+              || [[ ! "$3" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              actions_age::set_reason "refusing to look up an invalid owner/repo/sha"
+              return 1
+            fi
+
+            local own_file="" rc=0 out cache_file=""
+            if [ -z "$ACTIONS_AGE_REASON_FILE" ]; then
+              ACTIONS_AGE_REASON_FILE=$(mktemp) || return 1
+              own_file="$ACTIONS_AGE_REASON_FILE"
+            fi
+
+            # Memo hit: replay the recorded outcome without touching the network. The
+            # first line is the status so a timestamp can never be mistaken for a
+            # reason, or the reverse.
+            if [ -n "$ACTIONS_AGE_CACHE_DIR" ]; then
+              # `ref_part` is validated as [0-9a-fA-F]{40}, so the same commit written
+              # in upper and lower hex would otherwise take two keys. Both `gh api` and
+              # git accept either, so this only costs a redundant lookup — normalized
+              # because the key's whole job is to identify a pin uniquely.
+              # `LC_ALL=C` for the same reason preflight::safe_for_md documents: a bare
+              # range expression is locale-dependent in principle. Input is 40-hex so
+              # nothing can go wrong in practice, but the file holds itself to this bar.
+              local key_sha; key_sha=$(printf '%s' "$3" | LC_ALL=C tr 'A-F' 'a-f')
+              cache_file="${ACTIONS_AGE_CACHE_DIR}/$1@$2@${key_sha}"
+              if [ -f "$cache_file" ]; then
+                # Clear the FILE, not just the variable, and do it before the own_file
+                # teardown drops the path. The file is the channel that survives the
+                # `ts=$(...)` subshell, so leaving a previous pin's failure in it makes
+                # its contents stop being a statement about the last lookup — the
+                # property every other path here maintains.
+                actions_age::clear_reason
+                local cached_status cached_payload
+                cached_status=$(head -n 1 "$cache_file")
+                cached_payload=$(tail -n +2 "$cache_file")
+                if [ -n "$own_file" ]; then
+                  rm -f "$own_file"
+                  ACTIONS_AGE_REASON_FILE=""
+                fi
+                if [ "$cached_status" = "ok" ]; then
+                  printf '%s\n' "$cached_payload"
+                  return 0
+                fi
+                actions_age::set_reason "$cached_payload"
+                return 1
+              fi
+            fi
+
+            out=$(actions_age::committer_date_impl "$@") || rc=$?
+
+            # _impl ran in a command substitution, so read the reason back from the file
+            # (the only thing that survived) and leave it in the variable for callers.
+            # Clear first: on success the file is empty and `get_reason` would fall
+            # through to whatever the variable already held, handing a stale reason to
+            # the "future consumer of this lib" this wrapper is written for.
+            ACTIONS_AGE_LOOKUP_REASON=""
+            ACTIONS_AGE_LOOKUP_REASON=$(actions_age::get_reason)
+            if [ -n "$own_file" ]; then
+              rm -f "$own_file"
+              ACTIONS_AGE_REASON_FILE=""
+            fi
+
+            if [ -n "$cache_file" ]; then
+              if [ "$rc" -eq 0 ]; then
+                printf 'ok\n%s\n' "$out" > "$cache_file"
+              else
+                printf 'fail\n%s\n' "$ACTIONS_AGE_LOOKUP_REASON" > "$cache_file"
+              fi
+            fi
+
+            if [ -n "$out" ]; then
+              printf '%s\n' "$out"
+            fi
+            return "$rc"
+          }
+
+          actions_age::committer_date_impl() {
+            local owner="$1" repo="$2" sha="$3" ts api_reason
+
+            actions_age::clear_reason
+            if ts=$(actions_age::api_committer_date "$owner" "$repo" "$sha"); then
+              printf '%s\n' "$ts"
+              return 0
+            fi
+            api_reason=$(actions_age::get_reason)
+
+            echo "  API lookup failed (${api_reason}); retrying anonymously over git" >&2
+            if ts=$(actions_age::git_committer_date "$owner" "$repo" "$sha"); then
+              echo "  ANON-GIT: resolved ${owner}/${repo}@${sha} with no credentials (API said: ${api_reason})" >&2
+              # Tallied so main() can say once, loudly, that the authenticated path is
+              # not working — see the end-of-run warning.
+              if [ -n "$ACTIONS_AGE_CACHE_DIR" ]; then
+                printf '%s\n' "${owner}/${repo}@${sha}" >> "${ACTIONS_AGE_CACHE_DIR}/.anon-tally"
+              fi
+              printf '%s\n' "$ts"
+              return 0
+            fi
+
+            # Both tiers failed: report them together so the operator can tell an
+            # allow-list rejection from a genuinely absent commit without reverse-
+            # engineering it from a runner log. Tier 2's reason comes back through
+            # get_reason (the FILE) for the same reason tier 1's did — the call above
+            # ran in a command-substitution subshell, so the variable it assigned is
+            # already gone by the time control reaches this line.
+            local git_reason; git_reason=$(actions_age::get_reason)
+            actions_age::set_reason "${api_reason}; ${git_reason}"
+            return 1
+          }
+
+          # The provenance path had the same blindness this change removes from the
+          # committer-date lookup: `2>/dev/null` meant an unreachable API surfaced as
+          # "self-reference repository, signature, or default-branch provenance
+          # mismatch" — a message that accuses the PIN when the problem is the
+          # TRANSPORT. That reads worse than the case originally fixed, because an
+          # operator is told their signature or ancestry is wrong.
+          #
+          # No anonymous fallback here, deliberately: provenance needs signature
+          # verification and protected-branch ancestry, which have no git equivalent,
+          # and it must stay fail-closed. Only the diagnosis improves.
           actions_age::github_tsv() {
             local path="$1" filter="$2"
-            gh api "$path" --jq "$filter" 2>/dev/null
+            local err_file out err rc=0
+            # Same guard as api_committer_date: without a reason here, main() falls
+            # through to "signature or default-branch provenance mismatch" — the
+            # accuses-the-pin-for-a-transport-fault message this change exists to remove.
+            err_file=$(mktemp) || {
+              actions_age::set_reason "provenance lookup could not allocate a workspace"
+              return 1
+            }
+            out=$(timeout 30 gh api "$path" --jq "$filter" 2>"$err_file") || rc=$?
+            err=$(cat "$err_file")
+            rm -f "$err_file"
+
+            if [ "$rc" -ne 0 ]; then
+              actions_age::log_detail "gh api" "$err"
+              case "$err" in
+                *"IP allow list"*) actions_age::set_reason "org IP allow list blocked the authenticated API read" ;;
+                *"Not Found"*|*"HTTP 404"*) actions_age::set_reason "provenance endpoint not found" ;;
+                *) actions_age::set_reason "gh api unreachable" ;;
+              esac
+              return 1
+            fi
+            printf '%s' "$out"
           }
 
           # A reusable workflow cannot quarantine its own fresh release without creating
@@ -770,9 +1342,28 @@ jobs:
           # ----- Main -----------------------------------------------------------------
 
           actions_age::main() {
-            preflight::require_tools gh awk sed grep sort
+            # `git` was always a hard dependency (every diff goes through it) but was
+            # never declared; `timeout` bounds the anonymous-git fallback, `mktemp`
+            # backs the reason file and the fetch workspace, `env` IS the anonymity
+            # scrub, and tr/head/tail/wc/cat carry the memo and reason plumbing. All
+            # ship in the same GNU coreutils/git baseline the GNU-date probe below
+            # already assumes, so declaring them costs nothing and fails legibly if
+            # absent — and the list should name everything the new paths lean on,
+            # not an arbitrary subset.
+            preflight::require_tools gh git env timeout mktemp tr head tail wc cat awk sed grep sort
             preflight::require_gnu_date
             preflight::validate_min_age_days
+
+            # Carries the committer-date failure reason across the command-substitution
+            # subshell boundary — see the ACTIONS_AGE_REASON_FILE comment above.
+            #
+            # This is the ONLY EXIT trap set anywhere in lib/, and `trap ... EXIT`
+            # replaces rather than appends. If a future caller or sibling helper ever
+            # installs one, this line silently disables it — chain them explicitly
+            # instead of adding a second unconditional `trap`.
+            ACTIONS_AGE_REASON_FILE=$(mktemp)
+            ACTIONS_AGE_CACHE_DIR=$(mktemp -d)
+            trap 'rm -f "$ACTIONS_AGE_REASON_FILE"; rm -rf "$ACTIONS_AGE_CACHE_DIR"' EXIT
 
             local base_ref="origin/${BASE_REF}"
             preflight::verify_base_ref "$base_ref"
@@ -857,11 +1448,22 @@ jobs:
                   local safe_owner_repo_skip; safe_owner_repo_skip=$(preflight::safe_for_md "${owner}/${repo}")
                   local safe_sha_short_skip; safe_sha_short_skip=$(preflight::safe_for_md "${ref_part:0:8}")
                   local trusted_default_branch
+                  actions_age::clear_reason
                   if ! trusted_default_branch=$(actions_age::trusted_self_ref_provenance "$owner" "$repo" "$ref_part"); then
-                    echo "::error file=${file}::Could not verify self-reference provenance for ${owner}/${repo}@${ref_part}"
+                    # Distinguish "the evidence contradicted the pin" from "the API was
+                    # unreachable". The old text asserted the former for both, which is
+                    # an alarming and misleading thing to tell an operator whose only
+                    # problem is network position.
+                    local prov_reason; prov_reason=$(actions_age::get_reason)
+                    if [ -n "$prov_reason" ]; then
+                      prov_reason="self-reference provenance could not be read: ${prov_reason}"
+                    else
+                      prov_reason="self-reference repository, signature, or default-branch provenance mismatch"
+                    fi
+                    echo "::error file=${file}::Could not verify self-reference provenance for ${owner}/${repo}@${ref_part} (${prov_reason})"
                     echo "| \`${safe_owner_repo_skip}\` | \`${safe_sha_short_skip}\` | — | :x: self-ref provenance unverifiable |" >> "$GITHUB_STEP_SUMMARY"
                     preflight::record_unverifiable "$safe_owner_repo_skip" "$safe_sha_short_skip" \
-                      "self-reference repository, signature, or default-branch provenance mismatch"
+                      "$prov_reason"
                     failed=true
                     continue
                   fi
@@ -877,10 +1479,16 @@ jobs:
 
                 local ts
                 if ! ts=$(actions_age::committer_date "$owner" "$repo" "$ref_part"); then
-                  echo "::error file=${file}::Could not verify age for ${owner}/${repo}@${ref_part} (gh api unreachable or commit not found)"
-                  echo "| \`${safe_owner_repo}\` | \`${safe_sha_short}\` | — | :x: api unreachable |" >> "$GITHUB_STEP_SUMMARY"
-                  preflight::record_unverifiable "$safe_owner_repo" "$safe_sha_short" \
-                    "gh api unreachable or commit not found"
+                  # Both the authenticated and the anonymous tier failed. The reason is
+                  # composed from this file's fixed vocabulary, so it is safe to
+                  # interpolate and it names WHICH wall was hit — an org IP allow list
+                  # reads very differently from a deleted commit, and the next person
+                  # should not have to reverse-engineer that from a runner log.
+                  local reason; reason=$(actions_age::get_reason)
+                  [ -n "$reason" ] || reason="gh api unreachable or commit not found"
+                  echo "::error file=${file}::Could not verify age for ${owner}/${repo}@${ref_part} (${reason})"
+                  echo "| \`${safe_owner_repo}\` | \`${safe_sha_short}\` | — | :x: unverifiable |" >> "$GITHUB_STEP_SUMMARY"
+                  preflight::record_unverifiable "$safe_owner_repo" "$safe_sha_short" "$reason"
                   failed=true
                   continue
                 fi
@@ -902,6 +1510,22 @@ jobs:
 
               echo "::endgroup::"
             done
+
+            # A pin dated by tier 2 is a normal outcome for an allow-listed org, but it
+            # is also what a broken GH_TOKEN looks like — and in that state the check
+            # now PASSES on public pins where it used to fail. Without this the only
+            # evidence is a per-pin stderr line inside a collapsed `::group::`, so say
+            # it once at the top level. A warning, not an error: the pins were verified.
+            local anon_tally="${ACTIONS_AGE_CACHE_DIR:-}/.anon-tally"
+            if [ -n "${ACTIONS_AGE_CACHE_DIR:-}" ] && [ -s "$anon_tally" ]; then
+              local anon_count; anon_count=$(wc -l < "$anon_tally" | tr -d ' ')
+              echo "::warning::${anon_count} pin(s) were dated by the anonymous git fallback because the authenticated API read failed. Expected for an org with a GitHub IP allow list, and benign under an API rate limit; otherwise check GH_TOKEN, which no longer fails public pins on its own. The per-pin reasons above say which."
+              # Also on the step summary: on a green run that is the only artifact a
+              # reviewer sees (the PR comment path is gated on a non-empty failures
+              # file, so it never fires), and an unqualified :white_check_mark: hides
+              # the one state worth noticing.
+              echo "> :warning: ${anon_count} pin(s) dated by the anonymous git fallback — the authenticated API read failed. Expected for an org with a GitHub IP allow list; otherwise check \`GH_TOKEN\`." >> "$GITHUB_STEP_SUMMARY"
+            fi
 
             if [ "$failed" = true ]; then
               preflight::step_summary_failed "$MIN_AGE_DAYS" "$checked_count" "$skipped_count"
