@@ -27,6 +27,29 @@ on:
         required: false
         type: string
         default: "."
+      allow_registry_free:
+        description: |
+          Pass, with a warning, when a **pnpm** lockfile resolves nothing
+          from a registry — for a repo that genuinely vendors every
+          dependency through git or tarball URLs, which would otherwise
+          get a red check on every PR that touches the lockfile.
+          Deliberately narrow: it cannot weaken a lockfile that has even
+          one registry package, so it is not a general opt-out of the
+          age check.
+
+          pnpm only. package-lock.json and yarn.lock drop non-registry
+          entries at parse time and report no new dependencies, so a
+          fully-vendored repo on those already passes. Setting this
+          changes nothing for them.
+
+          One caveat in a repo with more than one lockfile kind: this
+          makes the pnpm file pass, but the run as a whole can still
+          fail if another lockfile has packages that could not be
+          verified. The all-skipped guard fires on that before this
+          branch is reached, and it fails closed on purpose.
+        type: boolean
+        required: false
+        default: false
       comment_on_failure:
         description: |
           Post a sticky PR comment listing packages that failed the age
@@ -73,6 +96,11 @@ jobs:
           # so the post-step below can render the data into a comment
           # without redoing classification. Unset → no-op.
           AGE_CHECK_FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
+          # Reusable workflows do not inherit `env` from the caller, so
+          # every AGE_CHECK_* the lib reads has to be threaded through an
+          # input here or it is unreachable for consumers.
+          # tests/workflow_lint_test.sh enforces that.
+          AGE_CHECK_ALLOW_REGISTRY_FREE: ${{ inputs.allow_registry_free && '1' || '' }}
         run: |
           # ============================================================================
           # _preflight.sh - Shared preflight helpers for age-check-*.sh
@@ -588,6 +616,43 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           }
 
+          # Footer for a run where one or more manifests were skipped wholesale by
+          # explicit configuration rather than examined. Takes both counts because
+          # the honest sentence depends on whether anything else WAS checked:
+          # with a nonzero checked_count the skip is a caveat on a real result,
+          # with zero it is the whole result. Emitting one blockquote per
+          # condition produced two adjacent paragraphs saying the same thing, and
+          # a forward reference to a count that never followed.
+          preflight::step_summary_registry_free() {
+            local skipped_files="$1" checked_count="${2:-0}"
+            {
+              echo ""
+              if [ "$checked_count" -gt 0 ]; then
+                echo "> **${skipped_files} lockfile(s) were not age-checked at all**, having resolved nothing from a registry; they were skipped by configuration. The count below covers only the rest."
+              else
+                echo "> **Nothing was age-checked.** ${skipped_files} lockfile(s) resolved nothing from a registry and were skipped by configuration. This is a pass by configuration, not by verification."
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          # Footer for a run that verified NOTHING because a manifest could not be
+          # read — as distinct from a dependency failing the age check, which is
+          # what `step_summary_failed` is for.
+          #
+          # Deliberately does NOT mention `age-check-bypass`. That label is scoped
+          # to verified-CVE overrides, the conditions reaching this footer can be
+          # permanent rather than incidental, and the label genuinely clears the
+          # check (the reusable job is gated on its absence) — so naming it here
+          # would hand the operator the exact anti-pattern the ecosystem scripts
+          # warn against in their own ::error:: on the same failure.
+          preflight::step_summary_unverifiable() {
+            local reason="$1"
+            {
+              echo ""
+              echo "> **Nothing could be verified — ${reason}.** No dependency was age-checked in this run, so this fails rather than reporting a pass it cannot support."
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
           # Guard against "registry outage → every package skipped → workflow
           # passes" — if nothing actually got verified, fail and write a
           # summary explaining why.
@@ -613,10 +678,43 @@ jobs:
           #   BASE_REF       - default 'main'
           #   LOCKFILE_PATH  - default 'package-lock.json' (also inspects
           #                    pnpm-lock.yaml and yarn.lock if detected)
+          #   AGE_CHECK_ALLOW_REGISTRY_FREE - set by the reusable workflow from its
+          #                    `allow_registry_free` input. A reusable workflow does
+          #                    not inherit env from its caller, so this needs an
+          #                    input on BOTH entry points to be reachable: the
+          #                    mirror template and the in-repo
+          #                    .github/workflows/age-check-npm.yml. Both are
+          #                    machine-checked by tests/workflow_lint_test.sh —
+          #                    one guard for reachability from the template, one
+          #                    for parity between the two. pnpm only; the
+          #                    package-lock and yarn parsers drop non-registry
+          #                    entries at parse time, so a fully-vendored repo on
+          #                    those passes already. Lets a
+          #                    lockfile that resolves NOTHING from a registry pass
+          #                    with a warning instead of failing. For the repo
+          #                    that genuinely vendors every dependency through git
+          #                    or tarball URLs: without it that repo gets a red
+          #                    required check on every PR touching the lockfile,
+          #                    forever. Scoped deliberately narrow — it does not
+          #                    weaken any check on a lockfile that has even one
+          #                    registry package.
           #
           # Exit codes:
           #   0 - all newly-added dependencies are >= MIN_AGE_DAYS old
           #   1 - at least one dependency is too young or its age can't be verified
+          #
+          # The diff_* parsers use a richer set among themselves, so `main` can
+          # tell the operator which thing broke:
+          #   0 - work-list on stdout (possibly empty)
+          #   1 - the manifest could not be read
+          #   2 - the BASE REVISION could not be read (most often a shallow
+          #       checkout: verify_base_ref only proves the ref resolves, so
+          #       fetch-depth: 1 passes preflight and fails at merge-base)
+          #   3 - read fine, but it resolves NOTHING from a registry, so there
+          #       was nothing to age-check
+          #   4 - as 3, but `allow_registry_free` says that is intended. A pass,
+          #       reported separately so the run does not render as a verified
+          #       one when nothing was verified.
           #
           # Known limitations (documented so future maintainers don't re-derive):
           # - npm aliases (`npm:other-package@version`) won't be extracted
@@ -630,9 +728,47 @@ jobs:
           #   but a partially-public lockfile can pass as long as its public
           #   packages clear the threshold. Acceptable given the alternative
           #   (refusing to gate any mixed-registry lockfile) is strictly worse.
-          # - pnpm / yarn parsers are best-effort diff-driven and haven't been
-          #   fuzzed against workspace / overrides edge cases the way the
+          # - The yarn parser is best-effort diff-driven and hasn't been fuzzed
+          #   against workspace / overrides edge cases the way the
           #   package-lock.json path has.
+          # - The pnpm parser reads every key spelling pnpm has shipped (v5
+          #   `/pkg/1.2.3`, v6 `/pkg@1.2.3`, v9 `pkg@1.2.3`) and diffs the base
+          #   and head images rather than scraping `git diff`. It reads only the
+          #   top-level `packages:` map, so a future lockfileVersion that renames
+          #   or restructures that map would parse as "no packages" — which is
+          #   why diff_pnpm_lock fails closed when a lockfile declares resolved
+          #   packages it cannot parse, rather than returning an empty work-list
+          #   in silence.
+          # - Two gaps are known and deliberately not fixed here. A newly
+          #   VENDORED dependency is invisible rather than merely unchecked (keys
+          #   resolving through git/tarball/link:/file:/workspace: are dropped in
+          #   the parser, so they reach neither side of the set difference and a
+          #   PR adding one to a lockfile that still has registry packages goes
+          #   green with no annotation); and the zero-parse guard is all-or-
+          #   nothing, so a future format that respelled most keys but left one
+          #   recognisable would gate that one and render "Verified 1 package(s)".
+          #   Do not read a silent pass as "nothing was added".
+          # - pnpm keys carry no registry. Older pnpm wrote registry-qualified v5
+          #   keys for non-default registries (`example.com/pkg/1.0.0:`, no
+          #   leading slash). Those are counted as non-registry, not dropped
+          #   silently, which has two edges. In a lockfile where EVERY key is
+          #   qualified — a v5 repo on a private default registry — the run fails
+          #   closed as "nothing from a registry", which is true of npmjs but
+          #   reads oddly for a repo whose packages are all registry-hosted; that
+          #   is a green->red flip for such a repo, alongside the fully-vendored
+          #   one. In a MIXED v5 lockfile the qualified keys are simply excluded
+          #   from the work-list with no annotation, because the non-registry
+          #   count is read only when nothing at all parsed. So a private-registry
+          #   package can enter a mixed lockfile ungated and unremarked.
+          #   A v6/v9 key is bare `pkg@1.2.3` and the registry lives in
+          #   `resolution: {tarball: ...}` or .npmrc, so entries from a private
+          #   default registry ARE checked, against npmjs. Consequences: 404s
+          #   inflate skipped_count, and if a public homonym exists a fresh
+          #   PRIVATE package is aged against the PUBLIC one's publish date and
+          #   passes. This is the same weakness the package-lock path has (a
+          #   private https `resolved` clears its startswith("https://") filter
+          #   too) — see the mixed public/private note above. Filtering on
+          #   `resolution: {tarball: ...}` would be the real fix.
           #
           # ============================================================================
 
@@ -667,29 +803,71 @@ jobs:
           }
 
           # ----- Separable: read lockfile diff → pkg@version lines on stdout ----------
+          #
+          # Contract for every parser below: stdout is the work-list channel and
+          # nothing else, because `main` reads it back as the packages to
+          # age-check. All diagnostics go to stderr — an ::error:: on stdout is
+          # both swallowed by the caller's `$(...)` and mistaken for a package.
 
           npm_age::diff_package_lock() {
             local lockfile="$1" base_ref="$2"
             # Extract added packages from the new side of the diff using jq on
             # the post-merge file, filtered by which paths actually appear in
             # the diff.
-            if ! git cat-file -e "${base_ref}:${lockfile}" 2>/dev/null; then
+            # NOTE: this probes the TIP of ${base_ref} while the diff below uses
+            # three-dot (merge-base) semantics. So a repo carrying BOTH lockfile
+            # kinds gets two different answers to "what is the base?" in one run:
+            # diff_pnpm_lock resolves a merge base once and uses it throughout,
+            # this one does not, and only its `git diff` matches that. diff_pnpm_lock resolves a single
+            # base_rev and uses it throughout; this path was deliberately left
+            # alone here to keep the change pnpm-scoped. The mismatch is real —
+            # if ${base_ref} deletes the lockfile after this branch forks, the
+            # probe fails and every package below is treated as newly added — and
+            # is deliberately left alone: the fix is to resolve the base revision
+            # once in preflight::verify_base_ref rather than per call site, which
+            # touches every ecosystem and belongs in its own change.
+            #
+            # `<rev>:./<path>` — the "./" is load-bearing. Without it git resolves
+            # the path from the REPO ROOT while the `-- <pathspec>` forms below
+            # resolve it from the CWD, and the step runs under the caller's
+            # `working_directory`. For a monorepo passing working_directory:
+            # frontend, the bare form reads the root's lockfile (or none), which
+            # either promotes the whole head file or silently suppresses genuinely
+            # new packages against the wrong project's base.
+            if ! git cat-file -e "${base_ref}:./${lockfile}" 2>/dev/null; then
               # New lockfile — treat everything as newly added.
+              # `return 0` explicitly, and a checked jq. A bare `return` here
+              # forwarded jq's own status into the caller's rc contract, where 2
+              # means "base revision unreadable" — so a brand-new but malformed
+              # package-lock.json, the one case where the operator's file really
+              # is broken, told them to change fetch-depth.
               jq -r '
                 .packages // {} | to_entries[]
                 | select(.key != "" and (.value.version // null) != null)
                 | select((.value.resolved // "") | startswith("https://"))
                 | (.key | sub("^node_modules/"; "") | split("/node_modules/") | last) + "@" + .value.version' \
-                "$lockfile"
-              return
+                "$lockfile" \
+                || { echo "::error::could not parse ${lockfile}" >&2; return 1; }
+              return 0
             fi
+
+            # Fail closed on a lockfile that is not valid JSON. The per-key jq
+            # below suppresses its own errors on purpose (a malformed entry should
+            # be a per-package skip, not an abort), and the `|| { ... }` after the
+            # loop binds to `sort -u`, which reading its own stdin essentially
+            # never fails — so without this probe a PR that breaks
+            # package-lock.json into invalid JSON produced an empty work-list,
+            # "No new dependencies", and a green check. The new-lockfile branch
+            # above was already guarded; this is its sibling.
+            jq -e . "$lockfile" >/dev/null 2>&1 \
+              || { echo "::error file=${lockfile}::${lockfile} is not valid JSON; refusing to report no new dependencies" >&2; return 1; }
 
             # Split `git diff` from the grep/sort pipeline so a diff failure
             # isn't conflated with the grep-no-match case by the trailing
             # `|| true`. Caller pre-verifies the base ref via preflight.
             local diff_out
             diff_out=$(git diff "${base_ref}"...HEAD -- "$lockfile") \
-              || { echo "::error::git diff against ${base_ref} for ${lockfile} failed"; return 1; }
+              || { echo "::error::git diff against ${base_ref} for ${lockfile} failed" >&2; return 2; }
             local added_keys
             added_keys=$(printf '%s\n' "$diff_out" \
               | awk '/^\+[^+]/' \
@@ -713,19 +891,418 @@ jobs:
                 | select(($p.version // null) != null)
                 | select(($p.resolved // "") | startswith("https://"))
                 | ($k | sub("^node_modules/"; "") | split("/node_modules/") | last) + "@" + $p.version' "$lockfile" 2>/dev/null || true
-            done <<< "$added_keys" | sort -u
+            done <<< "$added_keys" | sort -u \
+              || { echo "::error::could not build the work-list for ${lockfile}" >&2; return 1; }
           }
 
+          # Reads a pnpm lockfile on stdin, emits one `pkg@version` line per
+          # registry-hosted entry in its top-level `packages:` map.
+          #
+          # Handles every key spelling pnpm has shipped, because a repo's
+          # lockfileVersion is whatever wrote it and we get no say:
+          #
+          #   v5   /pkg/1.2.3    /@scope/pkg/1.2.3   peers: _react@18.3.1
+          #   v6   /pkg@1.2.3    /@scope/pkg@1.2.3   peers: (react@18.3.1)
+          #   v9   pkg@1.2.3     @scope/pkg@1.2.3    peers: (react@18.3.1)
+          #
+          # Scoped to `packages:` deliberately. v9 repeats every key under
+          # `snapshots:` with peer suffixes attached, and `importers:` carries
+          # specifier ranges rather than resolved versions.
+          # $1 selects the output: "entries" (default) prints one pkg@version per
+          # line; "counts" prints how many keys parsed cleanly but were filtered
+          # out as non-registry. The caller uses "counts" only on the zero-entry
+          # path, to tell a format it could not read apart from one it read fine
+          # whose every entry is git-, tarball-, link- or workspace-sourced. Both
+          # fail closed; asserting the wrong cause is what burns whoever debugs it.
+          npm_age::parse_pnpm_lock() {
+            # A typo would otherwise be silently treated as "entries", handing the
+            # caller a package list where it expected a number — which then fails
+            # as a bash arithmetic error somewhere else entirely.
+            local mode="${1:-entries}"
+            case "$mode" in
+              entries|counts) ;;
+              *) echo "::error::npm_age::parse_pnpm_lock: unknown mode '${mode}'" >&2; return 2 ;;
+            esac
+            awk -v mode="$mode" '
+              # Non-comment text in column 0 opens a top-level block; remember
+              # whether it is the one holding resolved entries.
+              /^[^[:space:]#]/ { in_packages = ($0 ~ /^packages:[[:space:]]*$/); next }
+              !in_packages { next }
+
+              {
+                # Entry keys sit at EXACTLY two spaces — pnpm indents the children
+                # of `packages:` that way in v5, v6 and v9 alike. Matching any
+                # depth would also match content inside a nested block scalar: a
+                # dependency own `deprecated:` prose that happens to wrap on a line
+                # ending `pkg@1.2.3:` parses as a phantom package. is_valid_pkg_name
+                # rejects it, but via the branch that increments skipped_count —
+                # enough to trip the all-skipped guard in main and fail a PR whose
+                # lockfile changed nothing but a deprecation notice.
+                # (\r? tolerates a CRLF checkout.)
+                #
+                # If a future pnpm changes that indent this parses to zero and takes
+                # the fail-closed path below — visible, not silent.
+                if ($0 !~ /^  [^[:space:]].*:\r?$/) next
+                key = $0
+                sub(/^[[:space:]]+/, "", key)
+                sub(/:\r?$/, "", key)
+
+                # pnpm quotes keys containing YAML-special characters. \047 is a
+                # single quote, spelled octal so this program stays inside one
+                # pair of shell single quotes.
+                q = substr(key, 1, 1)
+                if ((q == "\"" || q == "\047") && substr(key, length(key), 1) == q)
+                  key = substr(key, 2, length(key) - 2)
+
+                # v6/v9 peer suffix, stripped before the split: a scoped peer in
+                # vue-loader@15.9.8(@vue/compiler-sfc@3.0.0) would otherwise own
+                # both the last "@" and the last "/" in the key.
+                sub(/\(.*$/, "", key)
+
+                slashed = (substr(key, 1, 1) == "/")
+                if (slashed) key = substr(key, 2)
+
+                # Both patterns anchor to $, so leftmost-longest lands them on the
+                # LAST separator — which is what keeps a leading "@scope/" on the
+                # name side. Only v5 puts the version after a "/", and requiring
+                # it to look like a semver keeps a v6 scoped name that merely
+                # starts with a digit (/@develar/7zip-bin@5.2.0) out of that arm.
+                # Not airtight: a v6 scoped name beginning <digits>.<digit> —
+                # /@scope/1.2beta@3.0.0 — would still take the v5 arm and split to
+                # @scope + 1.2beta@3.0.0, which then fails the semver charset and
+                # is filed as non-registry. That name shape is close to
+                # nonexistent on npm, and the outcome is a fail-closed with a
+                # slightly wrong reason rather than a pass, so the discriminator
+                # is left simple.
+                # The backslash in [^\/] is load-bearing: a bare "/" inside a
+                # /.../ literal is a syntax error on BWK awk. POSIX reads it as
+                # "not backslash and not slash", which is the same set here.
+                if (slashed && match(key, /\/[0-9]+\.[0-9][^\/]*$/)) {
+                  name = substr(key, 1, RSTART - 1)
+                  ver  = substr(key, RSTART + 1)
+                  sub(/_.*$/, "", ver)               # v5 peer suffix; "_" is not legal in semver
+                } else if (!slashed && substr(key, 1, 1) != "@" \
+                           && (key ~ /^[a-z][a-z0-9+.-]*:\/\// \
+                               || key ~ /^(file|link|workspace|portal|git\+):/ \
+                               || key ~ /^[^\/]+\.[^\/]+\//)) {
+                  # Keys that name a source rather than a package. Three shapes:
+                  #   scheme://...    https://host/x.tgz, git+https://host/r.git#sha
+                  #   host/path/rev   example.com/pkg/1.0.0, github.com/o/r/<sha>
+                  #   scheme:path      file:./x, link:../y, workspace:*, git+...
+                  #
+                  # The scheme-prefix shape used to sit in its own arm AFTER the
+                  # v6/v9 split, which meant a key carrying both a prefix and an
+                  # "@" (file:./pkg@1.0.0) was split there and emitted as a
+                  # registry package. Testing it here fixes that; folding also
+                  # removes a second nonregistry++ site to keep in step.
+                  # Neither has an "@" to split on — or, for git+ssh, has one that
+                  # belongs to the URL userinfo — so without the scheme alternative
+                  # they reach `else next` UNCOUNTED, and a lockfile made entirely
+                  # of them reports "lockfileVersion not understood" and sends the
+                  # operator off to pin back a release. It is a vendored repo, not
+                  # a format gap, and allow_registry_free is the answer.
+                  #
+                  # Tested here, AFTER the
+                  # v5 arm and BEFORE the v6/v9 one, because both neighbours would
+                  # get it wrong: a peer suffix (`..._react@16.0.0`) gives the
+                  # v6/v9 arm an "@" to split on, yielding a two-slash name that
+                  # only is_valid_pkg_name catches, and downgrades a real
+                  # diagnosis into "does not match npm package name rules".
+                  #
+                  # The two guards are what keep it off legitimate packages: an
+                  # unscoped v5 key with a dot in the name (`/lodash.merge/4.6.2`)
+                  # is `slashed` and has already matched the v5 arm above, and a
+                  # scoped name whose scope contains a dot (`@foo.bar/baz@1.0.0`)
+                  # is excluded by the leading "@".
+                  nonregistry++
+                  next
+                } else if (match(key, /@[^@]*$/)) {  # v6/v9
+                  name = substr(key, 1, RSTART - 1)
+                  ver  = substr(key, RSTART + 1)
+                } else next
+
+                # Defensive, not load-bearing: the nested sub-keys this once
+                # caught (peerDependenciesMeta children and the like) sit at four
+                # spaces and are already rejected by the indent anchor above,
+                # before any arm runs. What is left for it is a contrived
+                # two-space key that splits to an empty name, such as a bare
+                # @1.0.0 — cheap to keep, but do not read it as evidence that the
+                # indent anchor could be relaxed. It could not.
+                if (name == "") next
+
+                # Registry versions are semver: a leading digit, then only the
+                # characters semver allows, mirroring the package-lock parser
+                # keeping only https "resolved" — and it keeps ":" out of the
+                # version, so a crafted key cannot smuggle ::workflow-command::
+                # text into a log line or summary row.
+                #
+                # The NAME side is deliberately not constrained here — a crafted
+                # `pkg::error::foo@1.0.0` does yield that name. It is rejected
+                # downstream by npm_age::is_valid_pkg_name before it can reach the
+                # curl URL, and the resulting annotation lands mid-line behind a
+                # `::warning file=...::` prefix where Actions will not parse a
+                # workflow command. Constrained, but not here.
+                if (ver ~ /^[0-9][0-9A-Za-z.+-]*$/) {
+                  if (mode == "entries") print name "@" ver
+                  next
+                }
+
+                # Not semver. Two very different reasons, and they must not share
+                # a counter, because they lead to opposite remedies: one says pin
+                # back and file an issue, the other says set allow_registry_free
+                # — which turns the gate OFF for that repo, permanently. The
+                # catch-all therefore has to be the conservative one.
+                #
+                # A version that still names a SOURCE is a deliberate skip. That
+                # includes the shape a v9 git key leaves behind:
+                # `gitdep@git+ssh://git@github.com/o/r.git` splits at the last
+                # "@" — the one inside `git@github.com` — leaving
+                # `github.com/o/r.git`, which names no scheme but is plainly a
+                # host path. Testing for "://" anywhere, a known scheme prefix, or
+                # a host-shaped head covers the enumerable set; an earlier attempt
+                # that tested only scheme prefixes misfiled exactly that git key.
+                #
+                # Anything else — a future lockfileVersion spelling versions
+                # `v1.2.3`, say — is a format this parser cannot read, and falls
+                # through to the pin-back message.
+                if (ver ~ /:\/\// \
+                    || ver ~ /^(file|link|workspace|portal|git|git\+[a-z]+|https?|ssh):/ \
+                    || ver ~ /^[^\/]+\.[^\/]+\//) {
+                  nonregistry++
+                  next
+                }
+                unreadable++
+                next
+
+              }
+
+              END { if (mode == "counts") print nonregistry + 0, unreadable + 0 }
+            '
+          }
+
+          # Emits the pkg@versions present in the head image of the lockfile but
+          # not in the base image. Comparing the two images rather than scraping
+          # `git diff` added lines is what makes this correct for a version bump:
+          # the added line for a bumped package is a brand-new key, but so is a
+          # reformatted or re-indented one, and a diff-scraper cannot tell a
+          # genuinely new resolution from a line that merely moved.
+          #
+          # `precommit_age::changed_pins` in lib/age-check-precommit.sh is the
+          # same shape (parse base image, parse head image, emit head-only lines)
+          # against .pre-commit-config.yaml. The two are worth folding into one
+          # _preflight helper once a third ecosystem wants it.
           npm_age::diff_pnpm_lock() {
             local lockfile="$1" base_ref="$2"
-            local diff_out
-            diff_out=$(git diff "${base_ref}"...HEAD -- "$lockfile") \
-              || { echo "::error::git diff against ${base_ref} for ${lockfile} failed"; return 1; }
-            printf '%s\n' "$diff_out" \
-              | awk '/^\+[^+]/' \
-              | grep -oE '/[^:]+@[0-9][^:/ ]*' \
-              | sed 's|^/||' \
-              | sort -u || true
+
+            # Read the base side at the MERGE BASE, not at the tip of ${base_ref}.
+            # This is the three-dot semantics of the `git diff ${base_ref}...HEAD`
+            # this replaced, and of the package-lock and yarn parsers. Against the
+            # tip instead, any package ${base_ref} dropped or bumped since this
+            # branch forked reads as newly added here — enough to fail a PR over a
+            # dependency it never touched.
+            local base_rev
+            base_rev=$(git merge-base "$base_ref" HEAD) \
+              || { echo "::error::git merge-base ${base_ref} HEAD failed — a shallow checkout will do this; the workflow needs fetch-depth: 0" >&2; return 2; }
+
+            # Unchanged lockfile: nothing to gate, and parsing both images of a
+            # monorepo-scale lockfile to prove it costs real time on every PR.
+            # `git diff` compares blobs and applies the same clean filters the
+            # checkout did, so this agrees with the parse it skips.
+            #
+            # The ls-files guard is load-bearing: `git diff <rev> -- <path>`
+            # ignores untracked paths, so an untracked or gitignored lockfile —
+            # one generated by an earlier job step, say — reports "no change" and
+            # would short-circuit to a pass without the file ever being read.
+            # That is a silent pass, which is the whole thing this parser exists
+            # to stop. Untracked falls through to the full comparison instead,
+            # where an absent base image promotes every entry.
+            if git ls-files --error-unmatch "$lockfile" >/dev/null 2>&1 \
+               && git diff --quiet "$base_rev" -- "$lockfile" 2>/dev/null; then
+              return 0
+            fi
+
+            # Checked like every other call here. `set -e` does NOT cover this:
+            # main runs the function as `new_deps=$(...) || parse_rc=$?`, and
+            # errexit is suppressed for the whole body of a command on the left of
+            # a `||`. Unchecked, an awk failure (mawk out of memory on a monorepo
+            # lockfile is the realistic one) leaves head_entries empty, the counts
+            # probe re-runs the same failing awk and also comes back empty, and
+            # the run reports "lockfileVersion is not one this check understands"
+            # — sending the operator to pin back a release over an OOM.
+            local head_entries
+            head_entries=$(npm_age::parse_pnpm_lock < "$lockfile") \
+              || { echo "::error file=${lockfile}::could not read ${lockfile}; the parser itself failed" >&2; return 1; }
+
+            if [ -z "$head_entries" ]; then
+              # Nothing parsed. Two very different situations, and warning on both
+              # would leave the silent pass reachable: for a pnpm-only repo the
+              # non-registry entries no longer reach `skipped_count`, so the
+              # all-skipped guard in main cannot fire either, and a lockfileVersion
+              # that restructures `packages:` would go green with one annotation —
+              # the v9 bug again, one log line louder.
+              #
+              # `resolution:` is the one key pnpm has kept on every entry from v5
+              # through v9, so it survives the section rename that would defeat the
+              # parser. Its presence means the file demonstrably has packages we
+              # failed to read: verify nothing, fail closed.
+              # Checked for the same reason head_entries is: errexit is suppressed
+              # for this whole function. Unchecked, a failing awk yields an empty
+              # count, falls past the branch below to the `resolution:` grep, and
+              # reports a format this check cannot understand — the misdiagnosis
+              # `counts` exists to prevent, reached by a different door.
+              # Explicit IFS: the script sets IFS=$'\n\t' globally, so a bare
+              # `read` would not split this pair on its space.
+              local counts nonregistry=0 unreadable=0
+              counts=$(npm_age::parse_pnpm_lock counts < "$lockfile") \
+                || { echo "::error file=${lockfile}::could not count entries in ${lockfile}; the parser itself failed" >&2; return 1; }
+              IFS=' ' read -r nonregistry unreadable <<< "$counts"
+
+              # Unreadable wins, deliberately. These two branches offer opposite
+              # remedies — pin back and file an issue, versus set
+              # allow_registry_free, which turns the gate OFF for this repo
+              # permanently. A format whose keys still split but spell versions
+              # differently would otherwise land on the second one, and the
+              # operator would disable the check to clear a red build.
+              if [ "${unreadable:-0}" -gt 0 ]; then
+                echo "::error file=${lockfile}::${lockfile} has ${unreadable} package key(s) whose version this check could not read — its lockfileVersion is not one this check understands, so nothing was verified. Until this check is taught the new format, pin your caller to the previous ops-routines-workflows release SHA and tell the ops-routines maintainers." >&2
+                return 1
+              fi
+
+              if [ "${nonregistry:-0}" -gt 0 ]; then
+                # Unlike the unreadable-format branch below — a bug in this check
+                # that someone can fix — a repo that genuinely vendors everything
+                # through git deps would hit this on every PR that touches the
+                # lockfile. There is no per-repo opt-out for that today, and
+                # age-check-bypass is not one: it is reserved for verified-CVE
+                # overrides, so recommending it for a permanent, benign repo
+                # shape would erode the signal wherever the label is audited.
+                # Say what is true instead of offering the wrong escape hatch.
+                # Explicit truthy match, not `-n`: this variable's only job is to
+                # weaken a supply-chain control, and `=false` or `=0` turning it ON
+                # is a footgun for a local run or a future template edit. The
+                # workflow expression yields '' for false, so the supported path is
+                # unaffected either way.
+                case "${AGE_CHECK_ALLOW_REGISTRY_FREE:-}" in
+                  1|true|TRUE|True|yes|YES|Yes)
+                    echo "::warning file=${lockfile}::${lockfile} resolves ${nonregistry} package(s), none of them from a registry — nothing in this file was age-checked. Passing because allow_registry_free is set." >&2
+                    return 4
+                    ;;
+                esac
+                echo "::error file=${lockfile}::${lockfile} resolves ${nonregistry} package(s), none of them from the public npm registry (git, tarball, link:, file: or workspace: sources — or, in a v5 lockfile, keys qualified with a private registry host) — nothing could be age-checked. If that is this repo's permanent shape, pass allow_registry_free: true to the reusable workflow; age-check-bypass is for verified-CVE overrides only (runbooks/phase-0-checklist.md) and should not be applied every PR." >&2
+                return 3
+              fi
+
+              if grep -qE '^[[:space:]]+resolution:' "$lockfile"; then
+                # No knob covers this one, and the sibling error correctly steers
+                # operators away from age-check-bypass — so the message has to name
+                # the remediation that does exist, or it fails a required check
+                # while forbidding every escape it mentions.
+                echo "::error file=${lockfile}::${lockfile} declares resolved packages but no package key could be parsed — its lockfileVersion is not one this check understands, so nothing was verified. Until this check is taught the new format, pin your caller to the previous ops-routines-workflows release SHA and tell the ops-routines maintainers." >&2
+                return 1
+              fi
+              # No resolution entries at all: a genuinely dependency-free lockfile.
+              # Nothing to gate, and nothing wrong.
+              echo "::warning file=${lockfile}::${lockfile} declares no resolved dependencies — nothing to age-check for this file" >&2
+              return 0
+            fi
+
+            # An absent base image means a brand-new lockfile, and an empty base
+            # set is the right answer for it.
+            # `<rev>:./<path>` — see diff_package_lock: the "./" keeps this
+            # cwd-relative and therefore consistent with the `git diff` pathspec
+            # above under the caller's `working_directory`.
+            #
+            # Via a temp file, not a process substitution and not a variable. A
+            # process substitution's exit status is unobservable, so a mid-stream
+            # `git show` failure would silently truncate the base set and every
+            # unread package would read as newly added; a variable would hold a
+            # monorepo lockfile (10 MB+ is ordinary) in memory and copy it again
+            # through the pipe. The redirect gives the error check for neither
+            # cost. (The parsed entry lists below are still shell variables —
+            # smaller than the blob by a large constant, but not free.) Same mktemp + `trap ... RETURN` idiom as npm_age::published_at
+            # — the trap fires only when THIS function returns, not when the
+            # parser it calls does.
+            local base_blob
+            # Checked: errexit is suppressed for this whole function, so an
+            # unchecked mktemp leaves base_blob empty, `git show > ""` fails, and
+            # the run returns 2 — "base revision unreadable, most often a shallow
+            # checkout". That is the one confidently-wrong diagnosis left in a
+            # function built to avoid them.
+            base_blob=$(mktemp) \
+              || { echo "::error::could not create a temporary file for the base image" >&2; return 1; }
+            # shellcheck disable=SC2064
+            trap "rm -f \"$base_blob\"" RETURN
+
+            # Classify the base side, then report once. The promotion warning used
+            # to live inside the cat-file branch, so it never fired for an ABSENT
+            # base image — which is the case that most often causes the promotion:
+            # a lockfile this branch adds, an untracked one (the ls-files guard
+            # above deliberately routes those here), or a working_directory that
+            # does not match where the lockfile lives.
+            # `base_counts` is assigned inside the classifier below and read only
+            # there; no initializer, so a stale value cannot survive into a later
+            # iteration. (An earlier `|| echo 0` on that assignment was removed as
+            # misleading — it landed on the same `unreadable` state the current
+            # short-circuit does, so it drew a distinction the code never made.)
+            # `counts` prints "<non-registry> <unreadable>"; only the first field
+            # answers "did this image parse into source-shaped keys?".
+            local base_entries="" base_state=absent base_counts base_nonreg
+            if git cat-file -e "${base_rev}:./${lockfile}" 2>/dev/null; then
+              git show "${base_rev}:./${lockfile}" > "$base_blob" \
+                || { echo "::error::git show ${base_rev}:${lockfile} failed" >&2; return 2; }
+              base_entries=$(npm_age::parse_pnpm_lock < "$base_blob") \
+                || { echo "::error file=${lockfile}::could not read the base image of ${lockfile}; the parser itself failed" >&2; return 1; }
+              if [ -n "$base_entries" ]; then
+                base_state=ok
+              elif base_counts=$(npm_age::parse_pnpm_lock counts < "$base_blob") \
+                   && { IFS=' ' read -r base_nonreg _ <<< "$base_counts"; \
+                        [ "${base_nonreg:-0}" -gt 0 ]; }; then
+                # Read fine; everything in it resolves through git/tarball/link.
+                # Without this arm the `resolution:` probe below claims the base
+                # image is unreadable — the same misdiagnosis the head side has
+                # three branches to avoid, and it fires for the ordinary case of
+                # a repo migrating OFF vendored dependencies.
+                base_state=vendored
+              elif grep -qE '^[[:space:]]+resolution:' "$base_blob"; then
+                base_state=unreadable
+              else
+                base_state=empty
+              fi
+            fi
+
+            # Every state but `ok` means the difference is taken against an empty
+            # base set, so the WHOLE head lockfile is promoted to "newly added" —
+            # the entire transitive tree, each entry paying `sleep 0.2` and a
+            # registry round trip. On a real tree that is a job timeout, and a
+            # timeout reads as flake, so each case says whether re-running helps.
+            if [ "$base_state" != ok ]; then
+              # The count matters as much as the category: "treating 3 entries as
+              # newly added" and "treating 4,000" are different situations, and if
+              # the second one times out the log should already have said so.
+              local promoted; promoted=$(printf '%s\n' "$head_entries" | grep -c . || true)
+              local promo="all ${promoted} entries in ${lockfile} are being treated as newly added, which at this size can exhaust the job timeout"
+              case "$base_state" in
+                absent)
+                  echo "::warning file=${lockfile}::${lockfile} has no image at the merge base — ${promo}, and a timeout will read as flake rather than as this. Expected for a lockfile this branch adds; if instead the file is untracked or working_directory does not match where it lives, that is the thing to fix." >&2
+                  ;;
+                vendored)
+                  echo "::warning file=${lockfile}::the base image of ${lockfile} resolves nothing from a registry — ${promo}. Expected for a repo moving off vendored dependencies; nothing is wrong with the base image." >&2
+                  ;;
+                unreadable)
+                  echo "::warning file=${lockfile}::the base image of ${lockfile} declares resolved packages this check could not read — ${promo}. Re-running will not help." >&2
+                  ;;
+                empty)
+                  echo "::warning file=${lockfile}::the base image of ${lockfile} had no resolved dependencies — ${promo}. Expected for a project adding its first ones." >&2
+                  ;;
+              esac
+            fi
+
+            # `comm` reads an empty operand as the empty set, so neither case
+            # above needs special handling here; both sides are sorted under the
+            # same collation so it can stream them.
+            LC_ALL=C comm -13 \
+              <(printf '%s\n' "$base_entries" | LC_ALL=C sort -u) \
+              <(printf '%s\n' "$head_entries" | LC_ALL=C sort -u)
           }
 
           npm_age::diff_yarn_lock() {
@@ -734,7 +1311,7 @@ jobs:
             # Extract (package, version) pairs from the added side.
             local diff_out
             diff_out=$(git diff "${base_ref}"...HEAD -- "$lockfile") \
-              || { echo "::error::git diff against ${base_ref} for ${lockfile} failed"; return 1; }
+              || { echo "::error::git diff against ${base_ref} for ${lockfile} failed" >&2; return 2; }
             printf '%s\n' "$diff_out" \
               | awk '
                 /^\+[^+].*:$/   { line=$0; sub(/^\+/,"",line); sub(/:$/,"",line);
@@ -742,7 +1319,8 @@ jobs:
                                   sub(/^"/,"",name); sub(/"$/,"",name); next }
                 /^\+  version/  { ver=$0; sub(/^\+  version "/,"",ver); sub(/".*$/,"",ver);
                                   if (name != "") print name "@" ver; name="" }' \
-              | sort -u
+              | sort -u \
+              || { echo "::error::could not build the work-list for ${lockfile}" >&2; return 1; }
           }
 
           # ----- Registry fetch: ISO-8601 timestamp on stdout ------------------------
@@ -815,7 +1393,7 @@ jobs:
           # ----- Main -----------------------------------------------------------------
 
           npm_age::main() {
-            preflight::require_tools curl jq awk sed grep sort
+            preflight::require_tools curl jq awk sed grep sort comm mktemp git
             preflight::require_gnu_date
             preflight::validate_min_age_days
 
@@ -826,6 +1404,7 @@ jobs:
             local failed=false
             local checked_count=0
             local skipped_count=0
+            local registry_free_count=0
 
             local -a targets=()
             [ -f "$LOCKFILE_PATH" ]    && targets+=("package-lock:${LOCKFILE_PATH}")
@@ -844,12 +1423,91 @@ jobs:
               local kind="${entry%%:*}" file="${entry#*:}"
               echo "::group::Checking ${file}"
 
-              local new_deps=""
+              local new_deps="" parse_rc=0
               case "$kind" in
-                package-lock) new_deps=$(npm_age::diff_package_lock "$file" "$base_ref") ;;
-                pnpm)         new_deps=$(npm_age::diff_pnpm_lock    "$file" "$base_ref") ;;
-                yarn)         new_deps=$(npm_age::diff_yarn_lock    "$file" "$base_ref") ;;
+                package-lock) new_deps=$(npm_age::diff_package_lock "$file" "$base_ref") || parse_rc=$? ;;
+                pnpm)         new_deps=$(npm_age::diff_pnpm_lock    "$file" "$base_ref") || parse_rc=$? ;;
+                yarn)         new_deps=$(npm_age::diff_yarn_lock    "$file" "$base_ref") || parse_rc=$? ;;
               esac
+
+              # A parser that cannot read its lockfile has verified nothing, so
+              # this must not fall through to "no new dependencies". Catching the
+              # status explicitly (rather than letting `set -e` abort mid-loop)
+              # also closes the group, so the parser's stderr annotation is not
+              # rendered inside a fold whose body just stops.
+              # Both branches below put the file name into rendered surfaces, so
+              # sanitize once. record_unverifiable's contract says display_id
+              # arrives sanitized and it strips only the reason, and $file is
+              # LOCKFILE_PATH verbatim for the package-lock kind — a path with a
+              # "|" would split the row in the rendered PR comment.
+              local safe_file; safe_file=$(preflight::safe_for_md "$file")
+
+              # rc 4: a pass by explicit configuration rather than by
+              # verification. Recorded in the table and counted, so the run cannot
+              # report "Verified 0 package(s) :white_check_mark:" — which anyone
+              # auditing summaries at fleet scale reads as a pass WITH coverage.
+              # This is NOT the could-not-read case; that is the branch below.
+              if [ "$parse_rc" -eq 4 ]; then
+                echo "| \`${safe_file}\` | — | — | :warning: registry-free (allow_registry_free) |" >> "$GITHUB_STEP_SUMMARY"
+                registry_free_count=$((registry_free_count + 1))
+                echo "Nothing from a registry in ${file}; skipped via allow_registry_free"
+                echo "::endgroup::"
+                continue
+              fi
+
+              if [ "$parse_rc" -ne 0 ]; then
+                echo "::endgroup::"
+                # A parser that could not read its input has verified nothing, so
+                # this must not fall through to "no new dependencies". Three
+                # separate surfaces are written by hand here, because each covers
+                # a different reader:
+                #
+                #   the summary ROW      — record_unverifiable writes only the TSV,
+                #                          so without this append the footer below
+                #                          points at a table with just a header
+                #   the failures TSV     — comment-on-failure is gated on that file
+                #                          being non-empty; with no row the operator
+                #                          gets a red check and no PR-level word
+                #   the summary FOOTER   — see the step_summary_unverifiable note
+                #
+                # The PR comment is the only one of those an operator sees without
+                # opening the run log, so it has to name the right cause. A shallow
+                # checkout fails at merge-base rather than at parsing, and telling
+                # that operator their lockfile is unreadable sends them nowhere
+                # near `fetch-depth: 0`.
+                local fail_cell fail_reason
+                case "$parse_rc" in
+                  2)
+                    # Hedged: a shallow checkout is much the most common cause,
+                    # but a corrupt object or a permissions failure lands here too
+                    # and should not be told confidently to change fetch-depth.
+                    fail_cell=":x: base revision unreadable"
+                    fail_reason="could not read the base revision — most often a shallow checkout, in which case the workflow needs fetch-depth: 0"
+                    ;;
+                  3)
+                    # The case allow_registry_free exists for. Reporting it as a
+                    # parse failure would send this operator to the README entry
+                    # for the OTHER failure, whose remedy (pin back a release) is
+                    # the opposite of what they need.
+                    fail_cell=":x: nothing from a registry"
+                    fail_reason="resolves nothing from the public npm registry, so no dependency could be age-checked — if that is this repo's permanent shape, pass allow_registry_free: true to the reusable workflow"
+                    ;;
+                  *)
+                    fail_cell=":x: lockfile could not be parsed"
+                    fail_reason="lockfile could not be parsed; see the job log"
+                    ;;
+                esac
+                echo "::error file=${safe_file}::could not determine new dependencies for ${safe_file} — ${fail_reason}; failing closed"
+                echo "| \`${safe_file}\` | — | — | ${fail_cell} |" >> "$GITHUB_STEP_SUMMARY"
+                preflight::record_unverifiable "$safe_file" "n/a" "$fail_reason"
+                # NOT step_summary_failed: its footer tells the operator to add the
+                # age-check-bypass label, which is exactly what the parser's own
+                # ::error:: on this path tells them not to do — and the label does
+                # clear the check, so the summary would be teaching the
+                # anti-pattern from the surface that is one click away.
+                preflight::step_summary_unverifiable "${safe_file}: ${fail_reason}"
+                exit 1
+              fi
 
               if [ -z "$new_deps" ]; then
                 echo "No new dependencies in ${file}"
@@ -864,6 +1522,10 @@ jobs:
                   continue
                 fi
                 # Skip non-registry sources (file:, link:, workspace:, git+, portal:).
+                # package-lock and yarn only: the pnpm parser drops these at parse
+                # time, so they never reach here — which is also why they no
+                # longer reach skipped_count on that path. Do not read this as
+                # covering pnpm.
                 case "$ver" in
                   file:*|link:*|workspace:*|git+*|portal:*)
                     echo "  SKIP: ${pkg}@${ver} (non-registry)"
@@ -942,9 +1604,29 @@ jobs:
               echo "::endgroup::"
             done
 
+            # Emitted before every terminal branch below, not inside one. A file
+            # skipped via allow_registry_free was not age-checked at all, and each
+            # footer that follows would otherwise imply more coverage than the run
+            # had: step_summary_all_passed counts only what it checked, and
+            # step_summary_all_skipped speaks of "all N skipped" without knowing
+            # about a file it never saw. The helper takes checked_count too, so
+            # the pure registry-free run gets one accurate sentence rather than
+            # this one plus a second, near-identical one below.
+            if [ "$registry_free_count" -gt 0 ]; then
+              preflight::step_summary_registry_free "$registry_free_count" "$checked_count"
+            fi
+
             # Guard against "registry outage → every package skipped → workflow
             # passes" — if nothing actually got verified but some were skipped
             # (including non-registry SKIPs), err on the side of failing.
+            #
+            # `skipped_count` means different things per lockfile kind in one run:
+            # package-lock and yarn feed their non-registry entries through the
+            # per-package SKIP branch above, pnpm drops its own at parse time. So
+            # a repo with a registry-free pnpm lockfile AND a package-lock whose
+            # packages could not be verified fails here, before the registry-free
+            # exit below — the pnpm file passed, the run did not. That is fail-
+            # closed on purpose, and the input description says so.
             if [ "$checked_count" -eq 0 ] && [ "$skipped_count" -gt 0 ]; then
               preflight::step_summary_all_skipped "$skipped_count"
               echo "::error::All ${skipped_count} packages were skipped; no verification possible. Failing to avoid a false pass."
@@ -957,6 +1639,15 @@ jobs:
               echo "::error::One or more npm dependencies failed the age check."
               echo "To bypass for emergency security updates, add the 'age-check-bypass' label to this PR."
               exit 1
+            fi
+
+            if [ "$checked_count" -eq 0 ] && [ "$registry_free_count" -gt 0 ]; then
+              # The footer is already written above, by the branch of
+              # step_summary_registry_free that knows nothing else was checked.
+              # Not step_summary_all_passed: "Verified 0 package(s)
+              # :white_check_mark:" would contradict it.
+              echo "No registry dependencies to age-check (allow_registry_free)"
+              exit 0
             fi
 
             preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS" "$skipped_count"

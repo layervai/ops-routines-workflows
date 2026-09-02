@@ -704,6 +704,43 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           }
 
+          # Footer for a run where one or more manifests were skipped wholesale by
+          # explicit configuration rather than examined. Takes both counts because
+          # the honest sentence depends on whether anything else WAS checked:
+          # with a nonzero checked_count the skip is a caveat on a real result,
+          # with zero it is the whole result. Emitting one blockquote per
+          # condition produced two adjacent paragraphs saying the same thing, and
+          # a forward reference to a count that never followed.
+          preflight::step_summary_registry_free() {
+            local skipped_files="$1" checked_count="${2:-0}"
+            {
+              echo ""
+              if [ "$checked_count" -gt 0 ]; then
+                echo "> **${skipped_files} lockfile(s) were not age-checked at all**, having resolved nothing from a registry; they were skipped by configuration. The count below covers only the rest."
+              else
+                echo "> **Nothing was age-checked.** ${skipped_files} lockfile(s) resolved nothing from a registry and were skipped by configuration. This is a pass by configuration, not by verification."
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          # Footer for a run that verified NOTHING because a manifest could not be
+          # read — as distinct from a dependency failing the age check, which is
+          # what `step_summary_failed` is for.
+          #
+          # Deliberately does NOT mention `age-check-bypass`. That label is scoped
+          # to verified-CVE overrides, the conditions reaching this footer can be
+          # permanent rather than incidental, and the label genuinely clears the
+          # check (the reusable job is gated on its absence) — so naming it here
+          # would hand the operator the exact anti-pattern the ecosystem scripts
+          # warn against in their own ::error:: on the same failure.
+          preflight::step_summary_unverifiable() {
+            local reason="$1"
+            {
+              echo ""
+              echo "> **Nothing could be verified — ${reason}.** No dependency was age-checked in this run, so this fails rather than reporting a pass it cannot support."
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
           # Guard against "registry outage → every package skipped → workflow
           # passes" — if nothing actually got verified, fail and write a
           # summary explaining why.
