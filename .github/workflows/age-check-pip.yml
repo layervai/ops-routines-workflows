@@ -539,6 +539,66 @@ jobs:
             LC_ALL=C printf '%s' "$1" | LC_ALL=C tr -cd '[:alnum:]@/_.:+-' | LC_ALL=C head -c 80
           }
 
+          # ----- Operational knobs ----------------------------------------------------
+          #
+          # Not sanitization: these validate tuning inputs. Kept below the
+          # sanitization block so the markdown-allowlist rationale above stays
+          # attached to safe_for_md, which is the function a maintainer reads it
+          # for.
+
+          # Validate an operational positive-integer knob, echoing the value to
+          # use. Normalizes leading zeros through a base-10 round-trip for the
+          # same reason validate_min_age_days does — a `010` would otherwise be
+          # read as octal by arithmetic contexts.
+          #
+          # Unlike validate_min_age_days this FALLS BACK rather than aborting:
+          # MIN_AGE_DAYS is the security threshold, while these are tuning knobs
+          # (work-list caps, budgets), and a fat-fingered value must not take a
+          # supply-chain check offline. The warning goes to stderr because callers
+          # read the value from stdout.
+          preflight::validate_positive_int() {
+            local name="$1" value="$2" fallback="$3"
+            # Unset/empty is "not provided", not "misconfigured" — take the
+            # fallback silently. Warning here would fire on every run for any
+            # consumer whose workflow revision predates the input (the
+            # `ref: main` split makes that a real population), and would blame
+            # them for a value they never set. The ::warning below is reserved for
+            # a value that is present and genuinely unusable.
+            if [ -z "$value" ]; then
+              printf '%s' "$fallback"
+              return 0
+            fi
+            if [[ "$value" =~ ^[0-9]+$ ]]; then
+              value=$((10#$value))
+            else
+              value=0
+            fi
+            if [ "$value" -lt 1 ]; then
+              echo "::warning::${name} is not a positive integer; falling back to ${fallback}" >&2
+              value="$fallback"
+            fi
+            printf '%s' "$value"
+          }
+
+          # Sanitize each element of a list and join with ", ". safe_for_md's
+          # `tr -cd` keeps neither `,` nor space, so sanitizing an already-joined
+          # string collapses "package-lock.json, yarn.lock" into
+          # "package-lock.jsonyarn.lock". Map-then-join makes the safe order the
+          # obvious one for the next caller.
+          preflight::safe_list_for_md() {
+            local out="" item safe
+            for item in "$@"; do
+              safe=$(preflight::safe_for_md "$item")
+              # Skip an element that sanitized away entirely. Testing the
+              # ACCUMULATOR for emptiness instead would emit a dangling "a, " for a
+              # trailing empty and "a, , c" for a middle one — the same class of
+              # mis-rendering this function was added to fix, one step further out.
+              [ -n "$safe" ] || continue
+              out="${out:+${out}, }${safe}"
+            done
+            printf '%s' "$out"
+          }
+
           # ----- Step-summary helpers --------------------------------------------------
 
           # `GITHUB_STEP_SUMMARY` is provided by GitHub Actions; default to
