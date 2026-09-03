@@ -165,6 +165,9 @@ jobs:
           # - Explicit base_ref verification before `git diff` so a missing ref
           #   doesn't get conflated with "no changes detected" by a trailing
           #   `|| true` on the filter pipeline
+          # - One resolution of "the base" — the merge base of base_ref and HEAD —
+          #   so a parser that reads a base image (`git show <rev>:<path>`) sees
+          #   the same revision its three-dot `git diff` compares against
           # - Step-summary helpers so the Actions UI never shows an empty panel
           #   on early-exit paths
           # - Shared age comparison + ISO-8601 parsing to keep those callers
@@ -178,7 +181,10 @@ jobs:
           #   preflight::verify_base_ref "origin/${BASE_REF}"  # MUST come before any
           #                                              # subsequent `git diff` — see
           #                                              # the function comment for
-          #                                              # the silent-pass reason.
+          #                                              # the silent-pass reason. Also
+          #                                              # resolves the merge base once;
+          #                                              # read it via preflight::base_rev
+          #                                              # for every `<rev>:<path>` read.
           #
           # Usage (from an age-check script):
           #
@@ -263,29 +269,91 @@ jobs:
           # by this preflight *only* for the expected "missing base ref" failure
           # mode; for catastrophic git failures mid-script the helper still needs
           # its own `|| { echo ::error; return 1; }` branch.
+          #
+          # Also resolves "the base" ONCE, as the merge base of base_ref and HEAD,
+          # and exposes it via `preflight::base_rev`. Every `git diff
+          # ${base_ref}...HEAD` in the ecosystem scripts already compares against
+          # that merge base (three-dot semantics); a parser that instead READS a
+          # base image — `git show <rev>:<path>`, `git cat-file -e` — must read
+          # the same revision, or the two halves of one function disagree about
+          # which base they mean. Read at the TIP of base_ref, any dependency the
+          # base branch dropped or bumped after this branch forked is present in
+          # the head image and absent from the base one, so it reads as newly
+          # added and, if young, fails a PR that never touched it. Every
+          # ecosystem's main() hands its parsers this revision rather than the
+          # ref, so no call site re-derives what "the base" means.
           preflight::verify_base_ref() {
             local base_ref="$1"
             if [ -z "$base_ref" ]; then
               echo "::error::preflight::verify_base_ref called with empty argument"
               exit 1
             fi
+            # Sanitized once, here, for every surface the two failures below reach
+            # — the log line, the PR-comment row and the summary footer all render
+            # markdown, and a legally-named ref can carry `_`, `#` or a backtick.
+            local safe_ref; safe_ref=$(preflight::safe_for_md "$base_ref")
             if ! git rev-parse --verify --quiet "$base_ref" >/dev/null; then
-              echo "::error::Base ref ${base_ref} not found in this checkout. If you triggered this workflow via workflow_dispatch, ensure the base branch is fetched (fetch-depth: 0 on actions/checkout)."
-              exit 1
+              preflight::fail_not_run "$safe_ref" "base ref ${safe_ref} is not in this checkout — the base branch has to be fetched (fetch-depth: 0 on actions/checkout)"
             fi
-            # Record successful verification so `preflight::require_base_ref_verified`
-            # can assert it elsewhere if callers want a belt-and-suspenders check.
-            _PREFLIGHT_BASE_REF_VERIFIED=1
+            # A ref that resolves is not yet a usable base: on a shallow checkout
+            # (fetch-depth: 1) it exists but shares no reachable history with
+            # HEAD, and every three-dot diff downstream would fail on the same
+            # missing merge base. Failing here names the fix once, for every
+            # ecosystem.
+            if ! _PREFLIGHT_BASE_REV=$(git merge-base "$base_ref" HEAD); then
+              preflight::fail_not_run "$safe_ref" "could not resolve the merge base of ${safe_ref} and HEAD — most often a shallow checkout, in which case the workflow needs fetch-depth: 0 on actions/checkout"
+            fi
+            # The parsers are handed the revision, not the ref, and name only the
+            # revision in their own diagnostics; this is where the log ties the two.
+            echo "Base ${safe_ref}: merge base with HEAD is ${_PREFLIGHT_BASE_REV}"
           }
 
-          # Optional defensive check: assert verify_base_ref has run. Callers can
-          # invoke this right before a `git diff` as a static sanity check that
-          # the required-call-order convention was actually followed.
+          # Fail a run that never got to examine a pin, on every surface an
+          # operator might read: the log annotation, the failures TSV as a
+          # `not_run` row (so the PR comment carries the remedy — see
+          # record_not_run for why that row gets its own section) and the
+          # step-summary footer. For the failures a consumer repo reaches through
+          # an ordinary workflow setting — an unfetched base branch, a shallow
+          # checkout — because the PR comment is the one surface an operator sees
+          # without opening the run log. That comment only exists when there is a
+          # pull request to put it on: the render step is gated on a PR number,
+          # so a `push` or `workflow_dispatch` run — the shapes that reach these
+          # failures most easily — gets the ::error and the summary footer only.
+          # Coding errors stay ::error-only. The footer lands before any ecosystem
+          # header, since preflight runs first; its text stands on its own.
+          #
+          # Both arguments arrive SANITIZED (see verify_base_ref): they are rendered
+          # as markdown twice over. `reason` is one lowercase clause with no
+          # terminal period — the footer wraps it as `— ${reason}.` and the
+          # comment renders it in a table cell beside short sibling clauses.
+          preflight::fail_not_run() {
+            local display_id="$1" reason="$2"
+            echo "::error::${reason}"
+            preflight::record_not_run "$display_id" "$reason"
+            preflight::step_summary_unverifiable "$reason"
+            exit 1
+          }
+
+          # Assert verify_base_ref has run. `base_rev` uses it as its guard;
+          # callers can also invoke it right before a `git diff` as a static
+          # sanity check that the required-call-order convention was followed.
+          # Stderr, because `base_rev` is read through `$(...)` and a message on
+          # stdout would be captured and lost.
           preflight::require_base_ref_verified() {
-            if [ -z "${_PREFLIGHT_BASE_REF_VERIFIED:-}" ]; then
-              echo "::error::preflight::verify_base_ref must be called before any git diff. This is a coding error, not a runtime condition."
+            if [ -z "${_PREFLIGHT_BASE_REV:-}" ]; then
+              echo "::error::preflight::verify_base_ref must be called before any git diff. This is a coding error, not a runtime condition." >&2
               exit 1
             fi
+          }
+
+          # The merge base `verify_base_ref` resolved, on stdout — the revision
+          # every parser reads its base image from and diffs against, never the
+          # tip of base_ref. Fails closed if verify_base_ref has not run: with an
+          # empty revision `git show :<path>` reads the INDEX, a silent wrong
+          # answer rather than an error.
+          preflight::base_rev() {
+            preflight::require_base_ref_verified
+            printf '%s\n' "$_PREFLIGHT_BASE_REV"
           }
 
           # ----- ISO-8601 → epoch helper ----------------------------------------------
@@ -430,24 +498,39 @@ jobs:
           #                        issue. Tabs are stripped to keep the row
           #                        parseable.
           preflight::record_unverifiable() {
+            preflight::_record_reason_row "$1" "$2" "${3:-unknown reason}" unverifiable
+          }
+
+          # A row of kind `not_run`: the check stopped in preflight, before it
+          # examined a single pin — an unfetched base branch, a shallow clone. The
+          # remedy is a checkout setting, so the comment renders these in their
+          # own section with no "re-run" copy and no `age-check-bypass` offer:
+          # re-running cannot help, and the label would switch the gate off for a
+          # PR whose checkout is what needs fixing. `display_id` is the base ref,
+          # already sanitized (see verify_base_ref).
+          preflight::record_not_run() {
+            preflight::_record_reason_row "$1" "n/a" "$2" not_run
+          }
+
+          # Shared writer for the reason-carrying kinds. Strips characters that
+          # would corrupt the downstream comment:
+          #   - tabs/newlines break `IFS=$'\t' read` (multiline reason would
+          #     produce row count != failure count)
+          #   - `|` breaks the markdown table layout — the reason cell sits
+          #     between two `|` separators in the rendered comment, and an
+          #     embedded `|` would split the row into extra columns. All
+          #     in-tree call sites pass pipe-free strings today; this strip
+          #     defends a future caller forwarding upstream error text (e.g.,
+          #     curl stderr that happens to contain `|`).
+          preflight::_record_reason_row() {
             local file="${AGE_CHECK_FAILURES_FILE:-}"
             [ -z "$file" ] && return 0
-            local display_id="$1" display_version="$2"
-            local reason="${3:-unknown reason}"
-            # Strip characters that would corrupt the downstream comment:
-            #   - tabs/newlines break `IFS=$'\t' read` (multiline reason would
-            #     produce row count != failure count)
-            #   - `|` breaks the markdown table layout — the reason cell sits
-            #     between two `|` separators in the rendered comment, and an
-            #     embedded `|` would split the row into extra columns. All
-            #     in-tree call sites pass pipe-free strings today; this strip
-            #     defends a future caller forwarding upstream error text (e.g.,
-            #     curl stderr that happens to contain `|`).
+            local display_id="$1" display_version="$2" reason="$3" kind="$4"
             reason=$(printf '%s' "$reason" | tr -d '\t\n|')
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
               "$display_id" "$display_version" "?" \
               "n/a" "$reason" "?" \
-              "unverifiable" \
+              "$kind" \
               >> "$file"
           }
 
@@ -740,9 +823,10 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           }
 
-          # Footer for a run that verified NOTHING because a manifest could not be
-          # read — as distinct from a dependency failing the age check, which is
-          # what `step_summary_failed` is for.
+          # Footer for a run that verified NOTHING — because a manifest could not
+          # be read, or because preflight stopped the run before any manifest was
+          # examined (see fail_not_run) — as distinct from a dependency failing the
+          # age check, which is what `step_summary_failed` is for.
           #
           # Deliberately does NOT mention `age-check-bypass`. That label is scoped
           # to verified-CVE overrides, the conditions reaching this footer can be
@@ -1117,32 +1201,21 @@ jobs:
           # be captured into that variable instead of surfacing — the same trap
           # the 429 branch of npm_age::published_at documents.
           npm_age::changed_pins() {
-            local lockfile="$1" base_ref="$2" extractor="$3"
-            local before="" after="" base_sha
+            local lockfile="$1" base_rev="$2" extractor="$3"
+            local before="" after=""
 
-            # The MERGE BASE, not the base-branch tip.
-            #
-            # Under this reusable's own checkout config the two are the same
-            # commit, so nothing changes in production today: `actions/checkout` on
-            # a `pull_request` event checks out `refs/pull/N/merge`, whose parent
-            # is the base tip, so the tip is already an ancestor of HEAD. The
-            # `git diff ${base_ref}...HEAD` this replaces resolved to that same
-            # commit.
-            #
-            # It matters for every other way this script runs — a `push` or
-            # `workflow_dispatch` build, or a caller that checks out
-            # `pull_request.head.sha` rather than the merge ref. There HEAD does
-            # NOT contain the base branch's drift, and comparing against the tip
-            # pulls that drift into the work-list: on a 200-package lockfile where
-            # the branch bumps one dependency and the base has since merged a
-            # 60-package batch, that is 61 entries instead of 1. At ~0.45s per
-            # package a large enough drift times the job out over a
-            # one-dependency change. Taking the merge base makes the scope correct
-            # however HEAD was checked out.
-            if ! base_sha=$(git merge-base "$base_ref" HEAD 2>/dev/null); then
-              echo "::error::git merge-base ${base_ref} HEAD failed — a shallow checkout will do this; the workflow needs fetch-depth: 0" >&2
-              return 2
-            fi
+            # `base_rev` is preflight::base_rev — the MERGE BASE, not the
+            # base-branch tip (see verify_base_ref). Under this reusable's own
+            # checkout the two are one commit: `actions/checkout` on a
+            # `pull_request` event checks out `refs/pull/N/merge`, whose parent is
+            # the base tip. For every other way this script runs — a `push` or
+            # `workflow_dispatch` build, a caller checking out
+            # `pull_request.head.sha` — HEAD does NOT contain the base branch's
+            # drift, and comparing against the tip pulls that drift into the
+            # work-list: on a 200-package lockfile where the branch bumps one
+            # dependency and the base has since merged a 60-package batch, that is
+            # 61 entries instead of 1, and at ~0.45s per package a large enough
+            # drift times the job out over a one-dependency change.
 
             # `./` is load-bearing. `git show <rev>:<path>` resolves <path> from the
             # TOP OF THE WORKING TREE unless it starts with `./`, while the head
@@ -1154,13 +1227,32 @@ jobs:
             # appear in the root lockfile. That is a fail-OPEN in a supply-chain
             # gate. The `git diff -- "$lockfile"` this replaced used a pathspec,
             # which is cwd-relative, so the prefix restores the original scoping.
-            if git cat-file -e "${base_sha}:./${lockfile}" 2>/dev/null; then
-              if ! before=$(git show "${base_sha}:./${lockfile}" 2>/dev/null | "$extractor"); then
+            if git cat-file -e "${base_rev}:./${lockfile}" 2>/dev/null; then
+              # Read, then parse, as two checked steps, because they have
+              # different remedies: a `git show` that fails on an object the merge
+              # base names is a checkout problem (a partial clone's lazy blob
+              # fetch, a corrupt object), while an image the extractor rejects is
+              # a lockfile problem — and one pipeline reported both as the second.
+              # Via a temp file rather than a variable so a monorepo-scale image is
+              # not held in memory; same mktemp + `trap ... RETURN` idiom as
+              # diff_pnpm_lock, and the trap fires when THIS function returns.
+              # rc 2 on a failed mktemp: the base image could not be obtained, and
+              # main renders rc 1 as a head-lockfile parse failure, which it is not.
+              local base_blob
+              base_blob=$(mktemp) \
+                || { echo "::error::could not create a temporary file for the base image" >&2; return 2; }
+              # shellcheck disable=SC2064
+              trap "rm -f \"$base_blob\"" RETURN
+              if ! git show "${base_rev}:./${lockfile}" > "$base_blob"; then
+                echo "::error file=${lockfile}::could not read ${lockfile} at the merge base (${base_rev}) — git show failed; see its message above" >&2
+                return 2
+              fi
+              if ! before=$("$extractor" < "$base_blob"); then
                 # Fail closed and fast. Reporting the whole head lockfile instead
                 # would be unbounded — on a 3000-package lockfile that is a
                 # guaranteed 5-minute timeout, i.e. the same red build with a
                 # much worse message.
-                echo "::error file=${lockfile}::${lockfile} at ${base_ref} is not valid JSON; cannot determine which dependencies this branch introduces" >&2
+                echo "::error file=${lockfile}::${lockfile} at the merge base (${base_rev}) could not be parsed; cannot determine which dependencies this branch introduces" >&2
                 return 2
               fi
             fi
@@ -1196,11 +1288,8 @@ jobs:
           # `age-check-bypass`, which is the same argument this file makes for not
           # hard-failing an unsupported format.
           npm_age::lockfile_changed() {
-            local lockfile="$1" base_sha="$2"
-            # No resolvable base: report "changed" so the caller stays loud.
-            # changed_pins fails hard on the same condition moments later.
-            [ -n "$base_sha" ] || return 0
-            ! git diff --quiet "$base_sha" -- "./${lockfile}" 2>/dev/null
+            local lockfile="$1" base_rev="$2"
+            ! git diff --quiet "$base_rev" -- "./${lockfile}" 2>/dev/null
           }
 
           # Set by main to a temp file; report_unreadable_format appends to it.
@@ -1234,7 +1323,7 @@ jobs:
           }
 
           npm_age::diff_package_lock() {
-            local lockfile="$1" base_ref="$2"
+            local lockfile="$1" base_rev="$2"
 
             # Require the head image to be a JSON OBJECT before anything else.
             # A zero-byte or whitespace-only lockfile slips past both parse
@@ -1257,10 +1346,6 @@ jobs:
             # "I can't read this" that the pnpm probe below covers — announce it
             # rather than leaving it to a header comment. (Invalid JSON makes
             # `jq -e` non-zero and is left to changed_pins, which fails closed.)
-            # Resolved once and threaded into both probes; changed_pins resolves it
-            # again for itself, but this removes the other two calls per target.
-            local base_sha=""
-            base_sha=$(git merge-base "$base_ref" HEAD 2>/dev/null) || base_sha=""
 
             # jq -e: 0 = "has no packages", 1 = "has packages". 2+ (malformed)
             # cannot occur here — the head_kind guard above already returned — so
@@ -1271,7 +1356,7 @@ jobs:
             jq -e 'has("packages") | not' "$lockfile" >/dev/null 2>&1 || probe_rc=$?
             if [ "$probe_rc" -eq 0 ]; then
               head_unreadable=1
-              if npm_age::lockfile_changed "$lockfile" "$base_sha"; then
+              if npm_age::lockfile_changed "$lockfile" "$base_rev"; then
                 npm_age::report_unreadable_format "$lockfile" \
                   "no \`packages\` object (lockfileVersion 1?)"
               fi
@@ -1295,19 +1380,18 @@ jobs:
             # head yields no pins at all. Two contradictory warnings on one file is
             # worse than one accurate one.
             if [ "$head_unreadable" -eq 0 ] \
-               && [ -n "$base_sha" ] \
-               && npm_age::lockfile_changed "$lockfile" "$base_sha" \
-               && git cat-file -e "${base_sha}:./${lockfile}" 2>/dev/null \
-               && git show "${base_sha}:./${lockfile}" 2>/dev/null \
+               && npm_age::lockfile_changed "$lockfile" "$base_rev" \
+               && git cat-file -e "${base_rev}:./${lockfile}" 2>/dev/null \
+               && git show "${base_rev}:./${lockfile}" 2>/dev/null \
                   | jq -e 'has("packages") | not' >/dev/null 2>&1; then
               npm_age::report_unreadable_format "$lockfile" \
                 "base image has no \`packages\` object (lockfileVersion 1 -> 3 migration?); every head pin is treated as new"
             fi
-            npm_age::changed_pins "$lockfile" "$base_ref" npm_age::pkglock_pins
+            npm_age::changed_pins "$lockfile" "$base_rev" npm_age::pkglock_pins
           }
 
           npm_age::diff_yarn_lock() {
-            local lockfile="$1" base_ref="$2"
+            local lockfile="$1" base_rev="$2"
             # A blank yarn.lock fails closed (see the END guard in yarn_pins:
             # `yarn install` would re-resolve every range). But `main` enqueues
             # yarn.lock whenever the file merely EXISTS, and changed_pins has no
@@ -1317,15 +1401,13 @@ jobs:
             # branch did not introduce. Announce that instead; it still suppresses
             # the clean footer via unreadable_count.
             if ! grep -qE '[^[:space:]]' "$lockfile" 2>/dev/null; then
-              local base_sha
-              base_sha=$(git merge-base "$base_ref" HEAD 2>/dev/null) || base_sha=""
-              if ! npm_age::lockfile_changed "$lockfile" "$base_sha"; then
+              if ! npm_age::lockfile_changed "$lockfile" "$base_rev"; then
                 npm_age::report_unreadable_format "$lockfile" \
                   "file is empty and unchanged by this branch; nothing to age-check"
                 return 0
               fi
             fi
-            npm_age::changed_pins "$lockfile" "$base_ref" npm_age::yarn_pins
+            npm_age::changed_pins "$lockfile" "$base_rev" npm_age::yarn_pins
           }
 
           # pnpm parser, from PR #135 (lockfileVersion 5/9 support). Lives here
@@ -1510,17 +1592,11 @@ jobs:
           # against .pre-commit-config.yaml. The two are worth folding into one
           # _preflight helper once a third ecosystem wants it.
           npm_age::diff_pnpm_lock() {
-            local lockfile="$1" base_ref="$2"
+            local lockfile="$1" base_rev="$2"
 
-            # Read the base side at the MERGE BASE, not at the tip of ${base_ref}.
-            # This is the three-dot semantics of the `git diff ${base_ref}...HEAD`
-            # this replaced, and of the package-lock and yarn parsers. Against the
-            # tip instead, any package ${base_ref} dropped or bumped since this
-            # branch forked reads as newly added here — enough to fail a PR over a
-            # dependency it never touched.
-            local base_rev
-            base_rev=$(git merge-base "$base_ref" HEAD) \
-              || { echo "::error::git merge-base ${base_ref} HEAD failed — a shallow checkout will do this; the workflow needs fetch-depth: 0" >&2; return 2; }
+            # `base_rev` is preflight::base_rev, the merge base (see verify_base_ref
+            # for why the tip is the wrong image); it serves the probe, the read and
+            # the unchanged-file short-circuit below alike.
 
             # Unchanged lockfile: nothing to gate, and parsing both images of a
             # monorepo-scale lockfile to prove it costs real time on every PR.
@@ -1642,12 +1718,13 @@ jobs:
             # parser it calls does.
             local base_blob
             # Checked: errexit is suppressed for this whole function, so an
-            # unchecked mktemp leaves base_blob empty, `git show > ""` fails, and
-            # the run returns 2 — "base revision unreadable, most often a shallow
-            # checkout". That is the one confidently-wrong diagnosis left in a
-            # function built to avoid them.
+            # unchecked mktemp would leave base_blob empty and let `git show > ""`
+            # fail in its place, blaming an image that was never the problem. rc 2
+            # on purpose — the base image could not be obtained, and the log line
+            # says why; main renders rc 1 as a head-lockfile parse failure, which
+            # this is not.
             base_blob=$(mktemp) \
-              || { echo "::error::could not create a temporary file for the base image" >&2; return 1; }
+              || { echo "::error::could not create a temporary file for the base image" >&2; return 2; }
             # shellcheck disable=SC2064
             trap "rm -f \"$base_blob\"" RETURN
 
@@ -1755,9 +1832,9 @@ jobs:
           # tell the operator which thing broke:
           #   0 - work-list on stdout (possibly empty)
           #   1 - the manifest could not be read
-          #   2 - the BASE REVISION could not be read (most often a shallow
-          #       checkout: verify_base_ref only proves the ref resolves, so
-          #       fetch-depth: 1 passes preflight and fails at merge-base)
+          #   2 - the BASE IMAGE could not be read or parsed (not a missing merge
+          #       base — preflight already resolved it; see the rc 2 branch in
+          #       main)
           #   3 - read fine, but it resolves NOTHING from a registry, so there
           #       was nothing to age-check
           #   4 - as 3, but `allow_registry_free` says that is intended. A pass,
@@ -2110,6 +2187,7 @@ jobs:
 
             local base_ref="origin/${BASE_REF}"
             preflight::verify_base_ref "$base_ref"
+            local base_rev; base_rev=$(preflight::base_rev) || exit 1  # closed even where errexit is off
 
             NPM_AGE_UNREADABLE_MARKER=$(mktemp)
             export NPM_AGE_UNREADABLE_MARKER
@@ -2231,9 +2309,9 @@ jobs:
 
               local new_deps="" diff_rc=0
               case "$kind" in
-                package-lock) new_deps=$(npm_age::diff_package_lock "$file" "$base_ref") || diff_rc=$? ;;
-                pnpm)         new_deps=$(npm_age::diff_pnpm_lock    "$file" "$base_ref") || diff_rc=$? ;;
-                yarn)         new_deps=$(npm_age::diff_yarn_lock    "$file" "$base_ref") || diff_rc=$? ;;
+                package-lock) new_deps=$(npm_age::diff_package_lock "$file" "$base_rev") || diff_rc=$? ;;
+                pnpm)         new_deps=$(npm_age::diff_pnpm_lock    "$file" "$base_rev") || diff_rc=$? ;;
+                yarn)         new_deps=$(npm_age::diff_yarn_lock    "$file" "$base_rev") || diff_rc=$? ;;
               esac
 
               # Both branches below put the file name into rendered surfaces, so
@@ -2262,18 +2340,21 @@ jobs:
               # TSV (comment-on-failure is gated on it being non-empty), and the
               # summary FOOTER. The PR comment is the only one an operator sees
               # without opening the log, so it has to name the right cause — a
-              # shallow checkout fails at merge-base, not at parsing, and telling
-              # that operator their lockfile is unreadable sends them nowhere near
-              # `fetch-depth: 0`.
+              # base image that cannot be read is not a head-lockfile parse
+              # failure, and telling that operator their lockfile is unreadable
+              # sends them to the wrong file.
               if [ "$diff_rc" -ne 0 ]; then
                 echo "::endgroup::"
                 local fail_cell fail_reason
                 case "$diff_rc" in
                   2)
-                    # Hedged: a shallow checkout is much the most common cause,
-                    # but a corrupt object or a permissions failure lands here too.
-                    fail_cell=":x: base revision unreadable"
-                    fail_reason="could not read the base revision — most often a shallow checkout, in which case the workflow needs fetch-depth: 0"
+                    # Not a missing merge base — preflight resolved it and would
+                    # have failed there, naming fetch-depth. What reaches this arm
+                    # is a base image that could not be read (a partial clone's
+                    # lazy blob fetch, a corrupt object) or could not be parsed;
+                    # the parser's own ::error says which.
+                    fail_cell=":x: base image unreadable"
+                    fail_reason="could not read or parse the lockfile's base image at the merge base — not a missing merge base, but a partial clone (filter: on actions/checkout), an unreadable object, or no scratch space for the image can still fail the read; the job log names which image and why"
                     ;;
                   3)
                     # The case allow_registry_free exists for. Reporting it as a
@@ -2536,14 +2617,19 @@ jobs:
           # Embedded into each `age-check-<eco>.yml.tmpl` at the
           # `# @@COMMENT_ON_FAILURE@@` marker by `scripts/embed-lib-into-workflows.py`.
           #
-          # Reads the TSV that `preflight::record_failure` and
-          # `preflight::record_unverifiable` wrote during the main run step (one row
-          # per failed pin) and renders a single sticky comment. Each row carries a
-          # `kind` column — `too_new` or `unverifiable` — so the renderer can split
-          # into two sections with the right operator action: too-new pins get an
-          # eligible-after date and "wait then push any commit"; unverifiable pins
-          # (registry/API outages, missing manifests, etc.) get the upstream reason
-          # and "re-run the failed check." Updates an existing sticky in place
+          # Reads the TSV that `preflight::record_failure`,
+          # `preflight::record_unverifiable` and `preflight::record_not_run` wrote
+          # during the main run step (one row per failed pin) and renders a single
+          # sticky comment. Each row carries a `kind` column — `too_new`,
+          # `unverifiable` or `not_run` — so the renderer can split into sections
+          # with the right operator action: too-new pins get an eligible-after
+          # date and "wait then push any commit"; unverifiable pins (registry/API
+          # outages, missing manifests, etc.) get the upstream reason and "re-run
+          # the failed check"; a not-run row (preflight stopped the check before
+          # any pin — an unfetched base branch, a shallow clone) gets its reason,
+          # no re-run copy, and NO bypass offer: the remedy is a checkout setting,
+          # and the label would switch the gate off instead. Updates an existing
+          # sticky in place
           # (marker is `<!-- ops-routines:age-check-comment:${ECOSYSTEM} -->`);
           # deletes the sticky on a clean run so a stale "X days remaining" doesn't
           # outlive the failure that produced it.
@@ -2613,6 +2699,7 @@ jobs:
             # `::warning` flagging the degraded render.
             too_new_failures=$(mktemp)
             unverifiable_failures=$(mktemp)
+            not_run_failures=$(mktemp)
             if ! awk -F '\t' '
               NR == FNR {
                 if (($7 == "" ? "too_new" : $7) == "too_new") {
@@ -2629,14 +2716,18 @@ jobs:
                   if (!(key in too_new_pins)) {
                     print > unverifiable_out
                   }
+                } else if (kind == "not_run") {
+                  print > not_run_out
                 }
               }
             ' too_new_out="${too_new_failures}" \
               unverifiable_out="${unverifiable_failures}" \
+              not_run_out="${not_run_failures}" \
               "${deduped_failures}" "${deduped_failures}"; then
               echo "::warning::age-check renderer failed to split rows by kind; falling back to a flat list — some entries may be unverifiable rather than too-new (see the per-pin annotations in this run for the real classification)."
               cp "${deduped_failures}" "${too_new_failures}"
               : > "${unverifiable_failures}"
+              : > "${not_run_failures}"
             fi
 
             # shellcheck disable=SC2016
@@ -2646,6 +2737,20 @@ jobs:
             {
               printf '%s\n\n' "${MARKER}"
               printf '### Dependency Age Check failed — %s\n\n' "${ECOSYSTEM}"
+
+              # Preflight exits before any pin is examined, so a not-run row never
+              # shares a comment with the two pin sections below.
+              if [ -s "${not_run_failures}" ]; then
+                printf '#### The check could not run\n\n'
+                printf 'The check stopped before examining any dependency. The reason names the fix — a checkout setting, not a registry outage — so running the check again will not help until that setting is changed.\n\n'
+                printf '| Base ref | Reason |\n'
+                printf '|---|---|\n'
+                while IFS=$'\t' read -r id _ver _age _min reason _remaining _kind; do
+                  [ -z "${id}" ] && continue
+                  printf '| `%s` | %s |\n' "${id}" "${reason}"
+                done < "${not_run_failures}"
+                printf '\n'
+              fi
 
               if [ -s "${too_new_failures}" ]; then
                 printf '#### Pins below quarantine\n\n'
@@ -2673,10 +2778,16 @@ jobs:
                 printf '\n'
               fi
 
-              printf '> Need to merge sooner? Add the **`age-check-bypass`** label — verified-CVE emergencies only.\n'
+              # No bypass offer under a not-run row: the label genuinely clears the
+              # check, and the checkout would stay broken for the next PR. Keyed on
+              # the raw rows rather than the awk bucket, so the degraded fallback
+              # above (which dumps every row into too_new) cannot restore the offer.
+              if ! grep -q $'\tnot_run$' "${deduped_failures}"; then
+                printf '> Need to merge sooner? Add the **`age-check-bypass`** label — verified-CVE emergencies only.\n'
+              fi
               printf '\n<sub>Updated by `ops-routines-workflows/age-check-%s` · [run log](%s)</sub>\n' "${ECOSYSTEM}" "${RUN_URL}"
             } > "${body_file}"
-            rm -f "${deduped_failures}" "${too_new_failures}" "${unverifiable_failures}"
+            rm -f "${deduped_failures}" "${too_new_failures}" "${unverifiable_failures}" "${not_run_failures}"
 
             if [ -n "${existing_id}" ]; then
               if ! gh api -X PATCH "/repos/${REPO}/issues/comments/${existing_id}" \

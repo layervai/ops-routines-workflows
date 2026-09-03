@@ -98,6 +98,9 @@ jobs:
           # - Explicit base_ref verification before `git diff` so a missing ref
           #   doesn't get conflated with "no changes detected" by a trailing
           #   `|| true` on the filter pipeline
+          # - One resolution of "the base" — the merge base of base_ref and HEAD —
+          #   so a parser that reads a base image (`git show <rev>:<path>`) sees
+          #   the same revision its three-dot `git diff` compares against
           # - Step-summary helpers so the Actions UI never shows an empty panel
           #   on early-exit paths
           # - Shared age comparison + ISO-8601 parsing to keep those callers
@@ -111,7 +114,10 @@ jobs:
           #   preflight::verify_base_ref "origin/${BASE_REF}"  # MUST come before any
           #                                              # subsequent `git diff` — see
           #                                              # the function comment for
-          #                                              # the silent-pass reason.
+          #                                              # the silent-pass reason. Also
+          #                                              # resolves the merge base once;
+          #                                              # read it via preflight::base_rev
+          #                                              # for every `<rev>:<path>` read.
           #
           # Usage (from an age-check script):
           #
@@ -196,29 +202,91 @@ jobs:
           # by this preflight *only* for the expected "missing base ref" failure
           # mode; for catastrophic git failures mid-script the helper still needs
           # its own `|| { echo ::error; return 1; }` branch.
+          #
+          # Also resolves "the base" ONCE, as the merge base of base_ref and HEAD,
+          # and exposes it via `preflight::base_rev`. Every `git diff
+          # ${base_ref}...HEAD` in the ecosystem scripts already compares against
+          # that merge base (three-dot semantics); a parser that instead READS a
+          # base image — `git show <rev>:<path>`, `git cat-file -e` — must read
+          # the same revision, or the two halves of one function disagree about
+          # which base they mean. Read at the TIP of base_ref, any dependency the
+          # base branch dropped or bumped after this branch forked is present in
+          # the head image and absent from the base one, so it reads as newly
+          # added and, if young, fails a PR that never touched it. Every
+          # ecosystem's main() hands its parsers this revision rather than the
+          # ref, so no call site re-derives what "the base" means.
           preflight::verify_base_ref() {
             local base_ref="$1"
             if [ -z "$base_ref" ]; then
               echo "::error::preflight::verify_base_ref called with empty argument"
               exit 1
             fi
+            # Sanitized once, here, for every surface the two failures below reach
+            # — the log line, the PR-comment row and the summary footer all render
+            # markdown, and a legally-named ref can carry `_`, `#` or a backtick.
+            local safe_ref; safe_ref=$(preflight::safe_for_md "$base_ref")
             if ! git rev-parse --verify --quiet "$base_ref" >/dev/null; then
-              echo "::error::Base ref ${base_ref} not found in this checkout. If you triggered this workflow via workflow_dispatch, ensure the base branch is fetched (fetch-depth: 0 on actions/checkout)."
-              exit 1
+              preflight::fail_not_run "$safe_ref" "base ref ${safe_ref} is not in this checkout — the base branch has to be fetched (fetch-depth: 0 on actions/checkout)"
             fi
-            # Record successful verification so `preflight::require_base_ref_verified`
-            # can assert it elsewhere if callers want a belt-and-suspenders check.
-            _PREFLIGHT_BASE_REF_VERIFIED=1
+            # A ref that resolves is not yet a usable base: on a shallow checkout
+            # (fetch-depth: 1) it exists but shares no reachable history with
+            # HEAD, and every three-dot diff downstream would fail on the same
+            # missing merge base. Failing here names the fix once, for every
+            # ecosystem.
+            if ! _PREFLIGHT_BASE_REV=$(git merge-base "$base_ref" HEAD); then
+              preflight::fail_not_run "$safe_ref" "could not resolve the merge base of ${safe_ref} and HEAD — most often a shallow checkout, in which case the workflow needs fetch-depth: 0 on actions/checkout"
+            fi
+            # The parsers are handed the revision, not the ref, and name only the
+            # revision in their own diagnostics; this is where the log ties the two.
+            echo "Base ${safe_ref}: merge base with HEAD is ${_PREFLIGHT_BASE_REV}"
           }
 
-          # Optional defensive check: assert verify_base_ref has run. Callers can
-          # invoke this right before a `git diff` as a static sanity check that
-          # the required-call-order convention was actually followed.
+          # Fail a run that never got to examine a pin, on every surface an
+          # operator might read: the log annotation, the failures TSV as a
+          # `not_run` row (so the PR comment carries the remedy — see
+          # record_not_run for why that row gets its own section) and the
+          # step-summary footer. For the failures a consumer repo reaches through
+          # an ordinary workflow setting — an unfetched base branch, a shallow
+          # checkout — because the PR comment is the one surface an operator sees
+          # without opening the run log. That comment only exists when there is a
+          # pull request to put it on: the render step is gated on a PR number,
+          # so a `push` or `workflow_dispatch` run — the shapes that reach these
+          # failures most easily — gets the ::error and the summary footer only.
+          # Coding errors stay ::error-only. The footer lands before any ecosystem
+          # header, since preflight runs first; its text stands on its own.
+          #
+          # Both arguments arrive SANITIZED (see verify_base_ref): they are rendered
+          # as markdown twice over. `reason` is one lowercase clause with no
+          # terminal period — the footer wraps it as `— ${reason}.` and the
+          # comment renders it in a table cell beside short sibling clauses.
+          preflight::fail_not_run() {
+            local display_id="$1" reason="$2"
+            echo "::error::${reason}"
+            preflight::record_not_run "$display_id" "$reason"
+            preflight::step_summary_unverifiable "$reason"
+            exit 1
+          }
+
+          # Assert verify_base_ref has run. `base_rev` uses it as its guard;
+          # callers can also invoke it right before a `git diff` as a static
+          # sanity check that the required-call-order convention was followed.
+          # Stderr, because `base_rev` is read through `$(...)` and a message on
+          # stdout would be captured and lost.
           preflight::require_base_ref_verified() {
-            if [ -z "${_PREFLIGHT_BASE_REF_VERIFIED:-}" ]; then
-              echo "::error::preflight::verify_base_ref must be called before any git diff. This is a coding error, not a runtime condition."
+            if [ -z "${_PREFLIGHT_BASE_REV:-}" ]; then
+              echo "::error::preflight::verify_base_ref must be called before any git diff. This is a coding error, not a runtime condition." >&2
               exit 1
             fi
+          }
+
+          # The merge base `verify_base_ref` resolved, on stdout — the revision
+          # every parser reads its base image from and diffs against, never the
+          # tip of base_ref. Fails closed if verify_base_ref has not run: with an
+          # empty revision `git show :<path>` reads the INDEX, a silent wrong
+          # answer rather than an error.
+          preflight::base_rev() {
+            preflight::require_base_ref_verified
+            printf '%s\n' "$_PREFLIGHT_BASE_REV"
           }
 
           # ----- ISO-8601 → epoch helper ----------------------------------------------
@@ -363,24 +431,39 @@ jobs:
           #                        issue. Tabs are stripped to keep the row
           #                        parseable.
           preflight::record_unverifiable() {
+            preflight::_record_reason_row "$1" "$2" "${3:-unknown reason}" unverifiable
+          }
+
+          # A row of kind `not_run`: the check stopped in preflight, before it
+          # examined a single pin — an unfetched base branch, a shallow clone. The
+          # remedy is a checkout setting, so the comment renders these in their
+          # own section with no "re-run" copy and no `age-check-bypass` offer:
+          # re-running cannot help, and the label would switch the gate off for a
+          # PR whose checkout is what needs fixing. `display_id` is the base ref,
+          # already sanitized (see verify_base_ref).
+          preflight::record_not_run() {
+            preflight::_record_reason_row "$1" "n/a" "$2" not_run
+          }
+
+          # Shared writer for the reason-carrying kinds. Strips characters that
+          # would corrupt the downstream comment:
+          #   - tabs/newlines break `IFS=$'\t' read` (multiline reason would
+          #     produce row count != failure count)
+          #   - `|` breaks the markdown table layout — the reason cell sits
+          #     between two `|` separators in the rendered comment, and an
+          #     embedded `|` would split the row into extra columns. All
+          #     in-tree call sites pass pipe-free strings today; this strip
+          #     defends a future caller forwarding upstream error text (e.g.,
+          #     curl stderr that happens to contain `|`).
+          preflight::_record_reason_row() {
             local file="${AGE_CHECK_FAILURES_FILE:-}"
             [ -z "$file" ] && return 0
-            local display_id="$1" display_version="$2"
-            local reason="${3:-unknown reason}"
-            # Strip characters that would corrupt the downstream comment:
-            #   - tabs/newlines break `IFS=$'\t' read` (multiline reason would
-            #     produce row count != failure count)
-            #   - `|` breaks the markdown table layout — the reason cell sits
-            #     between two `|` separators in the rendered comment, and an
-            #     embedded `|` would split the row into extra columns. All
-            #     in-tree call sites pass pipe-free strings today; this strip
-            #     defends a future caller forwarding upstream error text (e.g.,
-            #     curl stderr that happens to contain `|`).
+            local display_id="$1" display_version="$2" reason="$3" kind="$4"
             reason=$(printf '%s' "$reason" | tr -d '\t\n|')
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
               "$display_id" "$display_version" "?" \
               "n/a" "$reason" "?" \
-              "unverifiable" \
+              "$kind" \
               >> "$file"
           }
 
@@ -673,9 +756,10 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           }
 
-          # Footer for a run that verified NOTHING because a manifest could not be
-          # read — as distinct from a dependency failing the age check, which is
-          # what `step_summary_failed` is for.
+          # Footer for a run that verified NOTHING — because a manifest could not
+          # be read, or because preflight stopped the run before any manifest was
+          # examined (see fail_not_run) — as distinct from a dependency failing the
+          # age check, which is what `step_summary_failed` is for.
           #
           # Deliberately does NOT mention `age-check-bypass`. That label is scoped
           # to verified-CVE overrides, the conditions reaching this footer can be
@@ -753,10 +837,10 @@ jobs:
           # ----- Separable: lockfile diff → pkg==version lines on stdout --------------
 
           pip_age::diff_requirements() {
-            local file="$1" base_ref="$2"
+            local file="$1" base_rev="$2"
             local diff_out
-            diff_out=$(git diff "${base_ref}"...HEAD -- "$file") \
-              || { echo "::error::git diff against ${base_ref} for ${file} failed"; return 1; }
+            diff_out=$(git diff "${base_rev}"...HEAD -- "$file") \
+              || { echo "::error::git diff against ${base_rev} for ${file} failed"; return 1; }
             printf '%s\n' "$diff_out" \
               | awk '/^\+[^+]/' \
               | sed 's/^\+//;s/[[:space:]]*#.*$//;s/[[:space:]]\+//g' \
@@ -765,12 +849,12 @@ jobs:
           }
 
           pip_age::diff_poetry_lock() {
-            local file="$1" base_ref="$2"
+            local file="$1" base_rev="$2"
             # poetry.lock uses TOML blocks [[package]] with name = "X" and version = "Y".
             # Grab added name/version pairs from the diff.
             local diff_out
-            diff_out=$(git diff "${base_ref}"...HEAD -- "$file") \
-              || { echo "::error::git diff against ${base_ref} for ${file} failed"; return 1; }
+            diff_out=$(git diff "${base_rev}"...HEAD -- "$file") \
+              || { echo "::error::git diff against ${base_rev} for ${file} failed"; return 1; }
             printf '%s\n' "$diff_out" \
               | awk '
                 /^\+name = /    { gsub(/^\+name = "|"$/,""); name=$0; next }
@@ -792,10 +876,10 @@ jobs:
           # (>=, ^, ~=) don't have a single deterministic version to age-check, so
           # we skip them rather than guess a satisfying release.
           pip_age::diff_pyproject() {
-            local file="$1" base_ref="$2"
+            local file="$1" base_rev="$2"
             local diff_out
-            diff_out=$(git diff "${base_ref}"...HEAD -- "$file") \
-              || { echo "::error::git diff against ${base_ref} for ${file} failed"; return 1; }
+            diff_out=$(git diff "${base_rev}"...HEAD -- "$file") \
+              || { echo "::error::git diff against ${base_rev} for ${file} failed"; return 1; }
 
             local added_lines
             added_lines=$(printf '%s\n' "$diff_out" \
@@ -866,6 +950,7 @@ jobs:
 
             local base_ref="origin/${BASE_REF}"
             preflight::verify_base_ref "$base_ref"
+            local base_rev; base_rev=$(preflight::base_rev) || exit 1  # closed even where errexit is off
 
             local now_epoch; now_epoch=$(date +%s)
             local failed=false
@@ -905,9 +990,9 @@ jobs:
 
               local new_deps=""
               case "$kind" in
-                req)       new_deps=$(pip_age::diff_requirements "$file" "$base_ref") ;;
-                poetry)    new_deps=$(pip_age::diff_poetry_lock  "$file" "$base_ref") ;;
-                pyproject) new_deps=$(pip_age::diff_pyproject    "$file" "$base_ref") ;;
+                req)       new_deps=$(pip_age::diff_requirements "$file" "$base_rev") ;;
+                poetry)    new_deps=$(pip_age::diff_poetry_lock  "$file" "$base_rev") ;;
+                pyproject) new_deps=$(pip_age::diff_pyproject    "$file" "$base_rev") ;;
               esac
 
               if [ -z "$new_deps" ]; then
@@ -1010,14 +1095,19 @@ jobs:
           # Embedded into each `age-check-<eco>.yml.tmpl` at the
           # `# @@COMMENT_ON_FAILURE@@` marker by `scripts/embed-lib-into-workflows.py`.
           #
-          # Reads the TSV that `preflight::record_failure` and
-          # `preflight::record_unverifiable` wrote during the main run step (one row
-          # per failed pin) and renders a single sticky comment. Each row carries a
-          # `kind` column — `too_new` or `unverifiable` — so the renderer can split
-          # into two sections with the right operator action: too-new pins get an
-          # eligible-after date and "wait then push any commit"; unverifiable pins
-          # (registry/API outages, missing manifests, etc.) get the upstream reason
-          # and "re-run the failed check." Updates an existing sticky in place
+          # Reads the TSV that `preflight::record_failure`,
+          # `preflight::record_unverifiable` and `preflight::record_not_run` wrote
+          # during the main run step (one row per failed pin) and renders a single
+          # sticky comment. Each row carries a `kind` column — `too_new`,
+          # `unverifiable` or `not_run` — so the renderer can split into sections
+          # with the right operator action: too-new pins get an eligible-after
+          # date and "wait then push any commit"; unverifiable pins (registry/API
+          # outages, missing manifests, etc.) get the upstream reason and "re-run
+          # the failed check"; a not-run row (preflight stopped the check before
+          # any pin — an unfetched base branch, a shallow clone) gets its reason,
+          # no re-run copy, and NO bypass offer: the remedy is a checkout setting,
+          # and the label would switch the gate off instead. Updates an existing
+          # sticky in place
           # (marker is `<!-- ops-routines:age-check-comment:${ECOSYSTEM} -->`);
           # deletes the sticky on a clean run so a stale "X days remaining" doesn't
           # outlive the failure that produced it.
@@ -1087,6 +1177,7 @@ jobs:
             # `::warning` flagging the degraded render.
             too_new_failures=$(mktemp)
             unverifiable_failures=$(mktemp)
+            not_run_failures=$(mktemp)
             if ! awk -F '\t' '
               NR == FNR {
                 if (($7 == "" ? "too_new" : $7) == "too_new") {
@@ -1103,14 +1194,18 @@ jobs:
                   if (!(key in too_new_pins)) {
                     print > unverifiable_out
                   }
+                } else if (kind == "not_run") {
+                  print > not_run_out
                 }
               }
             ' too_new_out="${too_new_failures}" \
               unverifiable_out="${unverifiable_failures}" \
+              not_run_out="${not_run_failures}" \
               "${deduped_failures}" "${deduped_failures}"; then
               echo "::warning::age-check renderer failed to split rows by kind; falling back to a flat list — some entries may be unverifiable rather than too-new (see the per-pin annotations in this run for the real classification)."
               cp "${deduped_failures}" "${too_new_failures}"
               : > "${unverifiable_failures}"
+              : > "${not_run_failures}"
             fi
 
             # shellcheck disable=SC2016
@@ -1120,6 +1215,20 @@ jobs:
             {
               printf '%s\n\n' "${MARKER}"
               printf '### Dependency Age Check failed — %s\n\n' "${ECOSYSTEM}"
+
+              # Preflight exits before any pin is examined, so a not-run row never
+              # shares a comment with the two pin sections below.
+              if [ -s "${not_run_failures}" ]; then
+                printf '#### The check could not run\n\n'
+                printf 'The check stopped before examining any dependency. The reason names the fix — a checkout setting, not a registry outage — so running the check again will not help until that setting is changed.\n\n'
+                printf '| Base ref | Reason |\n'
+                printf '|---|---|\n'
+                while IFS=$'\t' read -r id _ver _age _min reason _remaining _kind; do
+                  [ -z "${id}" ] && continue
+                  printf '| `%s` | %s |\n' "${id}" "${reason}"
+                done < "${not_run_failures}"
+                printf '\n'
+              fi
 
               if [ -s "${too_new_failures}" ]; then
                 printf '#### Pins below quarantine\n\n'
@@ -1147,10 +1256,16 @@ jobs:
                 printf '\n'
               fi
 
-              printf '> Need to merge sooner? Add the **`age-check-bypass`** label — verified-CVE emergencies only.\n'
+              # No bypass offer under a not-run row: the label genuinely clears the
+              # check, and the checkout would stay broken for the next PR. Keyed on
+              # the raw rows rather than the awk bucket, so the degraded fallback
+              # above (which dumps every row into too_new) cannot restore the offer.
+              if ! grep -q $'\tnot_run$' "${deduped_failures}"; then
+                printf '> Need to merge sooner? Add the **`age-check-bypass`** label — verified-CVE emergencies only.\n'
+              fi
               printf '\n<sub>Updated by `ops-routines-workflows/age-check-%s` · [run log](%s)</sub>\n' "${ECOSYSTEM}" "${RUN_URL}"
             } > "${body_file}"
-            rm -f "${deduped_failures}" "${too_new_failures}" "${unverifiable_failures}"
+            rm -f "${deduped_failures}" "${too_new_failures}" "${unverifiable_failures}" "${not_run_failures}"
 
             if [ -n "${existing_id}" ]; then
               if ! gh api -X PATCH "/repos/${REPO}/issues/comments/${existing_id}" \
