@@ -85,6 +85,43 @@ on:
         type: boolean
         required: false
         default: false
+      registry_url:
+        description: |
+          The registry whose publish dates this check reads, and the one
+          a lockfile entry must resolve to before it is age-checked.
+          Defaults to the public npm registry.
+
+          Set this when the repo installs from a private registry. A
+          lockfile entry names no registry in its key, so without this
+          every entry was looked up on npmjs regardless of where it came
+          from — and where a public package shares the name, a freshly
+          published private one was aged against the PUBLIC package's
+          history and passed. Entries resolving anywhere other than this
+          URL are now reported as skipped instead.
+
+          Resolution source, not the key: pnpm entries are matched on
+          `resolution: {tarball: ...}`, or on the default/scoped
+          registry in .npmrc for an integrity-only entry; package-lock
+          entries on the host of their `resolved` URL.
+
+          This also gives a pnpm v5 repo on a private default registry a
+          real gate. Those lockfiles qualify every key with the registry
+          host, which otherwise reads as "nothing from a registry" and
+          fails closed; naming the host here gates them normally, rather
+          than turning the check off with allow_registry_free.
+
+          Must be https:// — http:// is refused, because the
+          package-lock extractor admits only https:// pins and an http
+          registry would gate nothing while reporting green.
+
+          The check reads publish dates from this URL, so it must be
+          reachable from the runner and serve the standard packument
+          API WITHOUT authentication — no credential is sent, so a
+          registry requiring a token for reads answers 401 for every
+          pin (reported as "requires authentication", failing closed).
+        type: string
+        required: false
+        default: "https://registry.npmjs.org"
       comment_on_failure:
         description: |
           Post a sticky PR comment listing packages that failed the age
@@ -146,6 +183,7 @@ jobs:
           # input here or it is unreachable for consumers.
           # tests/workflow_lint_test.sh enforces that.
           AGE_CHECK_ALLOW_REGISTRY_FREE: ${{ inputs.allow_registry_free && '1' || '' }}
+          AGE_CHECK_REGISTRY_URL: ${{ inputs.registry_url }}
         run: |
           # ============================================================================
           # _preflight.sh - Shared preflight helpers for age-check-*.sh
@@ -866,11 +904,38 @@ jobs:
           #
           # The seam is extractor / comparator:
           #
-          #   EXTRACTOR  npm_age::pkglock_pins, npm_age::yarn_pins
-          #              One lockfile IMAGE on stdin -> `pkg@version` lines on
+          #   EXTRACTOR  npm_age::pkglock_pins, npm_age::yarn_pins,
+          #              npm_age::parse_pnpm_lock
+          #              One lockfile IMAGE on stdin -> one record per line on
           #              stdout. Format-specific, no git, no policy. Must be able
           #              to FAIL (non-zero) on input it cannot read, or the
           #              comparator's fail-closed branch is unreachable.
+          #
+          #              RECORD GRAMMAR:  [ "offregistry" TAB ] pkg "@" version
+          #
+          #              Classifying the registry is an extractor OBLIGATION, not
+          #              an option. An extractor that emits a bare `pkg@version`
+          #              is asserting the pin resolves to $NPM_AGE_WANT_HOST, and
+          #              main will fetch its publish date from there. Emitting one
+          #              for a pin that came from somewhere else is how a private
+          #              package gets aged against a public homonym's release
+          #              history — the false pass this tagging exists to close. If
+          #              you cannot tell where a pin resolved, the conservative
+          #              answer is the tag.
+          #
+          #              The marker is inside the comparison key on purpose: both
+          #              comparators below are full-LINE set differences, so a pin
+          #              that moves between registries without changing version
+          #              reads as a new record and is re-judged. A side channel
+          #              would lose that and force a rejoin.
+          #
+          #              Same shape as preflight::record_failure's TSV, which
+          #              also leads with a kind column.
+          #
+          #              yarn_pins does NOT yet classify: it never reads the
+          #              entry's `resolved`, so a yarn lockfile on a private
+          #              registry is still aged against the configured one.
+          #              Tracked; see Known limitations in age-check-npm.sh.
           #
           #   COMPARATOR npm_age::new_pins, npm_age::changed_pins
           #              Format-agnostic. changed_pins does the git plumbing
@@ -984,16 +1049,20 @@ jobs:
             | (if (($seg[-2] // "") | startswith("@"))
                then ($seg[-2:] | join("/"))
                else ($seg[-1] // "") end) as $url_name
-            | (if ($e.value.name // "") != "" and $e.value.name == $url_name
-               then $e.value.name
-               else $path_name
-               end) + "@" + $e.value.version'
+            | ((if ($e.value.name // "") != "" and $e.value.name == $url_name
+                then $e.value.name
+                else $path_name
+                end) + "@" + $e.value.version) as $pin
+            | (($seg[2] // "") | ascii_downcase | sub("^.*@"; "") | sub(":443$"; "")) as $h
+            | (if $h == "registry.yarnpkg.com" then "registry.npmjs.org" else $h end) as $host_c
+            | if $host_c == $host then $pin
+              else "offregistry\t" + $pin end'
 
           npm_age::pkglock_pins() {
             # jq's stderr is deliberately NOT suppressed: when this fails the
             # caller turns it into a red build, and the operator needs jq's reason
             # (and, via `pipefail`, a git-side failure lands in the same branch).
-            jq -r "$NPM_AGE_JQ_ENTRIES"
+            jq -r --arg host "$NPM_AGE_WANT_HOST" "$NPM_AGE_JQ_ENTRIES"
           }
 
           # Emits `pkg@version` for every registry-hosted pin in ONE yarn.lock
@@ -1155,8 +1224,10 @@ jobs:
               }'
           }
 
-          # Full-line set difference: the pins in <after> that <before> did not
-          # already carry. A brand-new lockfile (empty <before>) reports
+          # Full-line set difference: the records in <after> that <before> did not
+          # already carry. Records, not pins: an `offregistry<TAB>` prefix is part
+          # of the line, so a pin whose registry changed is correctly reported as
+          # new. A brand-new lockfile (empty <before>) reports
           # everything; a bumped pin is reported; an untouched pin is not.
           # Deliberately over-checks rather than under-checks — a pin reverted to
           # a previously-used version is re-verified and simply passes.
@@ -1414,6 +1485,33 @@ jobs:
           # with the other extractors rather than in the calling script: it is the
           # same extractor/comparator job, and this is the file that gets read when
           # someone asks which pins are being gated.
+          # WHICH REGISTRY an entry came from is read from its BODY, not its key —
+          # a pnpm key names no registry in any lockfileVersion. So this is not a
+          # key scanner: it buffers each key until it has seen that entry's
+          # `resolution:`, and only then decides. `{tarball: URL}` names a host
+          # outright; `{integrity: ...}` means "whatever registry was configured",
+          # which is .npmrc's business and arrives here as default_host/scope_map.
+          # Entries resolving anywhere but want_host are emitted TAGGED rather
+          # than dropped, so that a newly added private package is reported as
+          # skipped instead of vanishing from both sides of the set difference.
+          #
+          # $1 selects the output: "entries" (default) prints one pkg@version per
+          # line, prefixed with "offregistry<TAB>" for an entry that resolves
+          # somewhere other than want_host; "counts" prints
+          # "<non-registry> <unreadable>" — there is no off-registry count,
+          # because such an entry is PRINTED in entries mode, which makes the
+          # zero-entry path that reads "counts" unreachable for it. The caller uses "counts"
+          # only on the zero-entry path, to tell a format it could not read apart
+          # from one it read fine whose every entry is git-, tarball-, link- or
+          # workspace-sourced. Both fail closed; asserting the wrong cause is what
+          # burns whoever debugs it.
+          #
+          # awk vars: want_host is the configured registry host, default_host the
+          # one an integrity-only entry falls back to (.npmrc `registry=`, else the
+          # configured one), scope_map a space-separated `@scope=host` list. All
+          # three are globals set by age-check-npm.sh before this file is sourced
+          # and narrowed per target by npm_age::load_registry_config, so nothing
+          # here derives them.
           npm_age::parse_pnpm_lock() {
             # A typo would otherwise be silently treated as "entries", handing the
             # caller a package list where it expected a number — which then fails
@@ -1423,10 +1521,203 @@ jobs:
               entries|counts) ;;
               *) echo "::error::npm_age::parse_pnpm_lock: unknown mode '${mode}'" >&2; return 2 ;;
             esac
-            awk -v mode="$mode" '
+            # All three are set once at load time in age-check-npm.sh and narrowed
+            # per target by npm_age::load_registry_config. default_host equalling
+            # want_host is the honest reading of "no .npmrc evidence": with nothing
+            # saying the lockfile was written against some OTHER registry, an
+            # integrity-only entry came from the configured one.
+            awk -v mode="$mode" \
+                -v want_host="$NPM_AGE_WANT_HOST" \
+                -v default_host="$NPM_AGE_DEFAULT_HOST" \
+                -v scope_map="$NPM_AGE_SCOPE_MAP" '
+              BEGIN {
+                n = split(scope_map, sm, " ")
+                for (i = 1; i <= n; i++) {
+                  eq = index(sm[i], "=")
+                  if (eq > 1) scope_host[substr(sm[i], 1, eq - 1)] = substr(sm[i], eq + 1)
+                }
+              }
+
+              # pnpm quotes values containing YAML-special characters. \047 is a
+              # single quote, spelled octal so this program stays inside one pair
+              # of shell single quotes.
+              function unquote(s,   q) {
+                q = substr(s, 1, 1)
+                if ((q == "\"" || q == "\047") && substr(s, length(s), 1) == q)
+                  s = substr(s, 2, length(s) - 2)
+                return s
+              }
+
+              # Position of the (skip+1)-th `tarball:` that is actually a MAP KEY —
+              # preceded by "{", "," or whitespace and followed by whitespace — or
+              # 0 if there is none. A bare substring search believes a forged one
+              # inside a quoted VALUE:
+              #   {integrity: sha512-..., x: \047tarball: https://registry.npmjs.org/y\047}
+              # That is a single occurrence, so it also slips past the ambiguity
+              # guard, and the pin is emitted bare — which under the record grammar
+              # asserts it resolves to want_host. Aged against whatever public
+              # package shares the name: the same false pass, through the body.
+              #
+              # `skip` lets one function answer both questions the caller has:
+              # skip 0 is "where is the tarball", skip 1 is "is there a second one".
+              function tarball_key_pos(s, skip,   off, p, c, d, n) {
+                off = 0; n = 0
+                while ((p = index(substr(s, off + 1), "tarball:")) > 0) {
+                  p = off + p
+                  c = (p == 1) ? "{" : substr(s, p - 1, 1)
+                  d = substr(s, p + 8, 1)
+                  if ((c == "{" || c == "," || c == " " || c == "\t") \
+                      && (d == " " || d == "\t")) {
+                    n++
+                    if (n > skip) return p
+                  }
+                  off = p + 7
+                }
+                return 0
+              }
+
+              # Host the pending entry actually resolves through. Most specific
+              # evidence first: a tarball URL names its host outright, a v5 key
+              # qualified with a registry host names it in the key, and only an
+              # entry with neither — and with a resolution this parser could
+              # actually read — falls back to what .npmrc configured for its scope
+              # (or, failing that, the default registry). An empty return means
+              # "cannot tell", which the caller turns into the tag.
+              function pending_host(   url, scope, p, scheme) {
+                # Ambiguous entries are never called on-registry. Two direct-child
+                # resolution lines, or two tarballs inside one, and this parser
+                # cannot know which pnpm would install from — and first-wins and
+                # last-wins are each a false pass under the opposite ordering. The
+                # empty return matches no host, so the entry is tagged.
+                if (res_ambiguous || tarball_key_pos(pending_res, 1) > 0)
+                  return ""
+                p = tarball_key_pos(pending_res, 0)
+                if (p > 0) {
+                  # A POSITION, not sub(/^.*tarball:/): POSIX awk matches
+                  # leftmost-LONGEST, so `.*` runs to the LAST "tarball:" in the
+                  # line. A crafted URL fragment —
+                  # `{tarball: https://attacker.example/x.tgz#tarball:https://registry.npmjs.org/y}`
+                  # — then yields the npmjs host, the pin is judged on-registry and
+                  # aged against a genuine public package, while pnpm installs the
+                  # attacker tarball (a fragment is never sent to the server, so
+                  # the URL still fetches). The forgery sits INSIDE the real
+                  # resolution line, so the indent anchor does not reach it.
+                  url = substr(pending_res, p + 8)
+                  sub(/[,}].*$/, "", url)
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", url)
+                  url = unquote(url)
+                  scheme = url
+                  if (sub(/:\/\/.*$/, "", scheme)) scheme = tolower(scheme); else scheme = ""
+                  sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", url)
+                  sub(/\/.*$/, "", url)
+                  # Userinfo, as npm_age::registry_host does: `user:pass@host` must
+                  # compare as `host`, or a credentialed URL is both a wrong-red
+                  # and a string that gets echoed into the log.
+                  sub(/^.*@/, "", url)
+                  # Lower-cased and alias-folded to match npm_age::registry_host,
+                  # which normalises every host these are compared against. See
+                  # the comment there for why yarnpkg.com is not a separate
+                  # registry.
+                  url = tolower(url)
+                  # Default ports, as npm_age::registry_host does — the same
+                  # registry written two ways must not read as two.
+                  if (scheme == "https") sub(/:443$/, "", url)
+                  if (scheme == "http")  sub(/:80$/, "", url)
+                  if (url == "registry.yarnpkg.com") url = "registry.npmjs.org"
+                  return url
+                }
+
+                # POSITIVE EVIDENCE, or the tag. Until now "I saw no tarball" and
+                # "I could not read this resolution at all" were the same branch,
+                # and both fell through to default_host — which emits a BARE pin,
+                # and under the record grammar above a bare pin ASSERTS the package
+                # resolves to want_host. Two legal-YAML respellings reached that:
+                #
+                #   "resolution": {tarball: https://attacker/...}   quoted KEY, so
+                #                                                   ^    resolution: never matched
+                #   resolution: {"tarball": "https://attacker/..."} quoted key, so
+                #                                                   index(s,"tarball:") never matched
+                #
+                # Both are what js-yaml — and therefore pnpm — parses as an
+                # ordinary resolution, so the package installs from the attacker
+                # host while the pin is aged against a public homonym. Neither
+                # needs a second `resolution:`, so res_ambiguous never fires.
+                #
+                # An unread `tarball` is evidence this parser CANNOT JUDGE the
+                # entry, not evidence it is integrity-only. Testing for the
+                # presence of `integrity:` was not enough, because integrity is
+                # free for an attacker to add alongside a tarball spelled so the
+                # key matcher misses it:
+                #
+                #   {integrity: sha512-a==, "tarball": "https://attacker/..."}
+                #   {integrity: sha512-a==, tarball : https://attacker/...}
+                #
+                # Both are legal YAML flow syntax that pnpm installs from, and
+                # both passed the integrity test and fell through to default_host
+                # — a bare pin, aged against a public homonym. Execution reaches
+                # here only when tarball_key_pos found nothing, so a legitimate
+                # resolution has already returned above and no real entry carries
+                # the word otherwise.
+                if (index(pending_res, "tarball") > 0)
+                  return ""
+
+                # pnpm writes `integrity:` on every registry entry, so requiring
+                # it costs nothing real. A quoted `"integrity":` also fails this
+                # and is tagged — fail-closed, and the direction the grammar asks
+                # for.
+                if (pending_res == "" || pending_res !~ /integrity[[:space:]]*:/)
+                  return ""
+
+                # AFTER the body checks, not before them. A registry-qualified key
+                # is evidence, but it is evidence the ATTACKER writes, and ahead of
+                # these checks it was an off-switch for all of them:
+                #
+                #   registry.npmjs.org/evil/1.0.0:
+                #     resolution: {"tarball": "https://attacker.example/evil.tgz"}
+                #
+                # returned want_host straight from the key and emitted a BARE pin,
+                # so the quoted-tarball and no-resolution refusals never ran and it
+                # was aged against the public `evil`. An exemption marker is the
+                # off-switch for a safety default, so it must be subject to the
+                # same evidence as everything else: it chooses BETWEEN registries
+                # once the body has shown the entry is readable, and never excuses
+                # an unreadable one.
+                # Only ever want_host: the v5 strip arm requires the key to be
+                # prefixed with want_host itself. A v5 key qualified with any OTHER
+                # host does not reach here — it takes the source-shaped arm and is
+                # counted non-registry, which is fail-closed but is a count rather
+                # than the tag the grammar would prefer.
+                if (pending_key_host != "") return pending_key_host
+                if (substr(pending_name, 1, 1) == "@") {
+                  scope = pending_name
+                  sub(/\/.*$/, "", scope)
+                  if (scope in scope_host) return scope_host[scope]
+                }
+                return default_host
+              }
+
+              # Emits the buffered entry, if any. Called before each new key, on
+              # leaving the packages block, and at EOF — the three ways an entry
+              # can end.
+              function flush(   h) {
+                if (pending_name == "") return
+                h = pending_host()
+                if (h == want_host) {
+                  if (mode == "entries") print pending_name "@" pending_ver
+                } else {
+                  # Tagged, not dropped. A dropped entry reaches neither side of
+                  # the set difference in diff_pnpm_lock, so a newly added private
+                  # package would go green with no annotation — the invisibility
+                  # documented for vendored deps, reached by a second door.
+                  if (mode == "entries") print "offregistry\t" pending_name "@" pending_ver
+                }
+                pending_name = ""; pending_ver = ""; pending_res = ""
+                pending_key_host = ""; in_res = 0; res_indent = 0; res_ambiguous = 0
+              }
+
               # Non-comment text in column 0 opens a top-level block; remember
               # whether it is the one holding resolved entries.
-              /^[^[:space:]#]/ { in_packages = ($0 ~ /^packages:[[:space:]]*$/); next }
+              /^[^[:space:]#]/ { flush(); in_packages = ($0 ~ /^packages:[[:space:]]*$/); next }
               !in_packages { next }
 
               {
@@ -1442,17 +1733,84 @@ jobs:
                 #
                 # If a future pnpm changes that indent this parses to zero and takes
                 # the fail-closed path below — visible, not silent.
-                if ($0 !~ /^  [^[:space:]].*:\r?$/) next
+                if ($0 !~ /^  [^[:space:]].*:\r?$/) {
+                  # Not a key, so it is a body line of the entry whose key was
+                  # read last — where `resolution:` lives, and with it the only
+                  # statement the lockfile makes about where the package came
+                  # from. Everything else in the body is ignored.
+                  # Guard clause rather than a wrapping if: this is the block that
+                  # decides whether a private package is reported as
+                  # npmjs-resolved, and one less level of nesting is one less
+                  # thing between a reader and that decision.
+                  #
+                  # `in_res || pending_res == ""` because once the resolution is
+                  # captured every remaining body line (engines, dependencies,
+                  # dev, ...) would pay for a substitution and a match that both
+                  # inner branches then ignore — measurably, on a monorepo
+                  # lockfile.
+                  # `body ~ /^    resolution:/` stays in the condition after the
+                  # resolution is captured, so a SECOND one is still noticed and
+                  # marks the entry ambiguous rather than being skipped as noise.
+                  if (pending_name != "" \
+                      && (in_res || pending_res == "" || $0 ~ /^    resolution:/)) {
+                    body = $0
+                    sub(/\r$/, "", body)
+                    ind = match(body, /[^ ]/)
+                    # A block-style resolution continues on deeper-indented
+                    # lines. pnpm writes flow style, but a reformatted or
+                    # hand-edited lockfile does not have to, and reading only the
+                    # first line of a block-style map would miss a `tarball:`
+                    # under it — reporting a private package as npmjs-resolved,
+                    # which is the failure this whole path exists to prevent.
+                    if (in_res) {
+                      # A blank line is a CONTINUATION, not the end of the block.
+                      # match() returns 0 for a whitespace-only line, so `ind >
+                      # res_indent` was false and accumulation stopped there — a
+                      # `tarball:` after the blank was never seen, the entry fell
+                      # back to default_host, and a bare pin was emitted for a
+                      # package pnpm installs from somewhere else. Blank lines
+                      # inside a block mapping are legal YAML, so that is a
+                      # formatting quirk away, and it defeats the two-resolution
+                      # guard because there is only ever one `resolution:`.
+                      #
+                      # Safe: a two-space entry key is taken by the key regex
+                      # before this point and a column-0 line by the top rule, so
+                      # nothing else can leak into pending_res.
+                      if (body ~ /^[[:space:]]*$/ || ind > res_indent) {
+                        pending_res = pending_res " " body
+                        next
+                      }
+                      in_res = 0
+                    }
+                    # EXACTLY four spaces — a direct child of the two-space entry
+                    # key, which is the only place pnpm writes `resolution:`. Any
+                    # indent would also match a line inside a block scalar, and
+                    # that is forgeable: a crafted entry whose `deprecated: |` text
+                    # contains a `resolution: {tarball: https://registry.npmjs.org/...}`
+                    # line before the real one would be judged on-registry while
+                    # pnpm installs from the real resolution below it — which is
+                    # the very false pass this closes, handed back through the
+                    # body. Same
+                    # reasoning, and the same fix, as the two-space anchor on keys.
+                    #
+                    # First resolution only, so a later forged one cannot append.
+                    if (pending_res != "" && body ~ /^    resolution:/) res_ambiguous = 1
+                    if (pending_res == "" && body ~ /^    resolution:/) {
+                      pending_res = body
+                      res_indent = ind
+                      tail = body
+                      sub(/^[[:space:]]*resolution:[[:space:]]*/, "", tail)
+                      in_res = (tail == "")
+                    }
+                  }
+                  next
+                }
+                flush()
                 key = $0
                 sub(/^[[:space:]]+/, "", key)
                 sub(/:\r?$/, "", key)
 
-                # pnpm quotes keys containing YAML-special characters. \047 is a
-                # single quote, spelled octal so this program stays inside one
-                # pair of shell single quotes.
-                q = substr(key, 1, 1)
-                if ((q == "\"" || q == "\047") && substr(key, length(key), 1) == q)
-                  key = substr(key, 2, length(key) - 2)
+                key = unquote(key)
 
                 # v6/v9 peer suffix, stripped before the split: a scoped peer in
                 # vue-loader@15.9.8(@vue/compiler-sfc@3.0.0) would otherwise own
@@ -1461,6 +1819,25 @@ jobs:
 
                 slashed = (substr(key, 1, 1) == "/")
                 if (slashed) key = substr(key, 2)
+
+                # A v5 lockfile written against a non-default registry qualifies
+                # EVERY key with the registry host (`example.com/pkg/1.0.0`,
+                # no leading slash). Those keys are registry-hosted packages, so
+                # when the host is the configured registry they are stripped back
+                # to their v5 form and gated normally. Without this arm they fall
+                # into the source-shaped arm below and are counted non-registry,
+                # which for a whole such lockfile failed the run as "nothing from
+                # a registry" — true of npmjs, wrong about the repo, and with no
+                # remedy but turning the gate off.
+                #
+                # index(), not a regex: a host is full of dots, and want_host is
+                # caller-supplied.
+                key_host = ""
+                if (!slashed && want_host != "" && index(key, want_host "/") == 1) {
+                  key = substr(key, length(want_host) + 2)
+                  slashed = 1
+                  key_host = want_host
+                }
 
                 # Both patterns anchor to $, so leftmost-longest lands them on the
                 # LAST separator — which is what keeps a leading "@scope/" on the
@@ -1542,8 +1919,16 @@ jobs:
                 # curl URL, and the resulting annotation lands mid-line behind a
                 # `::warning file=...::` prefix where Actions will not parse a
                 # workflow command. Constrained, but not here.
+                # Buffered, not printed: the registry this resolves through is in
+                # the body, which has not been read yet. flush() emits it once the
+                # next key, the end of the block, or EOF says the body is done.
                 if (ver ~ /^[0-9][0-9A-Za-z.+-]*$/) {
-                  if (mode == "entries") print name "@" ver
+                  pending_name = name
+                  pending_ver = ver
+                  pending_res = ""
+                  pending_key_host = key_host
+                  in_res = 0
+                  res_ambiguous = 0
                   next
                 }
 
@@ -1576,7 +1961,10 @@ jobs:
 
               }
 
-              END { if (mode == "counts") print nonregistry + 0, unreadable + 0 }
+              END {
+                flush()
+                if (mode == "counts") print nonregistry + 0, unreadable + 0
+              }
             '
           }
 
@@ -1820,6 +2208,21 @@ jobs:
           #                    the whole JOB budget (see TIMEOUT_MINUTES), not the
           #                    scan alone — checkout, token mint and setup come out
           #                    of the same allowance.
+          #   AGE_CHECK_REGISTRY_URL - set by the reusable workflow from its
+          #                    `registry_url` input; default
+          #                    https://registry.npmjs.org. Names the ONE registry
+          #                    whose publish dates this check reads, which makes it
+          #                    two things at once: the host a lockfile entry must
+          #                    resolve to before it is age-checked, and the
+          #                    packument URL used to age it. An entry resolving
+          #                    anywhere else is skipped as "not on the configured
+          #                    registry" — visibly, and without a request — rather
+          #                    than looked up on npmjs, which is how a private
+          #                    package used to be aged against a public homonym's
+          #                    publish date. A reusable workflow does not inherit
+          #                    env from its caller, so this needs an input on BOTH
+          #                    entry points to be reachable; both are
+          #                    machine-checked by tests/workflow_lint_test.sh.
           #   TIMEOUT_MINUTES - default 5; the job timeout the caller set, used
           #                    only to sanity-check MAX_PINS against it. The scan
           #                    runs at ~130 pins/minute, so a workable cap is about
@@ -1872,9 +2275,11 @@ jobs:
           #   more often than when only newly-ADDED packages were checked, and a
           #   change touching only private pins reaches the all-skipped guard and
           #   fails. That failure is correct (nothing could be verified) but it is
-          #   newly common, so the guard names the cause and points at
-          #   `age-check-bypass`. A wholly-private lockfile cannot be gated by this
-          #   check at all.
+          #   newly common, so the guard names the cause — and, since the registry
+          #   is now read from the resolution, points at `registry_url` rather than
+          #   at a bypass. A wholly-private lockfile CAN be gated now, by naming
+          #   that registry; what cannot be gated is one whose registry this runner
+          #   cannot reach.
           # - Entries the `.resolved` filter DROPS are invisible, not skipped. A
           #   pin with `git+ssh://`, plain `http://`, or no `.resolved` at all
           #   never enters the work-list, so it counts toward neither
@@ -1888,18 +2293,86 @@ jobs:
           #   correctly fail. Not a regression (the filter predates the bump
           #   work), but it is the one empty-work-list path this change did not
           #   harden; tracked separately.
-          # - `.resolved` is only checked for an `https://` prefix, not for a HOST.
-          #   A pin fetched from a vendored CDN or a mirror
-          #   (`https://cdn.example.com/foo-1.0.0.tgz`) still gets looked up as
-          #   `foo` on registry.npmjs.org, so an unrelated public `foo@1.0.0`
-          #   published years ago renders a green row for a tarball that never came
-          #   from npmjs. Worse than the private-registry case, which at least 404s
-          #   into the all-skipped guard. Constraining the host is not free — a
-          #   corporate npm mirror rewrites `resolved` to its own host for packages
-          #   that genuinely ARE the npmjs ones, so a naive host check would fail
-          #   those repos closed. Needs a trusted-mirror-host input; tracked
-          #   separately. Bumps make this reachable far more often than when only
-          #   newly-added packages were checked.
+          # - WHICH REGISTRY a pin came from is decided from its RESOLUTION, never
+          #   from its key, and only pins on AGE_CHECK_REGISTRY_URL are aged. This
+          #   used to be a prefix test for `https://`, which a private registry
+          #   clears exactly as readily as npmjs — so a pin fetched from a mirror
+          #   or a private host was looked up by NAME on npmjs, and an unrelated
+          #   public package published years ago rendered a green row for a tarball
+          #   that never came from there. For a freshly published internal package
+          #   sharing a name with a public one, that inverted the control outright.
+          #   Now: a package-lock pin is matched on the host of its `resolved` URL;
+          #   a pnpm entry on `resolution: {tarball: ...}`, or — for the
+          #   integrity-only entries that are the common case, which name no host
+          #   at all — on the default and per-scope registries read from .npmrc.
+          #   Anything resolving elsewhere is emitted TAGGED and reported as
+          #   "skipped (not on the configured registry)", so it is visible rather
+          #   than silently dropped, and no request is made for it. A TAG
+          #   ANNOTATES; IT DOES NOT BLOCK. A brand-new dependency pointed at an
+          #   unknown host is skipped, and the run still goes green as long as some
+          #   other pin verified — only a run that verified NOTHING fails. That is
+          #   the same property the 404-skip it replaces had, so it is not a
+          #   regression, but it is the sharpest edge left in this control. A repo on a
+          #   private registry points registry_url at it and gets a real gate; the
+          #   host comparison is what the "trusted-mirror-host input" this bullet
+          #   used to call for turned into.
+          #   REGISTRY_URL IS SINGLE-VALUED, AND THAT IS A TRADE. Naming a private
+          #   registry removes the gate from everything resolving elsewhere —
+          #   INCLUDING npmjs. A mixed package-lock monorepo (public deps on
+          #   npmjs, `@acme/*` internal) is today gated on the public half and
+          #   falsely gated on the private half; after adopting registry_url it is
+          #   gated on the private half while its public dependencies are tagged
+          #   and skipped, which is the half where a compromised release is
+          #   likelier to arrive. The skips are visible and counted rather than
+          #   silent, and the run still fails if NOTHING verified, but coverage is
+          #   what this check exists to provide and it MOVES rather than only
+          #   improving. Gating against a SET of registries — or always
+          #   additionally checking npmjs-resolved pins against npmjs, whose
+          #   packument URL is known unconditionally — is the real answer; tracked
+          #   separately.
+          #   Two edges worth knowing. One host serving SEVERAL independent npm
+          #   namespaces (Artifactory-style npm-internal vs npm-remote) reads as
+          #   one registry, because only the host is compared — far narrower than
+          #   the public/private conflation it replaces. NO CREDENTIALS ARE SENT
+          #   either: the packument fetch is anonymous, so a registry_url naming a
+          #   registry that requires a token for reads answers 401/403 for every
+          #   pin — reported as "requires authentication" and failing closed,
+          #   distinctly from an outage, but it means this input only helps a
+          #   registry serving packuments unauthenticated. A token secret is
+          #   tracked separately. And publish dates come from whatever
+          #   registry_url names, including a caching PROXY: most pass the
+          #   upstream `time` map through unchanged, but one that stamps its own
+          #   first-fetch time makes min_age_days measure the age of the cache
+          #   entry rather than of the release. And a .npmrc that sets its
+          #   registry from an environment variable (`registry=${NPM_REGISTRY}`) is
+          #   read literally, matches no host, and so reports its entries
+          #   off-registry rather than aging them against the wrong place:
+          #   fail-closed and visible, but such a repo has to pass registry_url.
+          #   Every .npmrc from the working directory down to the lockfile is read,
+          #   nearest winning; npm also merges a per-user and a global one, which a
+          #   CI checkout does not have.
+          #   THE CONSEQUENCE IS THAT THIS FIX IS OPT-IN WHERE THE REGISTRY IS NOT
+          #   COMMITTED. A repo whose private registry is configured only in CI —
+          #   `actions/setup-node` with `registry-url`, NPM_CONFIG_REGISTRY, or a
+          #   runner-level ~/.npmrc — has integrity-only entries and no committed
+          #   evidence, so they are read as the configured registry and aged
+          #   against npmjs exactly as before. That repo stays green AND stays
+          #   wrong until its caller passes registry_url. It is the one shape this
+          #   change does not fix by itself, and the one an operator most needs
+          #   told. .npmrc is the wrong
+          #   file for yarn BERRY, which reads `npmRegistryServer` /
+          #   `npmScopes.<scope>.npmRegistryServer` from .yarnrc.yml — pointing
+          #   npm_age::npmrc_registries at a Berry repo would judge its pins
+          #   against a registry Berry never used. Moot today because the yarn
+          #   extractor does no registry filtering at all (above), but it is the
+          #   trap waiting for whoever adds it.
+          # - yarn.lock is the exception, and still has the hole described above.
+          #   npm_age::yarn_pins pairs a name to a version from the header and body
+          #   and never reads the entry's `resolved`, so a yarn lockfile on a
+          #   private registry still has every pin aged against
+          #   AGE_CHECK_REGISTRY_URL. Giving yarn the same treatment is tracked
+          #   separately; a yarn repo on a private registry should not rely on this
+          #   check until then.
           # - The work-list is keyed on `pkg@version`, so a change that alters
           #   WHERE a pin comes from without moving its version — `resolved`
           #   swapping registry host, or `integrity` changing under a fixed
@@ -1914,23 +2387,16 @@ jobs:
           #   changes while the key/header line stays unchanged context. That made
           #   MIN_AGE_DAYS toothless for the most common lockfile change there is;
           #   see the comment on npm_age::changed_pins for the incident.
-          # - npm_age::diff_pnpm_lock is STILL diff-driven, and it is only correct
-          #   for the pnpm v6-style `/pkg@1.2.3:` key. It does not share the bump
-          #   gap (that key carries the version inline, so a bump produces a
-          #   genuinely new added line) — but lockfileVersion 9, the current
-          #   default, dropped the leading `/` and writes `pkg@1.2.3:`, which the
-          #   `grep -oE '/[^:]+@[0-9][^:/ ]*'` in npm_age::diff_pnpm_lock does not
-          #   match an UNSCOPED v9 key at all. Scoped keys are worse, not better: pnpm quotes them, and
-          #   the grep matches inside one, so `'@babel/core@7.24.0':` yields the
-          #   pin `core@7.24.0'` — an unrelated real package plus a junk version.
-          #   Those resolve to nothing and land in skipped_count, so a v9 repo
-          #   whose scoped pins moved reaches the all-skipped guard and gets a RED
-          #   check reading "no verification possible". A v9 repo is therefore not
-          #   silently ungated; it is loudly and misleadingly broken, which is a
-          #   different (and more urgent) problem than a silent pass. The
-          #   `lockfileVersion:` probe below at least names the real cause beside
-          #   it. Fixing it properly needs the same extractor treatment plus real
-          #   v5/v6/v9 fixtures; tracked separately.
+          # - npm_age::diff_pnpm_lock reads every key spelling pnpm has shipped (v5
+          #   `/pkg/1.2.3`, v6 `/pkg@1.2.3`, v9 `pkg@1.2.3`) and diffs the base and
+          #   head images rather than scraping `git diff`. (This bullet previously
+          #   described the diff-driven v6-only parser; that was replaced, and the
+          #   description was left behind by the merge that brought the two
+          #   rewrites together.) It reads only the top-level `packages:` map, so a
+          #   future lockfileVersion that renamed or restructured that map would
+          #   parse as "no packages" — which is why it fails closed when a lockfile
+          #   declares resolved packages it cannot parse, rather than returning an
+          #   empty work-list in silence.
           # - The pnpm parser has not been fuzzed against workspace / overrides
           #   edge cases the way the package-lock.json path has.
           #
@@ -1980,6 +2446,21 @@ jobs:
           [ -n "${MAX_PINS+set}" ] && NPM_AGE_MAX_PINS_FROM_ENV=1
           MAX_PINS="${MAX_PINS:-350}"
 
+          # Empty, not just unset: the reusable workflow threads this from an
+          # input, and an Actions expression yields "" rather than leaving the
+          # variable out. An empty value here would build every packument request
+          # against nothing at all, so it has to fall back like an absent one.
+          REGISTRY_URL="${AGE_CHECK_REGISTRY_URL:-}"
+          [ -n "$REGISTRY_URL" ] || REGISTRY_URL="https://registry.npmjs.org"
+          # A trailing slash is what a caller copying the URL out of their .npmrc
+          # will most often pass, and the requests below join with "/". Pure
+          # parameter expansion rather than sed: this runs before
+          # preflight::require_tools, so reaching for an external tool here would
+          # trade the friendly "tool not available" error for a confusing one.
+          while [ "$REGISTRY_URL" != "${REGISTRY_URL%/}" ]; do
+            REGISTRY_URL="${REGISTRY_URL%/}"
+          done
+
 
           # ----- Input validation: package name --------------------------------------
 
@@ -2003,6 +2484,254 @@ jobs:
             [[ "$name" =~ ^(@[a-zA-Z0-9~][a-zA-Z0-9~._-]*/)?[a-zA-Z0-9~][a-zA-Z0-9~._-]*$ ]]
           }
 
+          # ----- Configured registry --------------------------------------------------
+          #
+          # Defined before the parsers are sourced: they call npm_age::registry_host
+          # and read $REGISTRY_URL to decide which pins are on the configured
+          # registry at all.
+
+          # The registry URL reaches a curl command line, so it is validated on the
+          # same principle as npm_age::is_valid_pkg_name above: constrain the
+          # charset before it can reach the network layer, not after. A caller who
+          # fat-fingers this gets a refusal naming the value rather than a request
+          # to somewhere unintended.
+          #
+          # Scheme is restricted to http/https: curl speaks file://, scp:// and
+          # more, and a registry_url of `file:///etc/passwd` would otherwise turn
+          # every package lookup into a local file read whose body lands in the job
+          # log. No userinfo is accepted either, so credentials cannot be smuggled
+          # into a URL that gets echoed into logs and summaries.
+          npm_age::is_valid_registry_url() {
+            local url="$1"
+            [ ${#url} -le 2000 ] || return 1
+            # https ONLY, not http. The package-lock extractor admits a pin only
+            # when its `resolved` starts `https://` — a deliberate scope fence, so
+            # that git/plain-http/absent sources keep being dropped rather than
+            # flipping a fully-vendored repo red. Accepting `http://` here would
+            # therefore produce a registry_url under which every package-lock pin
+            # is silently dropped and NOTHING is gated: a supply-chain control
+            # configured, reporting green, and doing nothing. Refusing is the
+            # honest answer, and it is the same posture as everywhere else in this
+            # file. (A plaintext packument fetch is also trivially spoofable,
+            # which makes the age it reports worthless.)
+            [[ "$url" =~ ^https://[a-zA-Z0-9._~-]+(:[0-9]{1,5})?(/[a-zA-Z0-9._~%/-]*)?$ ]]
+          }
+
+          # Host[:port] of a registry URL — the token entries are compared against.
+          # Path is deliberately dropped: a registry mounted at
+          # https://nexus.example/repository/npm-group serves tarballs under that
+          # same prefix, but a caller passes the base URL they know, and comparing
+          # whole prefixes would then classify every one of those as off-registry.
+          # Host identity is the property that actually matters — it is what
+          # decides whether a package name means the same package.
+          # Lower-cased: hosts are case-insensitive, but the four places that
+          # derive one compare the results for raw string equality. A .npmrc
+          # reading `registry=https://Registry.NpmJS.org` would otherwise be
+          # declared a different registry from the configured one and push every
+          # integrity-only entry down the off-registry path — a red check on a
+          # repo that is squarely on npmjs. Every other derivation (the pnpm awk,
+          # the package-lock jq) lower-cases to match.
+          # registry.yarnpkg.com is folded to registry.npmjs.org. It is not a
+          # different registry — it is an alias in front of the public npm
+          # registry, serving the same packages under the same names, and yarn v1
+          # writes it into `resolved` by default. Without the fold a repo migrated
+          # from yarn to npm (npm 7+ carries yarn.lock `resolved` URLs straight
+          # into package-lock.json) has every pin tagged off-registry and fails
+          # the all-skipped guard — a red check for pins that are squarely on
+          # npmjs. The fold has to be applied to the ENTRY host too, not just
+          # here: the pnpm awk and the package-lock jq each repeat it, because
+          # their host never passes through this function.
+          npm_age::registry_host() {
+            local url="$1" scheme=""
+            case "$url" in *://*) scheme="${url%%://*}" ;; esac
+            url="${url#*://}"
+            url="${url%%/*}"
+            # Userinfo, before anything else looks at this. is_valid_registry_url
+            # rejects it in the INPUT precisely so credentials cannot be echoed
+            # into logs and summaries, but a value parsed out of a committed
+            # .npmrc never passes that validator — and `registry=https://user:pass@host/`
+            # is not far-fetched in exactly the private-registry repos this feature
+            # is for. Without the strip, `user:pass@host` lands verbatim in the
+            # warning below (safe_for_md prevents markdown injection, it does not
+            # redact, and Actions cannot mask a value that never came from a
+            # secret) and also matches no configured host, so it is a wrong-red
+            # as well as a leak.
+            url="${url##*@}"
+            url=$(printf '%s' "$url" | tr '[:upper:]' '[:lower:]')
+            scheme=$(printf '%s' "$scheme" | tr '[:upper:]' '[:lower:]')
+            # A default port is the same registry written two ways. Without this,
+            # `registry_url: https://npm.corp.example` against a lockfile whose
+            # `resolved` carries `:443` classifies every pin off-registry and
+            # fails a repo that is squarely on its configured registry — the
+            # wrong-red the yarnpkg fold below also exists to prevent.
+            case "${scheme}|${url}" in
+              https\|*:443) url="${url%:443}" ;;
+              http\|*:80)   url="${url%:80}" ;;
+            esac
+            [ "$url" = "registry.yarnpkg.com" ] && url="registry.npmjs.org"
+            printf '%s' "$url"
+          }
+
+          # Derived once, at load time, and read directly by every extractor —
+          # which is why they carry no fallback of their own. `main` narrows
+          # DEFAULT_HOST / SCOPE_MAP per target from that target's .npmrc; a direct
+          # caller (the parser unit tests) gets these values as-is.
+          #
+          # Before is_valid_registry_url runs, deliberately: `main` exits 1 on an
+          # invalid URL long before an extractor reads these, and a direct caller
+          # gets exactly what it would have computed for itself.
+          #
+          # Derived, never taken from the environment. Classification uses this
+          # host while the packument fetch always uses $REGISTRY_URL, so an
+          # inherited NPM_AGE_WANT_HOST would let a run judge pins against one
+          # registry and read their dates from another, silently. Tests drive
+          # AGE_CHECK_REGISTRY_URL, which moves both together.
+          NPM_AGE_WANT_HOST=$(npm_age::registry_host "$REGISTRY_URL")
+          NPM_AGE_DEFAULT_HOST="$NPM_AGE_WANT_HOST"
+          # Space-separated `@scope=host`. Empty, not unset: the append in
+          # npm_age::load_registry_config is unguarded and this file runs under
+          # `set -u`.
+          NPM_AGE_SCOPE_MAP=""
+
+          # ----- .npmrc: which registry an integrity-only entry came from -------------
+
+          # A pnpm entry whose resolution is `{integrity: ...}` carries no host: it
+          # came from whatever registry was configured when the lockfile was
+          # written. That configuration lives in .npmrc, so this reads it and emits
+          # one `<scope-or-default> <host>` pair per line — `default` plus any
+          # `@scope:registry=` overrides.
+          #
+          # Scoped lines matter as much as the default one: a repo whose default IS
+          # npmjs but which pulls `@acme/*` from a private registry has
+          # integrity-only entries for both, indistinguishable without this.
+          # Reading only the default would age every private @acme package against
+          # npmjs — the precise false pass this all exists to stop.
+          #
+          # Auth lines (`//host/:_authToken=...`, `@scope:_authToken=...`) match
+          # neither key shape and are dropped, so no secret reaches stdout.
+          #
+          # Values are read literally. A `registry=${NPM_REGISTRY}` style
+          # indirection resolves to no host, which reports its entries
+          # off-registry rather than guessing — see Known limitations.
+          npm_age::npmrc_registries() {
+            local file="$1"
+            [ -f "$file" ] || return 0
+            # `sed` first so a CRLF checkout does not leave "\r" glued to the host.
+            # Blank and comment lines (npm accepts both ";" and "#") are dropped by
+            # the anchored match rather than by a separate pass.
+            sed 's/\r$//' "$file" | awk '
+              {
+                line = $0
+                sub(/^[[:space:]]+/, "", line)
+                if (line ~ /^[;#]/) next
+                eq = index(line, "=")
+                if (eq == 0) next
+                key = substr(line, 1, eq - 1)
+                val = substr(line, eq + 1)
+                gsub(/[[:space:]]/, "", key)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+                # \047 is a single quote, spelled octal so this program stays
+                # inside one pair of shell single quotes.
+                gsub(/^"|"$/, "", val)
+                gsub(/^\047|\047$/, "", val)
+
+                if (key == "registry") scope = "default"
+                else if (key ~ /^@[^:]+:registry$/) { scope = key; sub(/:registry$/, "", scope) }
+                else next
+
+                # The VALUE is emitted as written; the caller runs it through
+                # npm_age::registry_host, so "host" has exactly one definition
+                # rather than a second one here that has to be kept in step. An
+                # unresolved ${VAR} survives that unchanged, matches no real host,
+                # and so lands on the off-registry path instead of a wrong one.
+                # A registry line WAS present. If its value is unusable — empty,
+                # or carrying whitespace that would split the space-separated
+                # scope map — emit a sentinel rather than nothing, so the caller
+                # can tell "no registry configured" from "a registry configured
+                # that I could not read". Dropping it silently left
+                # NPM_AGE_DEFAULT_HOST at the configured host, i.e. every entry
+                # judged on-registry: fail-OPEN, in the one place this file cannot
+                # afford it.
+                if (val == "" || val ~ /[[:space:]]/) val = "?unreadable"
+                print scope, val
+              }'
+          }
+
+          # Narrows NPM_AGE_DEFAULT_HOST / NPM_AGE_SCOPE_MAP to the .npmrc
+          # governing <dir>, or leaves them at the configured registry when there
+          # is none.
+          #
+          # Per TARGET, not per run. The step runs in the caller's
+          # working_directory, but lockfile_path may name a lockfile in a
+          # subdirectory of it (`apps/web/pnpm-lock.yaml` under a root
+          # working_directory is explicitly supported below) — and that app's
+          # .npmrc is what governed the install that wrote that lockfile. Reading
+          # only the top-level one would miss an `@acme:registry=` there, fall back
+          # to "same as the configured registry", and age those private packages
+          # against a public homonym: the exact false pass this all exists to
+          # close, reached through the one configuration that looks handled.
+          npm_age::load_registry_config() {
+            local dir="$1" scope host d
+            NPM_AGE_DEFAULT_HOST="$NPM_AGE_WANT_HOST"
+            NPM_AGE_SCOPE_MAP=""
+
+            # Every .npmrc from the working directory down to the lockfile, applied
+            # root-first so the NEAREST one wins. Both directions matter and each
+            # is a false pass on its own: reading only the top-level file misses
+            # `apps/web/.npmrc`, and reading only the lockfile's own directory
+            # misses a registry configured once at the repo root — which is where
+            # pnpm workspaces normally put it. Either way the private packages get
+            # aged against a public homonym.
+            #
+            # Relative paths only, so this never walks above the working directory
+            # — enforced here rather than assumed of the caller, because an
+            # absolute or `..`-bearing lockfile_path would otherwise have this
+            # reading .npmrc files from outside the checkout entirely.
+            # Also catches a directory whose NAME merely contains ".." (apps/v1..2),
+            # which is broader than traversal alone — harmless, since the fallback
+            # is the working directory, and not worth a more delicate pattern on a
+            # path that reaches the filesystem.
+            case "$dir" in
+              /*|*..*) dir="." ;;
+            esac
+            local -a dirs=()
+            d="$dir"
+            while [ "$d" != "." ] && [ "$d" != "/" ]; do
+              dirs=("$d" "${dirs[@]}")
+              d=$(dirname "$d")
+            done
+            dirs=("." "${dirs[@]}")
+
+            for d in "${dirs[@]}"; do
+              [ -f "${d}/.npmrc" ] || continue
+              # Explicit IFS: the script sets IFS=$'\n\t' globally, so a bare `read`
+              # would not split this pair on its space.
+              while IFS=' ' read -r scope host; do
+                host=$(npm_age::registry_host "$host")
+                # Same reasoning as the sentinel above: a value that parses to no
+                # host at all (`registry=//host/`, which npm accepts) must not
+                # leave the default at the configured registry. "?unreadable"
+                # matches no real host, so its entries are tagged and the mismatch
+                # warning below names the file.
+                [ -n "$host" ] || host="?unreadable"
+                if [ "$scope" = "default" ]; then
+                  NPM_AGE_DEFAULT_HOST="$host"
+                else
+                  # Later files override an earlier entry for the same scope
+                  # because the awk map assignment is last-wins; appending is
+                  # enough, no removal needed.
+                  NPM_AGE_SCOPE_MAP="${NPM_AGE_SCOPE_MAP}${NPM_AGE_SCOPE_MAP:+ }${scope}=${host}"
+                fi
+              done < <(npm_age::npmrc_registries "${d}/.npmrc")
+            done
+
+            if [ "$NPM_AGE_DEFAULT_HOST" != "$NPM_AGE_WANT_HOST" ]; then
+              local safe_default; safe_default=$(preflight::safe_for_md "$NPM_AGE_DEFAULT_HOST")
+              local safe_dir; safe_dir=$(preflight::safe_for_md "$dir")
+              echo "::warning::.npmrc for ${safe_dir} sets a default registry (${safe_default}) other than the configured registry_url (${NPM_AGE_WANT_HOST}); packages resolving through it are reported as skipped, not age-checked. Set registry_url to age them."
+            fi
+          }
+
           # ----- Separable: lockfile -> pkg@version work-list -------------------------
           #
           # Extractors and the base-vs-head comparator live in their own file: they
@@ -2017,6 +2746,9 @@ jobs:
           # version $2 on stdout. Exit codes:
           #   0 - success (stdout may still be empty if the version isn't in .time)
           #   1 - registry says 404/410 (package private, scope-only, unpublished)
+          #   3 - registry says 401/403: reachable, but refusing us. Distinct from
+          #       2 because the operator action is a credential, not a retry — and
+          #       this check sends none.
           #   2 - transient failure after --retry exhaustion (including 429)
           #
           # Uses curl's native --retry for the transient case + --compressed to
@@ -2053,7 +2785,7 @@ jobs:
             # branch below.
             http_code=$(curl -sS --compressed -m 10 --retry 2 --retry-delay 2 --retry-all-errors \
               -o "$response_file" -w "%{http_code}" \
-              "https://registry.npmjs.org/${url_pkg}" || echo "000")
+              "${REGISTRY_URL}/${url_pkg}" || echo "000")
 
             case "$http_code" in
               200)
@@ -2062,6 +2794,17 @@ jobs:
                 ;;
               404|410)
                 return 1
+                ;;
+              401|403)
+                # Reachable and REFUSING us, which is a different operator action
+                # from an outage. Most registries this feature is for (GitHub
+                # Packages, Artifactory, Nexus with anonymous read off, npm private
+                # orgs) need a token even to read a packument, and this check sends
+                # none — so without splitting this out, following the "pass
+                # registry_url" advice turns every pin into "<host> unreachable",
+                # which is the one thing it is not.
+                echo "::warning::${pkg}@${version} — ${REGISTRY_URL} returned ${http_code}: authentication required, and this check has no credential for it" >&2
+                return 3
                 ;;
               429)
                 # --retry-all-errors already retries 429; if we got here, rate
@@ -2126,6 +2869,24 @@ jobs:
             preflight::require_tools curl jq awk sed grep sort
             preflight::require_gnu_date
             preflight::validate_min_age_days
+
+            # Refuse a bad registry URL before any parsing, not at the first
+            # request: every entry is classified against a host derived from it, so
+            # a typo would render as "nothing is on your registry" rather than as
+            # the configuration error it is.
+            if ! npm_age::is_valid_registry_url "$REGISTRY_URL"; then
+              local safe_reg; safe_reg=$(preflight::safe_for_md "$REGISTRY_URL")
+              echo "::error::registry_url is not a valid http(s) registry URL: ${safe_reg}"
+              # Its own row, so the PR comment names the malformed input rather
+              # than falling through to exit_guard's generic "see the job log" —
+              # the same reason the parse-failure path below records one.
+              preflight::record_unverifiable "registry_url" "$safe_reg" \
+                "not a valid http(s) registry URL"
+              preflight::step_summary_unverifiable "registry_url is not a valid http(s) registry URL: ${safe_reg}"
+              exit 1
+            fi
+
+            echo "Age-checking against ${REGISTRY_URL}"
 
             # `type: number` on the workflow input guarantees little once a caller
             # writes `max_pins: ${{ vars.NPM_MAX_PINS }}`. A non-integer would make
@@ -2204,6 +2965,21 @@ jobs:
             # gets a message that names the cause instead of a bare "no
             # verification possible".
             local skipped_private=0
+            # Subset of skipped_count: pins skipped because they resolve to a
+            # registry other than the configured one — identified from the
+            # lockfile, so no request is made for them at all. Tracked separately
+            # so the all-skipped failure can name registry_url, the remedy that
+            # gates them, rather than a way to switch the check off.
+            local offregistry_count=0
+            # Rows actually written for off-registry pins. Uncapped, a
+            # private-registry monorepo promoting a whole lockfile writes one row
+            # and one annotation per pin: past 1 MiB Actions discards the step
+            # summary ENTIRELY, and the summary is this check's primary human
+            # output. Capping the rendering, never the counting, is what keeps the
+            # run's own conclusion readable. (GitHub surfaces only ~10 annotations
+            # per type per step anyway, so the flood was mostly invisible.)
+            local offregistry_rows=0
+            local -r OFFREGISTRY_ROW_CAP=50
 
             # Lockfiles actually inspected, for the all-skipped guard's failure row.
             local -a processed=()
@@ -2307,6 +3083,12 @@ jobs:
               processed+=("$file")
               echo "::group::Checking $(preflight::safe_for_md "$file")"
 
+              # Registry config for THIS lockfile, from the .npmrc beside it.
+              # `dirname` of a cwd-level lockfile is ".", which is the same file
+              # the previous shape read — so the common case is unchanged and the
+              # subdirectory case stops silently using the wrong one.
+              npm_age::load_registry_config "$(dirname "$file")"
+
               local new_deps="" diff_rc=0
               case "$kind" in
                 package-lock) new_deps=$(npm_age::diff_package_lock "$file" "$base_rev") || diff_rc=$? ;;
@@ -2393,9 +3175,24 @@ jobs:
               # that, so an over-budget run at least says how much it was trying to
               # do. See the budget note on the rate-limit sleep below.
               local pin_count total_pins_so_far
-              pin_count=$(printf '%s\n' "$new_deps" | grep -c . || true)
+              # Off-registry rows are excluded from the budget. They are decided
+              # from the lockfile and cost no request and no `sleep 0.2` — roughly
+              # 150x cheaper than the ~0.45s per pin this cap is sized against — so
+              # counting them refuses a run that would finish in about a second.
+              # That lands on the repo shape this feature exists for: a
+              # private-registry monorepo promoting a whole lockfile would be told
+              # "raise max_pins", spend a re-run on it, and only then reach the
+              # all-skipped guard that names registry_url. Two wrong turns, from a
+              # message this file's own standard says must name the real cause.
+              local off_count off_note=""
+              off_count=$(printf '%s\n' "$new_deps" | grep -c "^offregistry$(printf '\t')" || true)
+              # An explicit test, not `${off_count:+...}`: that expands whenever the
+              # variable is non-EMPTY, and "0" is non-empty — so every ordinary run
+              # would report "0 more resolve to another registry".
+              [ "$off_count" -gt 0 ] && off_note="; ${off_count} more resolve to another registry and are skipped without a request"
+              pin_count=$(( $(printf '%s\n' "$new_deps" | grep -c . || true) - off_count ))
               total_pins_so_far=$(( total_pins + pin_count ))
-              echo "::notice::$(preflight::safe_for_md "$file"): ${pin_count} pin(s) to verify, ${total_pins_so_far} across this run (~$(( total_pins_so_far * 45 / 100 ))s at ~0.45s each; job timeout is ${TIMEOUT_MINUTES} min). Counts work-list entries; backstop and invalid-name skips never reach the registry, so this over-estimates slightly."
+              echo "::notice::$(preflight::safe_for_md "$file"): ${pin_count} pin(s) to verify, ${total_pins_so_far} across this run (~$(( total_pins_so_far * 45 / 100 ))s at ~0.45s each; job timeout is ${TIMEOUT_MINUTES} min)${off_note}. Counts work-list entries; backstop and invalid-name skips never reach the registry, so this over-estimates slightly."
 
               # Refuse rather than run out the clock. This is the same rule the
               # unparseable-base branch in changed_pins already applies ("fail
@@ -2431,6 +3228,36 @@ jobs:
 
               while IFS= read -r dep_entry; do
                 [ -z "$dep_entry" ] && continue
+
+                # An "offregistry<TAB>pkg@ver" line is a pin the extractor read
+                # fine and deliberately did not admit: it resolves through some
+                # registry other than the configured one, so its publish date HERE
+                # would be a different package's. Reported and counted rather than
+                # dropped, because a newly added private dependency going green
+                # with no annotation is the failure this replaced. No request is
+                # made for it — that 404 round trip is what used to inflate
+                # skipped_count on every private entry.
+                #
+                # The tab cannot occur in a package name or in the semver charset
+                # the extractors enforce, so this cannot collide with a real pin.
+                if [ "${dep_entry%%$'\t'*}" = "offregistry" ]; then
+                  local off_pin="${dep_entry#*$'\t'}"
+                  local safe_off safe_off_ver
+                  safe_off=$(preflight::safe_for_md "${off_pin%@*}")
+                  safe_off_ver=$(preflight::safe_for_md "${off_pin##*@}")
+                  # A `::warning file=` like every sibling skip branch, so the skip
+                  # shows in the PR's Files-changed view and not only in the job
+                  # log. Columns split to match every other row in the table.
+                  if [ "$offregistry_rows" -lt "$OFFREGISTRY_ROW_CAP" ]; then
+                    echo "::warning file=$(preflight::safe_for_md "$file")::${safe_off}@${safe_off_ver} — resolves to a registry other than ${NPM_AGE_WANT_HOST} (skipped; pass registry_url to age it)"
+                    echo "| \`${safe_off}\` | ${safe_off_ver} | — | :warning: skipped (not on the configured registry) |" >> "$GITHUB_STEP_SUMMARY"
+                    offregistry_rows=$((offregistry_rows + 1))
+                  fi
+                  offregistry_count=$((offregistry_count + 1))
+                  skipped_count=$((skipped_count + 1))
+                  continue
+                fi
+
                 local pkg="${dep_entry%@*}" ver="${dep_entry##*@}"
                 if [ -z "$pkg" ] || [ -z "$ver" ]; then
                   continue
@@ -2494,23 +3321,36 @@ jobs:
                     fi
                     ;;
                   1)
-                    # 404/410 — package not on npmjs (private registry, scope-
-                    # only, or unpublished). Skip with warning; no way to verify
-                    # age from public metadata.
-                    echo "::warning file=$(preflight::safe_for_md "$file")::${pkg}@${safe_ver} — not found on npmjs.org (private or unpublished; skipped)"
+                    # 404/410 — package not on the configured registry (internal
+                    # scope, unpublished, or a registry this check was not pointed
+                    # at). Skip with warning; no way to verify age from metadata
+                    # this run can read.
+                    echo "::warning file=$(preflight::safe_for_md "$file")::${pkg}@${safe_ver} — not found on ${NPM_AGE_WANT_HOST} (private or unpublished; skipped)"
                     echo "| \`${pkg}\` | ${safe_ver} | — | :warning: skipped (404 — private or unpublished) |" >> "$GITHUB_STEP_SUMMARY"
                     skipped_count=$((skipped_count + 1))
                     skipped_private=$((skipped_private + 1))
+                    continue
+                    ;;
+                  3)
+                    # Authentication, not an outage. Still fails closed — an
+                    # unverifiable pin must not pass — but the row and the PR
+                    # comment name a cause the operator can act on, which is the
+                    # standard the rest of this file holds itself to.
+                    echo "::error file=$(preflight::safe_for_md "$file")::${pkg}@${safe_ver} — ${NPM_AGE_WANT_HOST} requires authentication and this check has no credential for it"
+                    echo "| \`${pkg}\` | ${safe_ver} | — | :x: registry requires authentication |" >> "$GITHUB_STEP_SUMMARY"
+                    preflight::record_unverifiable "$pkg" "$safe_ver" \
+                      "${NPM_AGE_WANT_HOST} requires authentication; this check sends no credential, so it cannot read publish dates there"
+                    failed=true
                     continue
                     ;;
                   *)
                     # Transient failure after curl --retry. Fail closed — an
                     # outage must not silently let new deps through a security
                     # control.
-                    echo "::error file=$(preflight::safe_for_md "$file")::${pkg}@${safe_ver} — registry unreachable after retry"
+                    echo "::error file=$(preflight::safe_for_md "$file")::${pkg}@${safe_ver} — ${NPM_AGE_WANT_HOST} unreachable after retry"
                     echo "| \`${pkg}\` | ${safe_ver} | — | :x: registry unreachable |" >> "$GITHUB_STEP_SUMMARY"
                     preflight::record_unverifiable "$pkg" "$safe_ver" \
-                      "npmjs registry unreachable after retry"
+                      "${NPM_AGE_WANT_HOST} unreachable after retry"
                     failed=true
                     continue
                     ;;
@@ -2528,6 +3368,15 @@ jobs:
               echo "::endgroup::"
             done
 
+            # Immediately after the loop and BEFORE every terminal branch below —
+            # the all-skipped guard exits, and a capped run is exactly the shape
+            # that reaches it, so a line emitted later never renders on the run
+            # that needs it. Same reasoning as the registry-free footer further
+            # down, which says so in as many words.
+            if [ "$offregistry_count" -gt "$offregistry_rows" ]; then
+              echo "| — | — | — | :warning: $(( offregistry_count - offregistry_rows )) more not on the configured registry (rows capped) |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+
             # Guard against "registry outage → every package skipped → workflow
             # passes" — if nothing actually got verified but some were skipped
             # (including non-registry SKIPs), err on the side of failing.
@@ -2538,9 +3387,36 @@ jobs:
               # branch runs before the `failed` branch, so if another lockfile
               # tripped the budget cap or a parse failure, the advice "drop this
               # check for this repo" would be actively wrong for what happened.
-              if [ "$skipped_private" -eq "$skipped_count" ] && [ "$failed" = false ]; then
-                all_skipped_reason="no pin in this change could be verified against npmjs.org (private registry, internal scope, or unpublished)"
-                echo "::error::All ${skipped_count} package(s) in this change are absent from npmjs.org (private registry, internal scope, or unpublished), so none could be age-verified. Failing to avoid a false pass. If this lockfile is served entirely by a private registry this check cannot gate it — drop it for this repo, or add the 'age-check-bypass' label to this PR."
+              if [ "$offregistry_count" -gt 0 ] && [ "$failed" = false ]; then
+                # Every skip was "resolves somewhere else", which has a real fix
+                # that is not a bypass: name that registry and they get gated for
+                # real. Saying only "no verification possible" would send this
+                # operator looking for a way to switch the check off, which is the
+                # outcome this branch exists to avoid.
+                # Phrased like its siblings below: all three reasons share "no pin
+                # in this change could be verified" so the PR-comment row reads the
+                # same whatever the cause, with the cause appended.
+                # `-gt 0`, not `-eq skipped_count`: a private-registry repo
+                # routinely produces BOTH off-registry rows and pins that 404 on
+                # the configured registry. Requiring unanimity dropped that mixed
+                # case — the realistic one for this feature's audience — onto the
+                # generic message, the only one that never mentions registry_url.
+                all_skipped_reason="no pin in this change could be verified; ${offregistry_count} of ${skipped_count} resolve to a registry other than ${NPM_AGE_WANT_HOST}"
+                # The remedy depends on whether registry_url was already set. Told
+                # to "pass registry_url" by a run that already has one, an operator
+                # has nowhere to go; and a host that serves no packument API (a CDN
+                # or bucket behind `resolution: {tarball: ...}`) cannot be named
+                # here at all, so that case has to admit the label exists.
+                local off_remedy
+                if [ "$REGISTRY_URL" = "https://registry.npmjs.org" ]; then
+                  off_remedy="pass registry_url to the reusable workflow naming the registry this repo installs from — it must serve packuments WITHOUT authentication, because this check sends no credential"
+                else
+                  off_remedy="registry_url is already set to ${REGISTRY_URL}, so these resolve somewhere else again — check it names the registry this repo actually installs from; if that host serves no packument API this check cannot age them, and 'age-check-bypass' is the remaining way out"
+                fi
+                echo "::error::All ${skipped_count} package(s) in this change were skipped, so none could be age-verified. ${offregistry_count} of them resolve to a registry other than ${NPM_AGE_WANT_HOST}: ${off_remedy}. Failing to avoid a false pass."
+              elif [ "$skipped_private" -eq "$skipped_count" ] && [ "$failed" = false ]; then
+                all_skipped_reason="no pin in this change could be verified against ${NPM_AGE_WANT_HOST} (internal scope, unpublished, or a registry this check was not pointed at)"
+                echo "::error::All ${skipped_count} package(s) in this change are absent from ${NPM_AGE_WANT_HOST} (internal scope, unpublished, or a registry this check was not pointed at), so none could be age-verified. Failing to avoid a false pass. If this repo installs from a private registry, pass registry_url naming it — the check then reads ages from there instead of dropping the gate. If the pins are genuinely unpublished, the 'age-check-bypass' label is the remaining way out."
               else
                 all_skipped_reason="no pin in this change could be verified"
                 echo "::error::All ${skipped_count} packages were skipped; no verification possible. Failing to avoid a false pass."
