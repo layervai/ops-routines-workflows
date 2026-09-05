@@ -49,7 +49,9 @@ on:
       private_modules:
         description: |
           Optional newline-delimited exact module=owner/repo declarations for
-          private GitHub modules (for example github.com/acme/widget=acme/widget).
+          private GitHub modules. Root example:
+          github.com/acme/widget=acme/widget. Nested example:
+          github.com/acme/widget/auth=acme/widget, which resolves auth/vX.Y.Z.
         required: false
         type: string
         default: ""
@@ -136,7 +138,7 @@ jobs:
             fi
             repo="${line#*=}"
             if [[ ! "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]] \
-              || [ "${repo%%/*}" != "$OWNER" ]; then
+              || [[ "${repo#*/}" == *. ]] || [ "${repo%%/*}" != "$OWNER" ]; then
               echo "::error::Private module repository is invalid or outside owner $OWNER: $repo"
               exit 1
             fi
@@ -145,7 +147,7 @@ jobs:
           supplied=""
           while IFS= read -r repo || [ -n "$repo" ]; do
             [ -z "$repo" ] && continue
-            if [[ ! "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]]; then
+            if [[ ! "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]] || [[ "$repo" == *. ]]; then
               echo "::error::Invalid private-module token repository: $repo"
               exit 1
             fi
@@ -920,7 +922,8 @@ jobs:
           #   FIRST_PARTY_MODULE_OWNER - caller repository owner; required and enforced as
           #                  the GitHub owner for every first-party public module
           #   FIRST_PARTY_GH_TOKEN - optional token for public GitHub provenance lookups
-          #   PRIVATE_MODULES - optional newline-delimited exact module=owner/repo pairs
+          #   PRIVATE_MODULES - optional newline-delimited exact module=owner/repo pairs;
+          #                  a module may be at the repository root or in a subdirectory
           #   PRIVATE_MODULE_OWNER - GitHub owner for every declared private repository
           #   PRIVATE_MODULE_REPOSITORIES - newline-delimited exact repository names
           #   GH_TOKEN - App installation token; required only when PRIVATE_MODULES is set
@@ -1012,6 +1015,159 @@ jobs:
 
           # ----- Separable: exact private-module declaration + GitHub provenance -----
 
+          go_age::valid_module_subpath() {
+            local subpath="$1" LC_ALL=C
+            if [ -z "$subpath" ] || [[ "$subpath" == /* ]] || [[ "$subpath" == */ ]] \
+              || [[ "$subpath" == *//* ]] || [[ "$subpath" == *$'\n'* ]] \
+              || [[ "$subpath" == *$'\r'* ]]; then
+              return 1
+            fi
+
+            local segment short upper
+            local -a segments
+            local IFS=/
+            read -r -a segments <<< "$subpath"
+            for segment in "${segments[@]}"; do
+              # Match x/mod's module-path character alphabet for repository-relative
+              # elements: ASCII letters/digits plus - . _ ~. A leading -, _, or ~ is
+              # legal; a leading or trailing dot is not. In particular, '+' is allowed
+              # in package import paths but x/mod deliberately rejects it in module paths
+              # because it changes meaning in URLs.
+              if [[ ! "$segment" =~ ^[A-Za-z0-9_~-][A-Za-z0-9._~-]*$ ]] || [[ "$segment" == *. ]]; then
+                return 1
+              fi
+
+              # Match x/mod's cross-platform element restrictions too. Windows treats
+              # these names as devices even when a suffix follows the first dot. Go also
+              # rejects DOS 8.3 short-name shapes in module and import paths.
+              short="${segment%%.*}"
+              upper=$(printf '%s' "$short" | LC_ALL=C tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+              case "$upper" in
+                CON|PRN|AUX|NUL|COM1|COM2|COM3|COM4|COM5|COM6|COM7|COM8|COM9|LPT1|LPT2|LPT3|LPT4|LPT5|LPT6|LPT7|LPT8|LPT9)
+                  return 1
+                  ;;
+              esac
+              if [[ "$short" =~ ~[0-9]+$ ]]; then
+                return 1
+              fi
+            done
+            return 0
+          }
+
+          # Print the major component of a canonical Go module version. semver.Canonical
+          # expands short versions and removes build metadata, so canonical module
+          # versions must already contain major.minor.patch and may use only the special
+          # +incompatible suffix that module.CanonicalVersion preserves. Numeric
+          # prerelease identifiers cannot have leading zeroes.
+          go_age::canonical_module_version_major() {
+            local base_version="$1" prerelease identifier major LC_ALL=C
+            if [[ "$base_version" == *+incompatible ]]; then
+              base_version="${base_version%+incompatible}"
+            fi
+            # Keep a hand-edited go.sum value bounded before it enters a GitHub API URL.
+            # The former private-tag validator allowed at most 128 base-version bytes.
+            if [ "${#base_version}" -gt 128 ] \
+              || [[ "$base_version" == *+* ]] \
+              || [[ ! "$base_version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$ ]]; then
+              return 1
+            fi
+
+            major="${BASH_REMATCH[1]}"
+            if [[ "$base_version" == *-* ]]; then
+              prerelease="${base_version#*-}"
+              local -a identifiers
+              local IFS=.
+              read -r -a identifiers <<< "$prerelease"
+              for identifier in "${identifiers[@]}"; do
+                if [[ "$identifier" =~ ^[0-9]+$ ]] && [ "${#identifier}" -gt 1 ] && [[ "$identifier" == 0* ]]; then
+                  return 1
+                fi
+              done
+            fi
+
+            printf '%s\n' "$major"
+          }
+
+          # Return the repository-relative tag prefix for a declared private module.
+          # Go tags a module in subdirectory "foo/bar" as "foo/bar/vX.Y.Z". A final
+          # semantic-import-version segment belongs to the module path, not the tag
+          # prefix: "foo/bar/v2" still uses "foo/bar/v2.3.4". Root modules and their
+          # /vN variants have an empty prefix.
+          go_age::module_tag_prefix() {
+            local module="$1" repo="$2"
+            # The repository owner and name are module-path elements too. Validate them
+            # before the root-module fast path so an owner-wide first-party declaration
+            # cannot bypass x/mod's cross-platform restrictions.
+            go_age::valid_module_subpath "$repo" || return 1
+            local repo_module="github.com/${repo}"
+            if [ "$module" = "$repo_module" ]; then
+              printf '\n'
+              return 0
+            fi
+            if [[ "$module" != "$repo_module/"* ]]; then
+              return 1
+            fi
+
+            local subpath="${module#"$repo_module"/}"
+            go_age::valid_module_subpath "$subpath" || return 1
+
+            local last_segment="${subpath##*/}"
+            # Match the version-shaped suffix that x/mod SplitPathVersion inspects.
+            # A dotted, v0, v1, or zero-padded form is invalid as a module-path major;
+            # do not reinterpret it as an ordinary nested directory.
+            if [[ "$last_segment" =~ ^v[0-9.]+$ ]]; then
+              if [[ ! "$last_segment" =~ ^v([2-9]|[1-9][0-9]+)$ ]]; then
+                return 1
+              fi
+              if [ "$subpath" = "$last_segment" ]; then
+                printf '\n'
+              else
+                printf '%s\n' "${subpath%/*}"
+              fi
+              return 0
+            fi
+
+            printf '%s\n' "$subpath"
+          }
+
+          # Return the repository-relative tag prefix after enforcing Go's semantic
+          # import-version rule against the dependency version. Both private-module and
+          # first-party provenance paths use this function so /vN handling cannot drift.
+          go_age::repository_relative_tag_prefix() {
+            local module="$1" repo="$2" version="$3" route="$4" route_adjective tag_prefix
+            case "$route" in
+              Private) route_adjective="private" ;;
+              First-party) route_adjective="first-party" ;;
+              *)
+                echo "Invalid repository-relative tag route: ${route}" >&2
+                return 1
+                ;;
+            esac
+            if ! tag_prefix=$(go_age::module_tag_prefix "$module" "$repo"); then
+              echo "${route} module path cannot produce a valid repository-relative tag: ${module}" >&2
+              return 1
+            fi
+
+            local version_major
+            if ! version_major=$(go_age::canonical_module_version_major "$version"); then
+              echo "Invalid ${route_adjective} module tag: ${version}" >&2
+              return 1
+            fi
+            local last_segment="${module##*/}"
+            if [[ "$last_segment" =~ ^v([0-9]+)$ ]]; then
+              local path_major="${BASH_REMATCH[1]}"
+              if [ "$path_major" != "$version_major" ]; then
+                echo "${route} semantic import version does not match ${version}: ${module}" >&2
+                return 1
+              fi
+            elif [ "$version_major" != 0 ] && [ "$version_major" != 1 ] && [[ "$version" != *+incompatible ]]; then
+              echo "${route} v${version_major} module path lacks the required /v${version_major} suffix: ${module}" >&2
+              return 1
+            fi
+
+            printf '%s\n' "$tag_prefix"
+          }
+
           # Private modules never appear on proxy.golang.org, so their age must be
           # established from an authenticated, exact GitHub tag lookup. Keep this path
           # explicit and opt-in: an undeclared module always follows the existing public
@@ -1049,17 +1205,14 @@ jobs:
               fi
               module="${line%%=*}"
               repo="${line#*=}"
-              if [[ ! "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]]; then
+              if [[ ! "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]] \
+                || [[ "${repo#*/}" == *. ]]; then
                 echo "::error::Invalid private GitHub repository: ${repo}" >&2
                 return 1
               fi
-              local repo_module="github.com/${repo}" module_suffix
-              if [ "$module" != "$repo_module" ]; then
-                module_suffix="${module#"$repo_module"}"
-                if [ "$module_suffix" = "$module" ] || [[ ! "$module_suffix" =~ ^/v([2-9]|[1-9][0-9]+)$ ]]; then
-                  echo "::error::Private module/repository mismatch: ${module} must equal ${repo_module} or its /vN major-version path" >&2
-                  return 1
-                fi
+              if ! go_age::module_tag_prefix "$module" "$repo" >/dev/null; then
+                echo "::error::Private module/repository mismatch: ${module} must be the ${repo} root, its /vN major, or a valid nested module below that repository" >&2
+                return 1
               fi
               repo_owner="${repo%%/*}"
               repo_name="${repo#*/}"
@@ -1083,7 +1236,7 @@ jobs:
             local supplied_repositories="" seen_repositories=$'\n'
             while IFS= read -r repo_name || [ -n "$repo_name" ]; do
               [ -z "$repo_name" ] && continue
-              if [[ ! "$repo_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]]; then
+              if [[ ! "$repo_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]] || [[ "$repo_name" == *. ]]; then
                 echo "::error::Invalid PRIVATE_MODULE_REPOSITORIES entry: ${repo_name}" >&2
                 return 1
               fi
@@ -1112,12 +1265,21 @@ jobs:
             [ "$tag_kind" = "annotated" ] && [ "$verification" = "verified" ]
           }
 
-          go_age::private_repo_for() {
-            local wanted_module="$1" line
+          # Emit "repository<TAB>tag-prefix" for an exact declaration. Return 1 when
+          # the module is not declared and 2 when a declared module/version pair violates
+          # semantic import versioning. Configuration validation already proves the path
+          # shape; the second result is a defensive runtime check for a hand-edited
+          # go.sum whose version does not agree with the declared /vN path.
+          go_age::private_coordinates_for() {
+            local wanted_module="$1" version="$2" line repo tag_prefix
             while IFS= read -r line || [ -n "$line" ]; do
               [ -z "$line" ] && continue
               if [ "${line%%=*}" = "$wanted_module" ]; then
-                printf '%s\n' "${line#*=}"
+                repo="${line#*=}"
+                if ! tag_prefix=$(go_age::repository_relative_tag_prefix "$wanted_module" "$repo" "$version" Private); then
+                  return 2
+                fi
+                printf '%s\t%s\n' "$repo" "$tag_prefix"
                 return 0
               fi
             done <<< "$PRIVATE_MODULES"
@@ -1148,28 +1310,35 @@ jobs:
           # not the timestamp; this path is therefore only a quarantine aid for trusted
           # internal producers, not an equivalent public transparency guarantee.
           go_age::private_tag_metadata() {
-            local repo="$1" version="$2"
+            local repo="$1" version="$2" tag_prefix="${3:-}"
             # Go adds +incompatible to v2+ module versions that retain a v1-style module
             # path, but the repository tag itself omits that Go-only suffix.
-            local tag_version="${version%+incompatible}"
-            if [[ ! "$tag_version" =~ ^v[0-9A-Za-z.-]{1,127}$ ]]; then
+            local base_tag_version="${version%+incompatible}"
+            # The dispatcher already checked this value. Keep the same canonical check
+            # for direct callers and as defense in depth before the value enters a URL.
+            if ! go_age::canonical_module_version_major "$version" >/dev/null; then
               echo "Invalid private module tag: ${version}" >&2
               return 1
             fi
+            if [ -n "$tag_prefix" ] && ! go_age::valid_module_subpath "$tag_prefix"; then
+              echo "Invalid private module tag prefix: ${tag_prefix}" >&2
+              return 1
+            fi
+            local tag_version="${tag_prefix:+${tag_prefix}/}${base_tag_version}"
 
             local ref_json ref_name object_type object_sha
             if ! ref_json=$(go_age::github_json "/repos/${repo}/git/ref/tags/${tag_version}"); then
-              echo "Exact private tag ${repo}@${version} is missing or inaccessible" >&2
+              echo "Exact private tag ${repo}@${tag_version} is missing or inaccessible" >&2
               return 1
             fi
             IFS=$'\t' read -r ref_name object_type object_sha <<< "$(printf '%s' "$ref_json" \
               | jq -r '[.ref, .object.type, .object.sha] | map(. // "") | @tsv')"
             if [ "$ref_name" != "refs/tags/${tag_version}" ]; then
-              echo "Private tag ${repo}@${version} returned a mismatched ref name" >&2
+              echo "Private tag ${repo}@${tag_version} returned a mismatched ref name" >&2
               return 1
             fi
             if [[ ! "$object_sha" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "Private tag ${repo}@${version} returned an invalid object SHA" >&2
+              echo "Private tag ${repo}@${tag_version} returned an invalid object SHA" >&2
               return 1
             fi
 
@@ -1186,7 +1355,7 @@ jobs:
                     | map(. // "") | @tsv')"
                 if [ "$tag_name" != "$tag_version" ] || [ "$target_type" != "commit" ] \
                   || [[ ! "$target_sha" =~ ^[0-9a-f]{40}$ ]] || [ -z "$tagger_date" ]; then
-                  echo "Annotated tag provenance mismatch for ${repo}@${version}" >&2
+                  echo "Annotated tag provenance mismatch for ${repo}@${tag_version}" >&2
                   return 1
                 fi
                 printf '%s\tannotated\t%s\t%s\t%s\n' \
@@ -1201,14 +1370,14 @@ jobs:
                 IFS=$'\t' read -r commit_sha commit_date <<< "$(printf '%s' "$commit_json" \
                   | jq -r '[.sha, .commit.committer.date] | map(. // "") | @tsv')"
                 if [ "$commit_sha" != "$object_sha" ] || [ -z "$commit_date" ]; then
-                  echo "Lightweight tag provenance mismatch for ${repo}@${version}" >&2
+                  echo "Lightweight tag provenance mismatch for ${repo}@${tag_version}" >&2
                   return 1
                 fi
                 printf '%s\tlightweight\t%s\t%s\tunavailable\n' \
                   "$commit_date" "$object_sha" "$commit_sha"
                 ;;
               *)
-                echo "Unsupported private tag target type for ${repo}@${version}: ${object_type:-empty}" >&2
+                echo "Unsupported private tag target type for ${repo}@${tag_version}: ${object_type:-empty}" >&2
                 return 1
                 ;;
             esac
@@ -1265,7 +1434,7 @@ jobs:
               return 1
             fi
 
-            local entry first_element seen=$'\n'
+            local entry first_element repository_path seen=$'\n'
             while IFS= read -r entry; do
               [ -z "$entry" ] && continue
               # Go module paths are ASCII letters/digits plus `-._~/`. Anything
@@ -1303,11 +1472,13 @@ jobs:
                 echo "::error::Malformed EXEMPT_MODULE_PREFIXES repository path: ${entry}" >&2
                 return 1
               fi
-              local exact_or_prefix_path="${entry%/}"
-              if [ "$entry" != "$owner_root" ] \
-                && [[ ! "$exact_or_prefix_path" =~ ^github\.com/${FIRST_PARTY_MODULE_OWNER}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}(/[A-Za-z0-9][A-Za-z0-9._~-]*)*$ ]]; then
-                echo "::error::Malformed first-party GitHub module path: ${entry}" >&2
-                return 1
+              if [ "$entry" != "$owner_root" ]; then
+                repository_path="${entry#"$owner_root"}"
+                repository_path="${repository_path%/}"
+                if ! go_age::valid_module_subpath "$repository_path"; then
+                  echo "::error::Malformed first-party GitHub module path: ${entry}" >&2
+                  return 1
+                fi
               fi
               # A host-only prefix ("github.com/") would exempt EVERY module on that
               # host — a silent broad bypass that defeats per-module exemption. A
@@ -1377,47 +1548,19 @@ jobs:
             local module="$1" version="$2"
             local owner_root="github.com/${FIRST_PARTY_MODULE_OWNER}/"
             [[ "$module" == "$owner_root"* ]] || return 1
-            if [[ ! "$module" =~ ^github\.com/${FIRST_PARTY_MODULE_OWNER}/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}(/[A-Za-z0-9][A-Za-z0-9._~-]*)*$ ]]; then
-              echo "Invalid first-party GitHub module path: ${module}" >&2
-              return 1
-            fi
-
-            local module_tail="${module#"$owner_root"}" repo_name suffix
+            local module_tail="${module#"$owner_root"}" repo_name
             repo_name="${module_tail%%/*}"
-            if [[ ! "$repo_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]]; then
-              echo "Invalid first-party repository in module path: ${module}" >&2
-              return 1
-            fi
-            if [ "$module_tail" = "$repo_name" ]; then
-              suffix=""
-            else
-              suffix="/${module_tail#*/}"
-            fi
 
             local tag_version="${version%+incompatible}"
-            if [[ ! "$tag_version" =~ ^v([0-9]+)\.[0-9A-Za-z.-]{1,127}$ ]]; then
-              echo "Invalid first-party module tag: ${version}" >&2
-              return 1
-            fi
-            local version_major="${BASH_REMATCH[1]}"
-
-            if [[ "$suffix" =~ /v([0-9]+)$ ]]; then
-              local path_major="${BASH_REMATCH[1]}"
-              if [ "$path_major" -lt 2 ] || [ "$path_major" != "$version_major" ]; then
-                echo "First-party semantic import version does not match ${version}: ${module}" >&2
-                return 1
-              fi
-              suffix="${suffix%/v"${path_major}"}"
-            elif [ "$version_major" -ge 2 ] && [[ "$version" != *+incompatible ]]; then
-              echo "First-party v${version_major} module path lacks the required /v${version_major} suffix: ${module}" >&2
-              return 1
-            fi
-
-            local tag_prefix="${suffix#/}" expected_tag="$tag_version"
+            local repo="${FIRST_PARTY_MODULE_OWNER}/${repo_name}" tag_prefix
+            # repository_relative_tag_prefix applies the same x/mod element validator
+            # used by exemption configuration. Keep one accepted path alphabet for both.
+            tag_prefix=$(go_age::repository_relative_tag_prefix "$module" "$repo" "$version" First-party) || return 1
+            local expected_tag="$tag_version"
             if [ -n "$tag_prefix" ]; then
               expected_tag="${tag_prefix}/${tag_version}"
             fi
-            printf '%s/%s\t%s\n' "$FIRST_PARTY_MODULE_OWNER" "$repo_name" "$expected_tag"
+            printf '%s\t%s\n' "$repo" "$expected_tag"
           }
 
           # Emit "tag-kind<TAB>tag-object-sha<TAB>target-commit-sha<TAB>tag-verification".
@@ -1622,13 +1765,37 @@ jobs:
 
                 # Exact private declarations retain their authenticated tag-age path even
                 # when a consumer also configures an owner-wide public first-party prefix.
-                local private_repo=""
-                private_repo=$(go_age::private_repo_for "$module") || private_repo=""
+                local private_coordinates="" private_repo="" private_tag_prefix="" private_coordinates_status=0
+                private_coordinates=$(go_age::private_coordinates_for "$module" "$version") || private_coordinates_status=$?
+                if [ "$private_coordinates_status" -eq 0 ]; then
+                  IFS=$'\t' read -r private_repo private_tag_prefix <<< "$private_coordinates"
+                elif [ "$private_coordinates_status" -eq 2 ]; then
+                  echo "::error file=${sum_file}::Private declaration cannot resolve ${module}@${version}"
+                  echo "| \`${safe_module}\` | ${safe_version} | — | :x: private declaration unresolvable |" >> "$GITHUB_STEP_SUMMARY"
+                  preflight::record_unverifiable "$safe_module" "$safe_version" \
+                    "declared module/version cannot produce an exact private tag"
+                  # Fail closed for this dependency and continue the normal report. The
+                  # resolver uses status 2 for every declared-but-unresolvable module:
+                  # invalid path, invalid version, or semantic-major mismatch. The
+                  # `continue` prevents any proxy or provenance lookup for that invalid
+                  # declaration while preserving the gate's all-dependency diagnostics.
+                  failed=true
+                  continue
+                elif [ "$private_coordinates_status" -ne 1 ]; then
+                  echo "::error file=${sum_file}::Private declaration lookup failed for ${module}@${version} (status ${private_coordinates_status})"
+                  echo "| \`${safe_module}\` | ${safe_version} | — | :x: private declaration lookup failed |" >> "$GITHUB_STEP_SUMMARY"
+                  preflight::record_unverifiable "$safe_module" "$safe_version" \
+                    "private declaration lookup returned an unexpected status"
+                  # Only status 1 means "not declared". Every other status fails closed
+                  # for this dependency and must never reach public proxy routing.
+                  failed=true
+                  continue
+                fi
 
                 # A configured same-owner public module may bypass the cooldown only
                 # after the proxy origin, exact GitHub tag, verified target commit, and
-                # protected-default-branch ancestry all agree. This takes precedence
-                # over private-module routing, but unlike the old path-only exemption it
+                # protected-default-branch ancestry all agree. Exact private declarations
+                # take precedence; unlike the old path-only exemption, this public path
                 # performs every provenance lookup before recording a visible skip.
                 if [ -z "$private_repo" ] && go_age::module_is_exempt "$module"; then
                   local first_party_metadata fp_repo fp_tag fp_commit fp_branch fp_tag_kind
@@ -1649,7 +1816,7 @@ jobs:
 
                 local publish_time age_verb="published" metadata
                 if [ -n "$private_repo" ]; then
-                  if ! metadata=$(go_age::private_tag_metadata "$private_repo" "$version"); then
+                  if ! metadata=$(go_age::private_tag_metadata "$private_repo" "$version" "$private_tag_prefix"); then
                     echo "::error file=${sum_file}::Could not verify private tag provenance for ${module}@${version}"
                     echo "| \`${safe_module}\` | ${safe_version} | — | :x: private tag unverifiable |" >> "$GITHUB_STEP_SUMMARY"
                     preflight::record_unverifiable "$safe_module" "$safe_version" \
