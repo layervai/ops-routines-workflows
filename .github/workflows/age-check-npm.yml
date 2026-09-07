@@ -102,7 +102,9 @@ on:
           Resolution source, not the key: pnpm entries are matched on
           `resolution: {tarball: ...}`, or on the default/scoped
           registry in .npmrc for an integrity-only entry; package-lock
-          entries on the host of their `resolved` URL.
+          and yarn v1 entries on the host of their `resolved` URL.
+          Berry (yarn v2+) writes a `resolution:` descriptor and no URL,
+          so it names no host and is NOT filtered.
 
           This also gives a pnpm v5 repo on a private default registry a
           real gate. Those lockfiles qualify every key with the registry
@@ -932,10 +934,12 @@ jobs:
           #              Same shape as preflight::record_failure's TSV, which
           #              also leads with a kind column.
           #
-          #              yarn_pins does NOT yet classify: it never reads the
-          #              entry's `resolved`, so a yarn lockfile on a private
-          #              registry is still aged against the configured one.
-          #              Tracked; see Known limitations in age-check-npm.sh.
+          #              yarn_pins classifies yarn v1 from the entry's
+          #              `resolved` URL. BERRY entries name no host — they
+          #              carry a `resolution:` descriptor, not a location — so
+          #              they are emitted untagged and a Berry lockfile on a
+          #              private registry is still aged against the configured
+          #              registry. See Known limitations in age-check-npm.sh.
           #
           #   COMPARATOR npm_age::new_pins, npm_age::changed_pins
           #              Format-agnostic. changed_pins does the git plumbing
@@ -1083,8 +1087,51 @@ jobs:
           # would reach the all-skipped guard with checked_count 0 and fail the
           # PR outright.
           npm_age::yarn_pins() {
-            awk '
-              FNR == 1 { name = "" }
+            awk -v want_host="$NPM_AGE_WANT_HOST" '
+              # Emits the buffered entry, if any. A yarn block states its version
+              # one line ABOVE the `resolved` URL that says where it came from, so
+              # an entry cannot be printed on sight: it is held until that URL has
+              # been read. Called before each new header and at EOF — the two ways
+              # a block can end. Mirrors the flush() in npm_age::parse_pnpm_lock,
+              # which buffers for exactly the same reason.
+              function flush() {
+                if (pending_name == "") return
+                # block_conflict forces the tag regardless of host — see the
+                # `resolved` rule.
+                #
+                # The default is TAGGED, not untagged, and that inversion is the
+                # load-bearing part. A yarn v1 block always carries a readable
+                # `resolved`; if one produced a pin and no host, this parser did
+                # not read where the package came from, and aging it against the
+                # configured registry would assert something the lockfile never
+                # said. The ways that happens are not exotic — a key spelling the
+                # rule below does not match (yarn v1 accepts `resolved`,
+                # `"resolved"`, `resolved:` and `"resolved":` for the same key,
+                # and decodes escapes in keys, so no literal match is complete), a
+                # git conflict marker splitting the block at column 0, or an
+                # indent yarn did not write. Matching the key better shrinks that
+                # set; defaulting to tagged is what makes the ones left over fail
+                # closed instead of green.
+                #
+                # Berry is exempt per BLOCK, not per file: a block is Berry-shaped
+                # only if it carries its own `resolution:` at the direct-child
+                # indent. A file-level flag would be forgeable by dropping one
+                # `resolution:` line anywhere into a v1 lockfile, which yarn v1
+                # ignores and would have re-exempted every entry in it.
+                if (block_conflict ||
+                    (block_host == "" && !block_berry) ||
+                    (block_host != "" && block_host != want_host))
+                  print "offregistry\t" pending_name "@" pending_ver
+                else
+                  print pending_name "@" pending_ver
+                pending_name = ""; pending_ver = ""
+              }
+              # Resets ALL per-file state, not just `name`. Unreachable as written
+              # — yarn_pins is handed a single stream, never file operands — but
+              # the buffered entry and the block host are per-file too, and a
+              # half-reset here would colour file N+1s first flush with file Ns
+              # host if that ever changed.
+              FNR == 1 { flush(); name = ""; block_host = ""; block_conflict = 0; block_berry = 0 }
               # Counts any line that is not blank and not a comment. MUST come
               # before the header rule: that rule ends in `next`, which skips every
               # remaining rule for the line, so a counter placed after it would
@@ -1094,8 +1141,23 @@ jobs:
               # Structural markers only a real lockfile carries. A file with these
               # parsed fine and simply had nothing registry-hosted to report; a
               # truncated or wholesale-replaced file has none of them.
-              /^[[:space:]]*(__metadata|resolution:|resolved |languageName:|linkType:)/ { structural++ }
+              # `"?resolved"?[[:space:]:]` rather than a bare `resolved `: yarn v1
+              # writes this key four ways (see the resolved rule below), and a
+              # lockfile using one of the others would otherwise carry no
+              # structural evidence at all and trip the "truncated or wholesale
+              # replaced" arm of the END guard. (No apostrophes in this block: it
+              # is inside a single-quoted awk program.)
+              /^[[:space:]]*(__metadata|resolution:|"?resolved"?[[:space:]:]|languageName:|linkType:)/ { structural++ }
               /^[^[:space:]#]/ {
+                # A new header ends the previous block, so anything buffered from
+                # it can be emitted now: its `resolved` line, if it had one, has
+                # already been read. Clearing the host state AFTER that flush is
+                # what scopes a host to its own block — including for a header
+                # this rule goes on to REJECT (a `github:` pin, a Berry patch
+                # descriptor), whose `resolved` line must not colour the entry
+                # buffered before it.
+                flush()
+                block_host = ""; block_conflict = 0; block_berry = 0
                 line = $0
                 sub(/:[[:space:]]*$/, "", line)
                 split(line, parts, ",")
@@ -1177,8 +1239,105 @@ jobs:
                 ver = $0
                 sub(/^[[:space:]]*version[[:space:]]*:?[[:space:]]*"?/, "", ver)
                 sub(/["[:space:]].*$/, "", ver)
-                if (name != "" && ver != "") { print name "@" ver; pins++ }
+                # Buffered rather than printed (see flush()). pins++ stays here,
+                # at the point a version is ACCEPTED, so the END guard below counts
+                # exactly what it counted before — every accepted entry is flushed
+                # by a later header or at EOF.
+                if (name != "" && ver != "") { pending_name = name; pending_ver = ver; pins++ }
                 name = ""
+              }
+              # `resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz#..."`
+              # — the tarball yarn v1 actually fetched, and the only thing in the
+              # block that names the registry that served it (see the header note
+              # for why the block header cannot).
+              #
+              # EXACTLY two spaces — a direct child of the block header, which is
+              # the only place yarn writes `resolved`. Matching any indent instead
+              # reads the `dependencies:` map four spaces below it, and that is
+              # FORGEABLE: `resolved` is a legal package name and a tarball URL is
+              # a legal yarn range, so `    resolved "https://registry.npmjs.org/x"`
+              # inside the dependency map of an entry whose real `resolved` points
+              # at an attacker host is a well-formed line that overwrote the real
+              # host — the pin was then aged against the genuine public package
+              # and rendered green while yarn installs the attacker tarball. Same
+              # class as the block-scalar hole anchored against in
+              # npm_age::parse_pnpm_lock; see the note there.
+              #
+              # Recorded against the BLOCK, not the buffered entry, so the order
+              # of `version` and `resolved` inside a block does not matter.
+              # Berry shape. These four keys are the exemption`s only trigger, and
+              # every one is a key yarn v1 NEVER writes — which is the whole
+              # requirement, because block_berry is the off-switch for the
+              # fail-closed default above. A marker v1 also writes is not a format
+              # signal, it is a bypass: `version:` was tried here and had to be
+              # withdrawn, since v1 accepts the colon form too (the extractor
+              # carries `:?` for it, and the reformat test drives it as a v1
+              # shape), so `  version: "1.2.3"` plus any `resolved` spelling the
+              # rule below misses switched the default off and shipped the pin
+              # untagged.
+              #
+              # Read at the direct-child indent only, so a nested `dependencies:`
+              # line cannot exempt a block.
+              #
+              # v1 ignores unknown keys, so ANY per-block marker is forgeable in
+              # principle; narrowing to keys v1 never writes makes the forgery an
+              # obviously alien line rather than one the block plausibly needs.
+              /^  "?(resolution|checksum|languageName|linkType)"?[[:space:]]*:/ { block_berry = 1 }
+              # Every plain spelling yarn v1 accepts for this one key: bare or
+              # quoted, with or without a colon. All four set the same field and
+              # all four were verified to make yarn fetch the URL, so matching
+              # only the canonical one left three ways to hand the gate a pin
+              # whose origin it never read.
+              /^  "?resolved"?[[:space:]:]/ {
+                url = $0
+                sub(/\r$/, "", url)
+                sub(/^[[:space:]]*"?resolved"?[[:space:]]*:?[[:space:]]*/, "", url)
+                gsub(/^"|"$/, "", url)
+                # The test is whether a SCHEME was stripped — i.e. whether this
+                # line named a location at all — NOT whether that scheme was
+                # https. Gating on https looks like the `startswith("https://")`
+                # in NPM_AGE_JQ_ENTRIES but does not behave like it: that one is a
+                # `select`, so a non-https entry is DROPPED and never checked,
+                # whereas leaving block_host unset here emits the entry UNTAGGED,
+                # which means aging it against a registry the evidence says it did
+                # not come from. A pin resolved over plain `http://` from an
+                # internal host is the homonym false pass one scheme over.
+                #
+                # Everything after the host is discarded, so the `#<sha>` fragment
+                # yarn appends is irrelevant. Lower-cased and folded exactly as
+                # npm_age::registry_host and the other two extractors do, so all
+                # three compare hosts the same way — see the comment on
+                # registry_host for why yarnpkg.com is not a separate registry.
+                scheme = url
+                if (sub(/:\/\/.*$/, "", scheme)) scheme = tolower(scheme); else scheme = ""
+                if (sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", url)) {
+                  sub(/\/.*$/, "", url)
+                  # All four normalisations npm_age::registry_host applies, in its
+                  # order. Every host these are compared against goes through that
+                  # function, so a derivation here that skips one reports the same
+                  # registry written two ways as two registries — a wrong-RED on a
+                  # repo squarely on its configured registry.
+                  #
+                  # Userinfo first, taking the LAST `@`: `user:pass@host` must
+                  # compare as `host`, or a credentialed `resolved` (which a
+                  # private-registry lockfile can carry) is both a wrong-red and a
+                  # credential echoed into the annotation, where safe_for_md
+                  # escapes markdown but does not redact.
+                  sub(/^.*@/, "", url)
+                  url = tolower(url)
+                  # A default port is the same registry written two ways.
+                  if (scheme == "https") sub(/:443$/, "", url)
+                  if (scheme == "http")  sub(/:80$/, "", url)
+                  if (url == "registry.yarnpkg.com") url = "registry.npmjs.org"
+                  # yarn writes one `resolved` per block. TWO naming different
+                  # hosts is not a lockfile yarn produced, and whichever one it
+                  # would install from, this parser cannot know — so the entry is
+                  # tagged rather than aged against either. Fail closed on
+                  # ambiguity: picking first or last would each be a false pass
+                  # under the opposite ordering.
+                  if (block_host != "" && url != block_host) block_conflict = 1
+                  block_host = url
+                }
               }
               # awk exits 0 on anything, so without this the fail-closed branch in
               # changed_pins is unreachable for yarn: an unreadable image would
@@ -1218,6 +1377,8 @@ jobs:
               # exact thing this gate exists to block. Reporting an empty work-list
               # for it would be the "empty means nothing changed" conflation again.
               END {
+                # The last block in the file has no following header to end it.
+                flush()
                 if ((specs > 0 && pins == 0) ||
                     (content > 0 && pins == 0 && structural == 0) ||
                     (content == 0 && comments == 0)) exit 1
@@ -2363,16 +2524,63 @@ jobs:
           #   file for yarn BERRY, which reads `npmRegistryServer` /
           #   `npmScopes.<scope>.npmRegistryServer` from .yarnrc.yml — pointing
           #   npm_age::npmrc_registries at a Berry repo would judge its pins
-          #   against a registry Berry never used. Moot today because the yarn
-          #   extractor does no registry filtering at all (above), but it is the
-          #   trap waiting for whoever adds it.
-          # - yarn.lock is the exception, and still has the hole described above.
-          #   npm_age::yarn_pins pairs a name to a version from the header and body
-          #   and never reads the entry's `resolved`, so a yarn lockfile on a
-          #   private registry still has every pin aged against
-          #   AGE_CHECK_REGISTRY_URL. Giving yarn the same treatment is tracked
-          #   separately; a yarn repo on a private registry should not rely on this
-          #   check until then.
+          #   against a registry Berry never used. Live now that the yarn
+          #   extractor does filter (below): it is the trap waiting for whoever
+          #   extends that filtering to Berry.
+          # - yarn.lock is filtered for v1 ONLY. npm_age::yarn_pins reads each
+          #   block's `resolved "<url>"`, folds the host the same way
+          #   npm_age::registry_host does, and tags anything else — so a yarn v1
+          #   repo on a private registry gets a real gate by naming it in
+          #   registry_url. BERRY (yarn v2+) IS NOT FILTERED: it writes
+          #   `resolution:` and `checksum` and no `resolved` URL, and a
+          #   `resolution:` is a descriptor (`lodash@npm:4.17.21`), not a
+          #   location, so it names no host to compare and its blocks are emitted
+          #   untagged. A Berry repo on a private registry therefore still has the
+          #   homonym false pass above and should not rely on this check; closing
+          #   it needs the .yarnrc.yml reader described in the bullet above, not
+          #   npm_age::npmrc_registries. Two details of the v1 path worth knowing:
+          #   a `resolved` is read only at EXACTLY two spaces, the block's direct
+          #   child, because `resolved` is a legal package name and a tarball URL
+          #   a legal range — so a `dependencies:` entry four spaces down is a
+          #   well-formed forgery of the real host (same class as the block-scalar
+          #   hole in npm_age::parse_pnpm_lock). The DEFAULT for a block that
+          #   yields a pin without a readable host is TAGGED, not untagged: a real
+          #   yarn v1 block always carries a `resolved`, so its absence means the
+          #   parser never read where the package came from, and aging it against
+          #   the configured registry would assert something the lockfile never
+          #   said. That arm is what catches the layouts the rules do not match —
+          #   yarn v1 accepts `resolved`, `"resolved"`, `resolved:` and
+          #   `"resolved":` for the same key AND decodes escapes in keys, so no
+          #   literal match is ever complete; a git conflict marker also ends the
+          #   block at column 0 before either side's URL is reached. Berry is
+          #   exempt per BLOCK, keyed on `resolution:`, `checksum:`,
+          #   `languageName:` or `linkType:` at the direct-child indent — all keys
+          #   yarn v1 NEVER writes. That restriction is the point: block_berry is
+          #   the OFF-SWITCH for the fail-closed default, so a marker v1 also
+          #   writes is not a format signal but a bypass. A colon-form `version:`
+          #   was tried as a marker and withdrawn for exactly that reason (v1
+          #   accepts it too, and the extractor carries `:?` for it); a file-level
+          #   flag likewise, since one stray line dropped into a v1 lockfile — v1
+          #   ignores unknown keys — would re-exempt every entry in it.
+          #   Residual: because v1 ignores unknown keys, ANY per-block marker is
+          #   forgeable in principle. A block that both spells `resolved` in a way
+          #   the rules miss AND carries a forged Berry key is exempted and aged
+          #   against the configured registry. Narrowing the markers to keys v1
+          #   never writes makes that an obviously alien line rather than one the
+          #   block plausibly needs — a large reduction, not a proof. And a block naming TWO different
+          #   hosts is tagged rather than aged against either, since whichever
+          #   yarn would install from is unknowable here and picking first or last
+          #   is a false pass under the opposite ordering.
+          #   A BERRY entry, naming no host, is emitted untagged, so adopting this
+          #   cannot flip a Berry repo from green to red. That exemption does NOT
+          #   extend to a v1 block whose `resolved` named no host — a relative or
+          #   non-URL value — which is tagged like any other unreadable origin; a
+          #   v1 lockfile written entirely that way therefore fails the
+          #   all-skipped guard, and that is intended fail-closed behaviour rather
+          #   than an oversight. The test is whether a SCHEME was present,
+          #   not whether it was https: a pin resolved over plain `http://` from
+          #   an internal host is the same false pass one scheme over, and is
+          #   tagged.
           # - The work-list is keyed on `pkg@version`, so a change that alters
           #   WHERE a pin comes from without moving its version — `resolved`
           #   swapping registry host, or `integrity` changing under a fixed
@@ -2524,13 +2732,13 @@ jobs:
           # whole prefixes would then classify every one of those as off-registry.
           # Host identity is the property that actually matters — it is what
           # decides whether a package name means the same package.
-          # Lower-cased: hosts are case-insensitive, but the four places that
-          # derive one compare the results for raw string equality. A .npmrc
+          # Lower-cased: hosts are case-insensitive, but every place that derives
+          # one compares the results for raw string equality. A .npmrc
           # reading `registry=https://Registry.NpmJS.org` would otherwise be
           # declared a different registry from the configured one and push every
           # integrity-only entry down the off-registry path — a red check on a
-          # repo that is squarely on npmjs. Every other derivation (the pnpm awk,
-          # the package-lock jq) lower-cases to match.
+          # repo that is squarely on npmjs. Every other derivation — the pnpm awk,
+          # the package-lock jq and the yarn awk — lower-cases to match.
           # registry.yarnpkg.com is folded to registry.npmjs.org. It is not a
           # different registry — it is an alias in front of the public npm
           # registry, serving the same packages under the same names, and yarn v1
@@ -2539,8 +2747,9 @@ jobs:
           # into package-lock.json) has every pin tagged off-registry and fails
           # the all-skipped guard — a red check for pins that are squarely on
           # npmjs. The fold has to be applied to the ENTRY host too, not just
-          # here: the pnpm awk and the package-lock jq each repeat it, because
-          # their host never passes through this function.
+          # here: the pnpm awk, the package-lock jq and the yarn awk each repeat
+          # it, because their host never passes through this function. All three
+          # are repeat sites — change the fold and change them together.
           npm_age::registry_host() {
             local url="$1" scheme=""
             case "$url" in *://*) scheme="${url%%://*}" ;; esac
