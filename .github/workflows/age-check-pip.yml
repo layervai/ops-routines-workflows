@@ -201,7 +201,8 @@ jobs:
           # a diff via `$(git diff ...)` inside a helper function are protected
           # by this preflight *only* for the expected "missing base ref" failure
           # mode; for catastrophic git failures mid-script the helper still needs
-          # its own `|| { echo ::error; return 1; }` branch.
+          # its own failure branch — `preflight::git_diff_or_fail` below is that
+          # branch, and keeps the diagnosis off the caller's captured stdout.
           #
           # Also resolves "the base" ONCE, as the merge base of base_ref and HEAD,
           # and exposes it via `preflight::base_rev`. Every `git diff
@@ -287,6 +288,23 @@ jobs:
           preflight::base_rev() {
             preflight::require_base_ref_verified
             printf '%s\n' "$_PREFLIGHT_BASE_REV"
+          }
+
+          # `git diff` for the separable parsers, which `main` reads through
+          # `$(...)`. That makes a parser's stdout the work-list, so a failure is
+          # announced on stderr — where it reaches the job log and the annotations
+          # panel rather than the captured (and, under `set -e`, discarded) stdout —
+          # and the caller propagates the non-zero return:
+          #
+          #   diff_out=$(preflight::git_diff_or_fail "${base_rev}...HEAD" -- "$file") || return 1
+          preflight::git_diff_or_fail() {
+            git diff "$@" || {
+              # `%q` keeps the reproduced command re-runnable (pathspec globs stay
+              # quoted) and, unlike `$*`, does not join on the libs' newline+tab IFS.
+              local cmd; printf -v cmd ' %q' "$@"
+              echo "::error::git diff${cmd} failed" >&2
+              return 1
+            }
           }
 
           # ----- ISO-8601 → epoch helper ----------------------------------------------
@@ -519,7 +537,7 @@ jobs:
             local arg
             for arg in display_id display_version publish_time now_epoch min_age_days; do
               if [ -z "${!arg}" ]; then
-                echo "::error::preflight::age_row_for_publish: required arg \`${arg}\` was empty"
+                echo "::error::preflight::age_row_for_publish: required arg \`${arg}\` was empty" >&2
                 return 3
               fi
             done
@@ -839,8 +857,7 @@ jobs:
           pip_age::diff_requirements() {
             local file="$1" base_rev="$2"
             local diff_out
-            diff_out=$(git diff "${base_rev}"...HEAD -- "$file") \
-              || { echo "::error::git diff against ${base_rev} for ${file} failed"; return 1; }
+            diff_out=$(preflight::git_diff_or_fail "${base_rev}...HEAD" -- "$file") || return 1
             printf '%s\n' "$diff_out" \
               | awk '/^\+[^+]/' \
               | sed 's/^\+//;s/[[:space:]]*#.*$//;s/[[:space:]]\+//g' \
@@ -853,8 +870,7 @@ jobs:
             # poetry.lock uses TOML blocks [[package]] with name = "X" and version = "Y".
             # Grab added name/version pairs from the diff.
             local diff_out
-            diff_out=$(git diff "${base_rev}"...HEAD -- "$file") \
-              || { echo "::error::git diff against ${base_rev} for ${file} failed"; return 1; }
+            diff_out=$(preflight::git_diff_or_fail "${base_rev}...HEAD" -- "$file") || return 1
             printf '%s\n' "$diff_out" \
               | awk '
                 /^\+name = /    { gsub(/^\+name = "|"$/,""); name=$0; next }
@@ -878,8 +894,7 @@ jobs:
           pip_age::diff_pyproject() {
             local file="$1" base_rev="$2"
             local diff_out
-            diff_out=$(git diff "${base_rev}"...HEAD -- "$file") \
-              || { echo "::error::git diff against ${base_rev} for ${file} failed"; return 1; }
+            diff_out=$(preflight::git_diff_or_fail "${base_rev}...HEAD" -- "$file") || return 1
 
             local added_lines
             added_lines=$(printf '%s\n' "$diff_out" \
