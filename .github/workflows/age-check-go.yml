@@ -24,13 +24,17 @@ on:
         default: ""
       exempt_module_prefixes:
         description: |
-          Optional comma- or newline-separated same-owner public module paths.
+          Optional comma- or newline-separated same-owner module paths.
           Each entry must either end with "/" (a segment-safe module-path
           prefix: github.com/layervai/ matches github.com/layervai/frp but
           never github.com/layervai-evil/frp) or name one full module path to
           match exactly. A matching pin skips the age delay only after the Go
           proxy origin, exact GitHub tag, verified commit, and protected
-          default-branch ancestry agree. Malformed entries or unverifiable
+          default-branch ancestry agree. Private modules require an exact exemption entry (prefixes do not
+          select them) plus an exact private declaration. They require
+          a published non-prerelease, a verified annotated tag, and its verified
+          commit; private source releases need not be deployed first.
+          Malformed entries or unverifiable
           provenance fail closed. Prefer this over age-check-bypass, which
           skips the ENTIRE check for every dependency in the PR.
         required: false
@@ -934,7 +938,7 @@ jobs:
           #   MIN_AGE_DAYS - default 7
           #   BASE_REF     - default 'main'
           #   EXEMPT_MODULE_PREFIXES - optional comma- or newline-separated first-party
-          #                  public module paths; each entry ends with "/" (segment-safe
+          #                  module paths; each public entry ends with "/" (segment-safe
           #                  prefix) or names one full module path exactly. A match only
           #                  bypasses the age delay after exact proxy/GitHub provenance.
           #   FIRST_PARTY_MODULE_OWNER - caller repository owner; required and enforced as
@@ -1713,6 +1717,31 @@ jobs:
             printf '%s\t%s\t%s\t%s\t%s\n' "$repo" "$expected_tag" "$target_sha" "$default_branch" "$tag_kind"
           }
 
+          # Private first-party source releases can precede the coordinated deployment.
+          # They have no public proxy record: require a published release, an annotated
+          # signed tag, and its exact signed commit. The exact private declaration and
+          # same-owner exemption are both required by the caller before this function.
+          go_age::private_first_party_release() {
+            local repo="$1" version="$2" prefix="$3" kind="$4" commit="$5" verification="$6"
+            [ "${repo%%/*}" = "$FIRST_PARTY_MODULE_OWNER" ] || return 1
+            [ "$kind" = annotated ] && [ "$verification" = verified ] || return 1
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+            go_age::canonical_module_version_major "$version" >/dev/null || return 1
+            local tag="${version%+incompatible}" repo_json release_json commit_json
+            [ -z "$prefix" ] || tag="${prefix}/${tag}"
+            repo_json=$(go_age::github_json "/repos/${repo}") || return 1
+            printf '%s' "$repo_json" | jq -e --arg repo "$repo" --arg owner "$FIRST_PARTY_MODULE_OWNER" \
+              '.full_name == $repo and .owner.login == $owner and .private == true' >/dev/null || return 1
+            release_json=$(go_age::github_json "/repos/${repo}/releases/tags/${tag}") || return 1
+            printf '%s' "$release_json" | jq -e --arg tag "$tag" \
+              '.tag_name == $tag and .draft == false and .prerelease == false and
+               (.published_at | type == "string" and length > 0)' >/dev/null || return 1
+            commit_json=$(go_age::github_json "/repos/${repo}/commits/${commit}") || return 1
+            printf '%s' "$commit_json" | jq -e --arg commit "$commit" \
+              '.sha == $commit and .commit.verification.verified == true and
+               .commit.verification.reason == "valid"' >/dev/null
+          }
+
           # ----- Main -----------------------------------------------------------------
 
           go_age::main() {
@@ -1848,6 +1877,20 @@ jobs:
                     preflight::record_unverifiable "$safe_module" "$safe_version" \
                       "GitHub-verified annotated tag required"
                     failed=true
+                    continue
+                  fi
+                  if go_age::exempt_entries | grep -Fx -- "$module" >/dev/null; then
+                    if ! go_age::private_first_party_release "$private_repo" "$version" "$private_tag_prefix" "$tag_kind" "$target_commit_sha" "$verification"; then
+                      echo "::error file=${sum_file}::Could not verify private first-party release for ${module}@${version}"
+                      echo "| \`${safe_module}\` | ${safe_version} | — | :x: private first-party release unverifiable |" >> "$GITHUB_STEP_SUMMARY"
+                      preflight::record_unverifiable "$safe_module" "$safe_version" \
+                        "published release, signed tag, or signed commit missing"
+                      failed=true
+                      continue
+                    fi
+                    echo "  FIRST-PARTY PRIVATE: ${module}@${version} repo=${private_repo} tag=${tag_object_sha} commit=${target_commit_sha} release=verified"
+                    echo "| \`${safe_module}\` | ${safe_version} | — | :white_check_mark: private first-party release |" >> "$GITHUB_STEP_SUMMARY"
+                    skipped_count=$((skipped_count + 1))
                     continue
                   fi
                   if [ "$tag_kind" != "annotated" ] || [ "$verification" != "verified" ]; then
