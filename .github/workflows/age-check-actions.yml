@@ -806,7 +806,10 @@ jobs:
           # names are a separate concern — handled (if at all) by the caller's
           # `is_valid_*` ASCII-only allowlists, not here.
           preflight::safe_for_md() {
-            LC_ALL=C printf '%s' "$1" | LC_ALL=C tr -cd '[:alnum:]@/_.:+-' | LC_ALL=C head -c 80
+            # $2 is an optional length; the default keeps a summary-table cell
+            # readable. A log annotation has no table to fit and can carry more —
+            # a git URL loses its commit fragment at 80.
+            LC_ALL=C printf '%s' "$1" | LC_ALL=C tr -cd '[:alnum:]@/_.:+-' | LC_ALL=C head -c "${2:-80}"
           }
 
           # ----- Operational knobs ----------------------------------------------------

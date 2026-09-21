@@ -77,6 +77,13 @@ on:
           fully-vendored repo on those already passes. Setting this
           changes nothing for them.
 
+          Whether or not this is set, a pnpm entry NEWLY vendored on the
+          branch (git, tarball, link:, file:, workspace:, portal:) is annotated
+          as a `::notice` on the lockfile and an info row in the step
+          summary. Visibility only: it never fails the run and is never
+          counted as skipped. package-lock.json and yarn.lock get no
+          such notice today.
+
           One caveat in a repo with more than one lockfile kind: this
           makes the pnpm file pass, but the run as a whole can still
           fail if another lockfile has packages that could not be
@@ -915,7 +922,10 @@ jobs:
           # names are a separate concern — handled (if at all) by the caller's
           # `is_valid_*` ASCII-only allowlists, not here.
           preflight::safe_for_md() {
-            LC_ALL=C printf '%s' "$1" | LC_ALL=C tr -cd '[:alnum:]@/_.:+-' | LC_ALL=C head -c 80
+            # $2 is an optional length; the default keeps a summary-table cell
+            # readable. A log annotation has no table to fit and can carry more —
+            # a git URL loses its commit fragment at 80.
+            LC_ALL=C printf '%s' "$1" | LC_ALL=C tr -cd '[:alnum:]@/_.:+-' | LC_ALL=C head -c "${2:-80}"
           }
 
           # ----- Operational knobs ----------------------------------------------------
@@ -1103,6 +1113,20 @@ jobs:
           #              comparator's fail-closed branch is unreachable.
           #
           #              RECORD GRAMMAR:  [ "offregistry" TAB ] pkg "@" version
+          #                             |  "vendored" TAB key
+          #
+          #              A `vendored` record is a pnpm key that names a SOURCE
+          #              rather than a version — git, tarball, link:, file:,
+          #              workspace:, portal:, or a v5 key qualified with another registry
+          #              host — carried verbatim (minus YAML quoting) so a
+          #              reviewer can grep the lockfile for it. It has no publish
+          #              date, so main REPORTS it and never gates on it. It is in
+          #              the stream, rather than only counted, for the same reason
+          #              the offregistry tag is: a record that reaches neither
+          #              side of the set difference is invisible, and a PR that
+          #              vendored a brand-new dependency into a lockfile whose
+          #              registry pins did not move used to report "No new
+          #              dependencies" and go green with no annotation.
           #
           #              Classifying the registry is an extractor OBLIGATION, not
           #              an option. An extractor that emits a bare `pkg@version`
@@ -1161,6 +1185,14 @@ jobs:
             return 0
           fi
           _NPM_LOCKFILE_PARSERS_SOURCED=1
+
+          # The two ways a record stream is split by its kind column, kept beside
+          # the grammar so the predicate is spelled once. A tagged record is
+          # `<kind><TAB>...`; a bare pin has no tab at all. grep exits 1 when it
+          # selects nothing — an ordinary outcome for both — so only a status
+          # above 1 is a failure.
+          npm_age::records_of_kind()     { grep    "^${1}$(printf '\t')" || [ $? -eq 1 ]; }
+          npm_age::records_not_of_kind() { grep -v "^${1}$(printf '\t')" || [ $? -eq 1 ]; }
 
           # ----- Separable: read lockfile diff → pkg@version lines on stdout ----------
           #
@@ -1760,15 +1792,20 @@ jobs:
           # than dropped, so that a newly added private package is reported as
           # skipped instead of vanishing from both sides of the set difference.
           #
-          # $1 selects the output: "entries" (default) prints one pkg@version per
-          # line, prefixed with "offregistry<TAB>" for an entry that resolves
-          # somewhere other than want_host; "counts" prints
-          # "<non-registry> <unreadable>" — there is no off-registry count,
-          # because such an entry is PRINTED in entries mode, which makes the
-          # zero-entry path that reads "counts" unreachable for it. The caller uses "counts"
-          # only on the zero-entry path, to tell a format it could not read apart
-          # from one it read fine whose every entry is git-, tarball-, link- or
-          # workspace-sourced. Both fail closed; asserting the wrong cause is what
+          # $1 selects the output: "entries" (default) prints one record per
+          # line — `pkg@version`, prefixed with "offregistry<TAB>" for an entry
+          # that resolves somewhere other than want_host, or "vendored<TAB>" plus
+          # the verbatim key for one that names a source rather than a version;
+          # "counts" prints "<non-registry> <unreadable> <resolutions>". There is
+          # no off-registry count, because such an entry is PRINTED in entries
+          # mode, which makes the zero-pin path that reads "counts" unreachable
+          # for it; the vendored count is kept because that path DOES need it — a
+          # vendored record is not a pin, so a fully vendored lockfile still has
+          # no pins to gate. The caller reads the first two fields on the zero-pin
+          # path, to tell a format it could not read apart from one it read fine
+          # whose every entry is git-, tarball-, link- or workspace-sourced; the
+          # third is the denominator for its shortfall guard (see the
+          # `resolutions` counter below). Both fail closed; asserting the wrong cause is what
           # burns whoever debugs it.
           #
           # awk vars: want_host is the configured registry host, default_host the
@@ -1999,6 +2036,42 @@ jobs:
                 # If a future pnpm changes that indent this parses to zero and takes
                 # the fail-closed path below — visible, not silent.
                 if ($0 !~ /^  [^[:space:]].*:\r?$/) {
+                  # Denominator for the shortfall guard in diff_pnpm_lock: every
+                  # entry in a pnpm `packages:` map carries exactly one
+                  # `resolution:`, v5 through v9, written as a direct child of the
+                  # two-space key — so EXACTLY four spaces. Counted ONCE per key
+                  # (res_seen), independently of whether the key itself parsed:
+                  # the whole point is to know how many entries the file declares
+                  # when the key matcher could not read some of them. That is the
+                  # case the all-or-nothing zero-pin guard below cannot see — a
+                  # format that respelled most keys but left one recognisable
+                  # gates that one and renders "Verified 1 package(s)".
+                  #
+                  # The exact indent is what keeps the count from over-detecting.
+                  # A `resolution:` inside a nested block scalar — a `deprecated: |`
+                  # whose prose contains the word — cannot land on it, because YAML
+                  # requires block content to sit deeper than the key introducing
+                  # it, and that key is itself at four spaces. `in_packages` rules
+                  # out the same line under `importers:` or `snapshots:`, where v9
+                  # repeats every package. Both are load-bearing: a bare grep -c
+                  # would double the denominator on every real v9 lockfile.
+                  #
+                  # res_seen and the indent overlap on purpose. pnpm writes
+                  # `resolution:` as the FIRST body line, so under a key that has
+                  # one, res_seen alone already ignores anything deeper that
+                  # follows; the indent is what stops a nested line from being
+                  # counted under a key that has NO resolution of its own — which
+                  # is exactly the unreadable-key shape the denominator exists to
+                  # notice, and where a false count would become a false shortfall.
+                  # test_pnpm_shortfall_denominator_needs_the_exact_indent pins the
+                  # indent on its own; the block-scalar test pins the pair.
+                  #
+                  # Deliberately STRICTER than the `resolution:` grep the zero-pin
+                  # path runs. That one is a fail-closed sentinel and wants to
+                  # over-detect; this one triggers a failure by itself and wants
+                  # to under-detect. Each errs toward safety in its own direction.
+                  if (!res_seen && $0 ~ /^    resolution:/) { resolutions++; res_seen = 1 }
+
                   # Not a key, so it is a body line of the entry whose key was
                   # read last — where `resolution:` lives, and with it the only
                   # statement the lockfile makes about where the package came
@@ -2071,11 +2144,22 @@ jobs:
                   next
                 }
                 flush()
+                res_seen = 0
                 key = $0
                 sub(/^[[:space:]]+/, "", key)
                 sub(/:\r?$/, "", key)
 
                 key = unquote(key)
+
+                # The key as the lockfile spells it, saved before the peer-suffix,
+                # leading-slash and registry-host normalisation below — that
+                # normalisation exists to split a NAME from a VERSION, and a
+                # vendored key has neither. This is the payload of a `vendored`
+                # record, so what the reviewer reads is what they can grep for.
+                # Verbatim includes a v6 peer suffix, so a vendored dependency
+                # whose peer version changed reads as a new record: a notice, not
+                # a gate, for a resolution that genuinely did change.
+                raw = key
 
                 # v6/v9 peer suffix, stripped before the split: a scoped peer in
                 # vue-loader@15.9.8(@vue/compiler-sfc@3.0.0) would otherwise own
@@ -2156,6 +2240,7 @@ jobs:
                   # is `slashed` and has already matched the v5 arm above, and a
                   # scoped name whose scope contains a dot (`@foo.bar/baz@1.0.0`)
                   # is excluded by the leading "@".
+                  if (mode == "entries") print "vendored\t" raw
                   nonregistry++
                   next
                 } else if (match(key, /@[^@]*$/)) {  # v6/v9
@@ -2218,6 +2303,7 @@ jobs:
                 if (ver ~ /:\/\// \
                     || ver ~ /^(file|link|workspace|portal|git|git\+[a-z]+|https?|ssh):/ \
                     || ver ~ /^[^\/]+\.[^\/]+\//) {
+                  if (mode == "entries") print "vendored\t" raw
                   nonregistry++
                   next
                 }
@@ -2228,7 +2314,7 @@ jobs:
 
               END {
                 flush()
-                if (mode == "counts") print nonregistry + 0, unreadable + 0
+                if (mode == "counts") print nonregistry + 0, unreadable + 0, resolutions + 0
               }
             '
           }
@@ -2280,70 +2366,83 @@ jobs:
             head_entries=$(npm_age::parse_pnpm_lock < "$lockfile") \
               || { echo "::error file=${lockfile}::could not read ${lockfile}; the parser itself failed" >&2; return 1; }
 
-            if [ -z "$head_entries" ]; then
-              # Nothing parsed. Two very different situations, and warning on both
-              # would leave the silent pass reachable: for a pnpm-only repo the
-              # non-registry entries no longer reach `skipped_count`, so the
-              # all-skipped guard in main cannot fire either, and a lockfileVersion
-              # that restructures `packages:` would go green with one annotation —
-              # the v9 bug again, one log line louder.
-              #
+            # How many PINS — bare and offregistry records, what main can
+            # age-check — the head declares. `vendored` records are keys naming a
+            # source rather than a version, carried so a vendored ARRIVAL is
+            # reported instead of vanishing from both sides of the difference.
+            # Every "is there anything to gate" decision below reads this count:
+            # judged on the whole stream, a fully vendored lockfile would look
+            # non-empty here and skip the registry-free classification it needs.
+            # `grep -c` prints a count and exits 1 when that count is 0, so a
+            # printed "0" is the one non-zero status accepted. Anything else — the
+            # kind helper failing, a read error — is a real failure and must not
+            # be laundered into "no pins", which would route a lockfile full of
+            # pins into the zero-pin triage.
+            local pins_n
+            pins_n=$(printf '%s\n' "$head_entries" | npm_age::records_not_of_kind vendored | grep -c .) \
+              || [ "${pins_n:-}" = 0 ] \
+              || { echo "::error file=${lockfile}::could not count the pins in ${lockfile}" >&2; return 1; }
+
+            # Probed unconditionally, where it used to run only when nothing
+            # parsed: the shortfall guard further down needs the third field on
+            # the path where pins DID parse, which is the path it exists for. One
+            # more awk pass over the head image, only on a lockfile that actually
+            # changed — the unchanged-file short-circuit above still returns
+            # before any of this.
+            # Checked for the same reason head_entries is: errexit is suppressed
+            # for this whole function. Unchecked, a failing awk yields an empty
+            # count, falls past the zero-pin branch to the `resolution:` grep, and
+            # reports a format this check cannot understand — the misdiagnosis
+            # `counts` exists to prevent, reached by a different door.
+            # Explicit IFS: the script sets IFS=$'\n\t' globally, so a bare `read`
+            # would not split this triple on its spaces.
+            local counts nonregistry unreadable resolutions
+            counts=$(npm_age::parse_pnpm_lock counts < "$lockfile") \
+              || { echo "::error file=${lockfile}::could not count entries in ${lockfile}; the parser itself failed" >&2; return 1; }
+            IFS=' ' read -r nonregistry unreadable resolutions <<< "$counts"
+            # Three non-negative integers, or fail closed. Every guard below is an
+            # arithmetic test; on an empty or short triple those tests error and
+            # read FALSE, which would sail a lockfile past the unreadable, zero-pin
+            # and shortfall checks at once — fail-open in exactly the "the parser
+            # misbehaved" case they exist for. Unreachable while the awk prints
+            # its `+ 0` fields, which is the point of checking it here.
+            case "${nonregistry:-x}${unreadable:-x}${resolutions:-x}" in
+              *[!0-9]*)
+                echo "::error file=${lockfile}::could not count entries in ${lockfile}; the parser returned '${counts}'" >&2
+                return 1
+                ;;
+            esac
+
+            # Two of the zero-pin outcomes need no base image, and are decided
+            # before one is fetched: an unreadable format, and a lockfile with no
+            # vendored entries either — which is wholly unparsed or genuinely
+            # dependency-free. Deciding them first keeps a 10 MB+ base blob from
+            # being fetched and parsed for a run that fails a few lines later, and
+            # keeps a base-side failure from preempting the HEAD diagnosis: a
+            # `git show` failure or a base parse failure would otherwise return
+            # first and point the operator at the base image when the actionable
+            # fact is the head format.
+            #
+            # Unreadable wins, deliberately. The unreadable and vendored branches
+            # offer opposite remedies — pin back and tell the maintainers, versus
+            # set allow_registry_free, which turns the gate OFF for this repo
+            # permanently. A format whose keys still split but spell versions
+            # differently would otherwise land on the second one, and the
+            # operator would disable the check to clear a red build.
+            if [ "$pins_n" -eq 0 ] && [ "$unreadable" -gt 0 ]; then
+              echo "::error file=${lockfile}::${lockfile} has ${unreadable} package key(s) whose version this check could not read — its lockfileVersion is not one this check understands, so nothing was verified. Until this check is taught the new format, pin your caller to the previous ops-routines-workflows release SHA and tell the ops-routines maintainers." >&2
+              return 1
+            fi
+            if [ "$pins_n" -eq 0 ] && [ "$nonregistry" -eq 0 ]; then
               # `resolution:` is the one key pnpm has kept on every entry from v5
               # through v9, so it survives the section rename that would defeat the
               # parser. Its presence means the file demonstrably has packages we
-              # failed to read: verify nothing, fail closed.
-              # Checked for the same reason head_entries is: errexit is suppressed
-              # for this whole function. Unchecked, a failing awk yields an empty
-              # count, falls past the branch below to the `resolution:` grep, and
-              # reports a format this check cannot understand — the misdiagnosis
-              # `counts` exists to prevent, reached by a different door.
-              # Explicit IFS: the script sets IFS=$'\n\t' globally, so a bare
-              # `read` would not split this pair on its space.
-              local counts nonregistry=0 unreadable=0
-              counts=$(npm_age::parse_pnpm_lock counts < "$lockfile") \
-                || { echo "::error file=${lockfile}::could not count entries in ${lockfile}; the parser itself failed" >&2; return 1; }
-              IFS=' ' read -r nonregistry unreadable <<< "$counts"
-
-              # Unreadable wins, deliberately. These two branches offer opposite
-              # remedies — pin back and file an issue, versus set
-              # allow_registry_free, which turns the gate OFF for this repo
-              # permanently. A format whose keys still split but spell versions
-              # differently would otherwise land on the second one, and the
-              # operator would disable the check to clear a red build.
-              if [ "${unreadable:-0}" -gt 0 ]; then
-                echo "::error file=${lockfile}::${lockfile} has ${unreadable} package key(s) whose version this check could not read — its lockfileVersion is not one this check understands, so nothing was verified. Until this check is taught the new format, pin your caller to the previous ops-routines-workflows release SHA and tell the ops-routines maintainers." >&2
-                return 1
-              fi
-
-              if [ "${nonregistry:-0}" -gt 0 ]; then
-                # Unlike the unreadable-format branch below — a bug in this check
-                # that someone can fix — a repo that genuinely vendors everything
-                # through git deps would hit this on every PR that touches the
-                # lockfile. There is no per-repo opt-out for that today, and
-                # age-check-bypass is not one: it is reserved for verified-CVE
-                # overrides, so recommending it for a permanent, benign repo
-                # shape would erode the signal wherever the label is audited.
-                # Say what is true instead of offering the wrong escape hatch.
-                # Explicit truthy match, not `-n`: this variable's only job is to
-                # weaken a supply-chain control, and `=false` or `=0` turning it ON
-                # is a footgun for a local run or a future template edit. The
-                # workflow expression yields '' for false, so the supported path is
-                # unaffected either way.
-                case "${AGE_CHECK_ALLOW_REGISTRY_FREE:-}" in
-                  1|true|TRUE|True|yes|YES|Yes)
-                    echo "::warning file=${lockfile}::${lockfile} resolves ${nonregistry} package(s), none of them from a registry — nothing in this file was age-checked. Passing because allow_registry_free is set." >&2
-                    return 4
-                    ;;
-                esac
-                echo "::error file=${lockfile}::${lockfile} resolves ${nonregistry} package(s), none of them from the public npm registry (git, tarball, link:, file: or workspace: sources — or, in a v5 lockfile, keys qualified with a private registry host) — nothing could be age-checked. If that is this repo's permanent shape, pass allow_registry_free: true to the reusable workflow; age-check-bypass is for verified-CVE overrides only (runbooks/phase-0-checklist.md) and should not be applied every PR." >&2
-                return 3
-              fi
-
+              # failed to read: verify nothing, fail closed. No knob covers this
+              # one, and the sibling error correctly steers operators away from
+              # age-check-bypass — so the message has to name the remediation that
+              # does exist, or it fails a required check while forbidding every
+              # escape it mentions.
               if grep -qE '^[[:space:]]+resolution:' "$lockfile"; then
-                # No knob covers this one, and the sibling error correctly steers
-                # operators away from age-check-bypass — so the message has to name
-                # the remediation that does exist, or it fails a required check
-                # while forbidding every escape it mentions.
                 echo "::error file=${lockfile}::${lockfile} declares resolved packages but no package key could be parsed — its lockfileVersion is not one this check understands, so nothing was verified. Until this check is taught the new format, pin your caller to the previous ops-routines-workflows release SHA and tell the ops-routines maintainers." >&2
                 return 1
               fi
@@ -2353,8 +2452,76 @@ jobs:
               return 0
             fi
 
-            # An absent base image means a brand-new lockfile, and an empty base
-            # set is the right answer for it.
+            # The zero-pin triage above is all-or-nothing, and a format that
+            # respelled most keys while leaving one recognisable would sail past it
+            # and render "Verified 1 package(s)": a green check asserting coverage
+            # it does not have. So account for every entry the file declares, not
+            # merely for one — and do it HERE, on both paths: a lockfile whose only
+            # readable keys are vendored ones is the same partial parse, and used
+            # to reach the allow_registry_free pass below with no diagnosis at all.
+            #
+            # `resolutions` counts the `resolution:` line pnpm writes under every
+            # key in `packages:`; a key this parser read is either a pin or a
+            # counted vendored entry. Anything left over is an entry that exists,
+            # resolves to something, and was gated by nothing — including the
+            # `unreadable` keys, which are deliberately NOT added to `accounted` so
+            # they surface here instead of being silently dropped on the path
+            # where other entries parsed, and the keys with no "@" at all, which
+            # leave the parser through a branch that counts nothing. Needs no
+            # base image, which is why it sits above the fetch.
+            #
+            # Fails rather than warns, and with no margin, because the denominator
+            # is built to under-count rather than over-count (see the `resolutions`
+            # counter in the parser): every way it can be wrong makes `resolutions`
+            # too SMALL, which cannot trip this branch. A shortfall therefore means
+            # the parser demonstrably missed something, which is the silent pass
+            # this whole function exists to stop.
+            local accounted
+            accounted=$(( pins_n + nonregistry ))
+            if [ "$resolutions" -gt "$accounted" ]; then
+              echo "::error file=${lockfile}::${lockfile} declares $(( resolutions - accounted )) more resolved package(s) than this check could account for (${resolutions} resolved; ${pins_n} readable pins, ${nonregistry} vendored, ${unreadable} unreadable) — its lockfileVersion is not fully one this check understands, so the packages it did verify are not the whole file. Until this check is taught the format, pin your caller to the previous ops-routines-workflows release SHA and tell the ops-routines maintainers." >&2
+              return 5
+            fi
+
+            # The remaining zero-pin outcome: vendored entries only. Decided here,
+            # BEFORE the base image is fetched, because the failing answer (rc 3)
+            # never needs it — only the allow_registry_free pass does, for the
+            # arrivals it reports under rc 4, and that pass falls through to the
+            # same base fetch and the same trailing difference every other pass
+            # takes. Every record on this path is a vendored one, so that
+            # difference is exactly the arrivals list.
+            local rc=0
+            if [ "$pins_n" -eq 0 ]; then
+              # Unlike the unreadable-format branch above — a bug in this check
+              # that someone can fix — a repo that genuinely vendors everything
+              # through git deps would hit this on every PR that touches the
+              # lockfile. There is no per-repo opt-out for that today, and
+              # age-check-bypass is not one: it is reserved for verified-CVE
+              # overrides, so recommending it for a permanent, benign repo
+              # shape would erode the signal wherever the label is audited.
+              # Say what is true instead of offering the wrong escape hatch.
+              # Explicit truthy match, not `-n`: this variable's only job is to
+              # weaken a supply-chain control, and `=false` or `=0` turning it ON
+              # is a footgun for a local run or a future template edit. The
+              # workflow expression yields '' for false, so the supported path is
+              # unaffected either way.
+              case "${AGE_CHECK_ALLOW_REGISTRY_FREE:-}" in
+                1|true|TRUE|True|yes|YES|Yes)
+                  echo "::warning file=${lockfile}::${lockfile} resolves ${nonregistry} package(s), none of them from a registry — nothing in this file was age-checked. Passing because allow_registry_free is set." >&2
+                  rc=4
+                  ;;
+                *)
+                  echo "::error file=${lockfile}::${lockfile} resolves ${nonregistry} package(s), none of them from the public npm registry (git, tarball, link:, file:, workspace: or portal: sources — or, in a v5 lockfile, keys qualified with a private registry host) — nothing could be age-checked. If that is this repo's permanent shape, pass allow_registry_free: true to the reusable workflow; age-check-bypass is for verified-CVE overrides only (runbooks/phase-0-checklist.md) and should not be applied every PR." >&2
+                  return 3
+                  ;;
+              esac
+            fi
+
+            # The base image. It used to be read only once the head had something
+            # to gate, which meant the allow_registry_free pass returned without it — and so could not
+            # report a vendored arrival on exactly the repo shape most likely to
+            # vendor something. An absent base image means a brand-new lockfile,
+            # and an empty base set is the right answer for it.
             # `<rev>:./<path>` — see diff_package_lock: the "./" keeps this
             # cwd-relative and therefore consistent with the `git diff` pathspec
             # above under the caller's `working_directory`.
@@ -2366,9 +2533,10 @@ jobs:
             # monorepo lockfile (10 MB+ is ordinary) in memory and copy it again
             # through the pipe. The redirect gives the error check for neither
             # cost. (The parsed entry lists below are still shell variables —
-            # smaller than the blob by a large constant, but not free.) Same mktemp + `trap ... RETURN` idiom as npm_age::published_at
-            # — the trap fires only when THIS function returns, not when the
-            # parser it calls does.
+            # smaller than the blob by a large constant, but not free.) Same
+            # mktemp + `trap ... RETURN` idiom as npm_age::published_at — the trap
+            # fires only when THIS function returns, not when the parser it calls
+            # does.
             local base_blob
             # Checked: errexit is suppressed for this whole function, so an
             # unchecked mktemp would leave base_blob empty and let `git show > ""`
@@ -2387,29 +2555,32 @@ jobs:
             # a lockfile this branch adds, an untracked one (the ls-files guard
             # above deliberately routes those here), or a working_directory that
             # does not match where the lockfile lives.
-            # `base_counts` is assigned inside the classifier below and read only
-            # there; no initializer, so a stale value cannot survive into a later
-            # iteration. (An earlier `|| echo 0` on that assignment was removed as
-            # misleading — it landed on the same `unreadable` state the current
-            # short-circuit does, so it drew a distinction the code never made.)
-            # `counts` prints "<non-registry> <unreadable>"; only the first field
-            # answers "did this image parse into source-shaped keys?".
-            local base_entries="" base_state=absent base_counts base_nonreg
+            # The stream answers every question the classifier has: pins present
+            # is `ok`; no pins but vendored records is `vendored` — read fine,
+            # everything resolves through git/tarball/link, the ordinary case of a
+            # repo migrating OFF vendored dependencies, and without this arm the
+            # `resolution:` probe claims the image is unreadable. The separate
+            # `counts` pass this arm used to run was a third full traversal of a
+            # blob the comment above puts at 10 MB+.
+            local base_entries="" base_state=absent
             if git cat-file -e "${base_rev}:./${lockfile}" 2>/dev/null; then
               git show "${base_rev}:./${lockfile}" > "$base_blob" \
                 || { echo "::error::git show ${base_rev}:${lockfile} failed" >&2; return 2; }
               base_entries=$(npm_age::parse_pnpm_lock < "$base_blob") \
                 || { echo "::error file=${lockfile}::could not read the base image of ${lockfile}; the parser itself failed" >&2; return 1; }
-              if [ -n "$base_entries" ]; then
+              # Counted, not probed with `grep -q`: a reader that exits on the first
+              # match leaves the upstream grep writing into a closed pipe once the
+              # base has more pins than a pipe buffer holds (~2,600), it dies of
+              # SIGPIPE, the helper reports failure, and under pipefail the whole
+              # test reads false — filing a monorepo base as `vendored` and warning
+              # that its entire lockfile is being promoted. `grep -c` drains.
+              local base_pins_n
+              base_pins_n=$(printf '%s\n' "$base_entries" | npm_age::records_not_of_kind vendored | grep -c .) \
+                || [ "${base_pins_n:-}" = 0 ] \
+                || { echo "::error file=${lockfile}::could not count the pins in the base image of ${lockfile}" >&2; return 2; }
+              if [ "$base_pins_n" -gt 0 ]; then
                 base_state=ok
-              elif base_counts=$(npm_age::parse_pnpm_lock counts < "$base_blob") \
-                   && { IFS=' ' read -r base_nonreg _ <<< "$base_counts"; \
-                        [ "${base_nonreg:-0}" -gt 0 ]; }; then
-                # Read fine; everything in it resolves through git/tarball/link.
-                # Without this arm the `resolution:` probe below claims the base
-                # image is unreadable — the same misdiagnosis the head side has
-                # three branches to avoid, and it fires for the ordinary case of
-                # a repo migrating OFF vendored dependencies.
+              elif [ -n "$base_entries" ]; then
                 base_state=vendored
               elif grep -qE '^[[:space:]]+resolution:' "$base_blob"; then
                 base_state=unreadable
@@ -2420,15 +2591,14 @@ jobs:
 
             # Every state but `ok` means the difference is taken against an empty
             # base set, so the WHOLE head lockfile is promoted to "newly added" —
-            # the entire transitive tree, each entry paying `sleep 0.2` and a
+            # the entire transitive tree, each pin paying `sleep 0.2` and a
             # registry round trip. On a real tree that is a job timeout, and a
             # timeout reads as flake, so each case says whether re-running helps.
-            if [ "$base_state" != ok ]; then
-              # The count matters as much as the category: "treating 3 entries as
-              # newly added" and "treating 4,000" are different situations, and if
-              # the second one times out the log should already have said so.
-              local promoted; promoted=$(printf '%s\n' "$head_entries" | grep -c . || true)
-              local promo="all ${promoted} entries in ${lockfile} are being treated as newly added, which at this size can exhaust the job timeout"
+            # Counted in PINS, because that is what pays for a round trip; a
+            # vendored record costs nothing here — so on the rc-4 path, which has
+            # none, there is nothing to warn about.
+            if [ "$base_state" != ok ] && [ "$pins_n" -gt 0 ]; then
+              local promo="all ${pins_n} entries in ${lockfile} are being treated as newly added, which at this size can exhaust the job timeout"
               case "$base_state" in
                 absent)
                   echo "::warning file=${lockfile}::${lockfile} has no image at the merge base — ${promo}, and a timeout will read as flake rather than as this. Expected for a lockfile this branch adds; if instead the file is untracked or working_directory does not match where it lives, that is the thing to fix." >&2
@@ -2445,12 +2615,22 @@ jobs:
               esac
             fi
 
-            # `comm` reads an empty operand as the empty set, so neither case
-            # above needs special handling here; both sides are sorted under the
-            # same collation so it can stream them.
+            # The full-line difference, inline. preflight::new_lines_since_base is
+            # the shared comparator, but it reads and parses both images itself —
+            # this function has already done that, because it classifies the base
+            # image on the way (base_state), which the shared helper deliberately
+            # does not own. `comm` reads an empty operand as the empty set, so the
+            # absent-base case needs nothing special; a failure of the comparison
+            # itself is a failure, not "nothing changed". Vendored records ride the
+            # same difference, so only one that ARRIVED on this branch is emitted:
+            # the entries already live across the fleet do not re-announce
+            # themselves on every PR that touches their lockfile. `rc` is 4 on the
+            # allow_registry_free pass and 0 otherwise.
             LC_ALL=C comm -13 \
               <(printf '%s\n' "$base_entries" | LC_ALL=C sort -u) \
-              <(printf '%s\n' "$head_entries" | LC_ALL=C sort -u)
+              <(printf '%s\n' "$head_entries" | LC_ALL=C sort -u) \
+              || { echo "::error file=${lockfile}::could not compare ${lockfile} against its base image" >&2; return 1; }
+            return "$rc"
           }
 
           # ============================================================================
@@ -2508,6 +2688,11 @@ jobs:
           #   4 - as 3, but `allow_registry_free` says that is intended. A pass,
           #       reported separately so the run does not render as a verified one
           #       when nothing was verified.
+          #   5 - read, but not read WHOLE: the file declares more resolved
+          #       packages than the parser accounted for, so what it did verify is
+          #       not the whole file. Kept apart from 1 because the operator is
+          #       looking at a lockfile that parses. pnpm only, like 3 and 4 —
+          #       package-lock and yarn return only 0, 1 and 2.
           #
           # Exit codes:
           #   0 - every added or bumped dependency is >= MIN_AGE_DAYS old
@@ -2545,19 +2730,25 @@ jobs:
           #   at a bypass. A wholly-private lockfile CAN be gated now, by naming
           #   that registry; what cannot be gated is one whose registry this runner
           #   cannot reach.
-          # - Entries the `.resolved` filter DROPS are invisible, not skipped. A
-          #   pin with `git+ssh://`, plain `http://`, or no `.resolved` at all
-          #   never enters the work-list, so it counts toward neither
-          #   checked_count nor skipped_count. The yarn protocol allowlist drops
-          #   `github:`, `patch:` and friends the same way — same class, same
-          #   invisibility. A change that moves only such pins
-          #   therefore prints "No new dependencies" and the footer renders
-          #   "Verified 0 package(s) :white_check_mark:" — the all-skipped guard
-          #   cannot fire because nothing was skipped. The same pins over
-          #   `https://` from a private host would 404 into skipped_private and
-          #   correctly fail. Not a regression (the filter predates the bump
-          #   work), but it is the one empty-work-list path this change did not
-          #   harden; tracked separately.
+          # - Entries the package-lock `.resolved` filter DROPS are invisible,
+          #   not skipped, and the yarn protocol allowlist drops `github:`,
+          #   `patch:` and friends the same way. A pin with `git+ssh://`, plain
+          #   `http://`, or no `.resolved` at all never enters the work-list, so
+          #   it counts toward neither checked_count nor skipped_count; a change
+          #   that moves only such pins prints "No new dependencies" and the
+          #   footer renders "Verified 0 package(s) :white_check_mark:". pnpm NO
+          #   LONGER has this hole: its parser emits a `vendored` record for every
+          #   key naming a source (see the RECORD GRAMMAR in
+          #   lib/_npm-lockfile-parsers.sh), the record rides the same base/head
+          #   difference as a pin, and one that ARRIVED on the branch renders as a
+          #   `::notice` on the lockfile and an `:information_source:` row. That
+          #   is visibility only — no publish date, so nothing to threshold — and
+          #   it never touches skipped_count, because counting it there would feed
+          #   the all-skipped guard and fail a lockfile whose only change is one
+          #   vendored entry. Bringing package-lock and yarn up to the same
+          #   behaviour needs an inverted jq predicate with its own extraction,
+          #   and a non-registry classifier yarn does not have yet; tracked
+          #   separately.
           # - WHICH REGISTRY a pin came from is decided from its RESOLUTION, never
           #   from its key, and only pins on AGE_CHECK_REGISTRY_URL are aged. This
           #   used to be a prefix test for `https://`, which a private registry
@@ -2708,7 +2899,14 @@ jobs:
           #   future lockfileVersion that renamed or restructured that map would
           #   parse as "no packages" — which is why it fails closed when a lockfile
           #   declares resolved packages it cannot parse, rather than returning an
-          #   empty work-list in silence.
+          #   empty work-list in silence. That zero-parse guard is all-or-nothing,
+          #   so a second one covers the partial case: every entry in `packages:`
+          #   carries a `resolution:`, those lines are counted (once per key, at
+          #   the exact four-space indent, inside `packages:` only) and the pins
+          #   plus the vendored records must account for all of them. A shortfall
+          #   — a respelled key beside a readable one — fails the run with the
+          #   counts (rc 5), reported as a partial parse rather than an unreadable
+          #   file, because the operator is looking at a lockfile that parses.
           # - The pnpm parser has not been fuzzed against workspace / overrides
           #   edge cases the way the package-lock.json path has.
           #
@@ -3136,6 +3334,52 @@ jobs:
 
           # ----- Main -----------------------------------------------------------------
 
+          # Reports every `vendored` record in $2 (a work-list, any records) as a
+          # newly vendored arrival in the lockfile whose already-sanitized name is
+          # $1: a `::notice file=` on the
+          # lockfile, and an `:information_source:` summary row. Called from main,
+          # and it reads and writes main's `vendored_count` / `vendored_rows`
+          # through dynamic scoping — the same contract preflight::age_row_and_tally
+          # has on `checked_count` and `failed`.
+          #
+          # A notice, never a gate: a vendored entry has no publish date, so there
+          # is no age to threshold, and failing on one would mean failing a PR
+          # over a fact this check cannot evaluate. It is not counted as skipped
+          # either — that would feed the all-skipped guard and fail a lockfile
+          # whose only change is a single vendored entry. What the reviewer gets is
+          # the fact that this branch started resolving code from somewhere other
+          # than the registry, which for a supply-chain control is the sentence
+          # worth surfacing.
+          #
+          # Rows are capped like the off-registry ones: a fully vendored monorepo
+          # promoting its whole lockfile would otherwise write one row per entry,
+          # and past 1 MiB Actions discards the step summary entirely. Counting is
+          # never capped, so the footer can say how many were held back.
+          npm_age::report_vendored_arrivals() {
+            local safe_file="$1" records="$2" rec key safe_key
+            while IFS= read -r rec; do
+              [ -n "$rec" ] || continue
+              key="${rec#*$'\t'}"
+              vendored_count=$((vendored_count + 1))
+              [ "$vendored_rows" -lt "$VENDORED_ROW_CAP" ] || continue
+              # Sanitized like a package name, and for the same reason: the key is
+              # lockfile-controlled text. safe_for_md keeps ":" and "/" — a
+              # vendored key is mostly those — so a crafted key could still spell
+              # `::error::`, which is why it sits mid-line behind a `::notice
+              # file=` prefix where Actions will not parse a workflow command.
+              #
+              # Two lengths: the summary ROW keeps the default 80 so the table stays
+              # readable, but the annotation is what asks the reviewer to judge the
+              # source, and at 80 a git URL loses exactly the part that identifies
+              # the pinned commit — so the log line carries 200.
+              safe_key=$(preflight::safe_for_md "$key")
+              local safe_key_long; safe_key_long=$(preflight::safe_for_md "$key" 200)
+              echo "::notice file=${safe_file}::${safe_key_long} — newly resolved from outside the configured registry (git, tarball, link:, file:, workspace: or portal: — or, in a v5 lockfile, a key qualified with another registry host). Not age-checked: a vendored entry has no publish date. Confirm the source is one this repo intends to pull code from."
+              echo "| \`${safe_key}\` | — | — | :information_source: new non-registry source (not age-checked) |" >> "$GITHUB_STEP_SUMMARY"
+              vendored_rows=$((vendored_rows + 1))
+            done < <(printf '%s\n' "$records" | npm_age::records_of_kind vendored)
+          }
+
           # Runs on shell exit. Enforces the invariant that a FAILING run never
           # leaves $AGE_CHECK_FAILURES_FILE empty.
           #
@@ -3293,6 +3537,11 @@ jobs:
             # per type per step anyway, so the flood was mostly invisible.)
             local offregistry_rows=0
             local -r OFFREGISTRY_ROW_CAP=50
+            # Vendored records reported, and rows written for them — capped for
+            # the same reason as the off-registry rows. Written by
+            # npm_age::report_vendored_arrivals through dynamic scoping.
+            local vendored_count=0 vendored_rows=0
+            local -r VENDORED_ROW_CAP=50
 
             # Lockfiles actually inspected, for the all-skipped guard's failure row.
             local -a processed=()
@@ -3424,6 +3673,10 @@ jobs:
                 echo "| \`${safe_file}\` | — | — | :warning: registry-free (allow_registry_free) |" >> "$GITHUB_STEP_SUMMARY"
                 registry_free_count=$((registry_free_count + 1))
                 echo "Nothing from a registry in ${file}; skipped via allow_registry_free"
+                # stdout on this path carries the vendored records that ARRIVED
+                # (diff_pnpm_lock says why it still computes them), so the pass is
+                # not a blind one.
+                npm_age::report_vendored_arrivals "$safe_file" "$new_deps"
                 echo "::endgroup::"
                 continue
               fi
@@ -3459,6 +3712,15 @@ jobs:
                     fail_cell=":x: nothing from a registry"
                     fail_reason="resolves nothing from the public npm registry, so no dependency could be age-checked — if that is this repo's permanent shape, pass allow_registry_free: true to the reusable workflow"
                     ;;
+                  5)
+                    # Read, but not read WHOLE. Distinct from the generic parse
+                    # failure because the operator is looking at a lockfile that
+                    # parses — telling them it "could not be parsed" sends them
+                    # hunting for a corrupt file rather than for the entries this
+                    # check silently could not account for.
+                    fail_cell=":x: lockfile only partly parsed"
+                    fail_reason="declares more resolved packages than this check could account for, so the packages it did verify are not the whole file; see the job log for the counts"
+                    ;;
                   *)
                     fail_cell=":x: lockfile could not be parsed"
                     fail_reason="lockfile could not be parsed; see the job log"
@@ -3473,6 +3735,15 @@ jobs:
                 preflight::step_summary_unverifiable "${safe_file}: ${fail_reason}"
                 exit 1
               fi
+
+              # Vendored arrivals first, and deliberately BEFORE the empty-work-list
+              # test: the case that motivates them is exactly a PR whose work-list
+              # is empty — one that vendors a new git dependency into a lockfile
+              # whose registry pins did not move. Reported here, then removed from
+              # the work-list, so nothing below — the budget, the loop, the
+              # counters — ever sees a record it cannot age.
+              npm_age::report_vendored_arrivals "$safe_file" "$new_deps"
+              new_deps=$(printf '%s\n' "$new_deps" | npm_age::records_not_of_kind vendored)
 
               if [ -z "$new_deps" ]; then
                 echo "No new dependencies in ${file}"
@@ -3498,7 +3769,7 @@ jobs:
               # all-skipped guard that names registry_url. Two wrong turns, from a
               # message this file's own standard says must name the real cause.
               local off_count off_note=""
-              off_count=$(printf '%s\n' "$new_deps" | grep -c "^offregistry$(printf '\t')" || true)
+              off_count=$(printf '%s\n' "$new_deps" | npm_age::records_of_kind offregistry | grep -c . || true)
               # An explicit test, not `${off_count:+...}`: that expands whenever the
               # variable is non-EMPTY, and "0" is non-empty — so every ordinary run
               # would report "0 more resolve to another registry".
@@ -3688,6 +3959,9 @@ jobs:
             # down, which says so in as many words.
             if [ "$offregistry_count" -gt "$offregistry_rows" ]; then
               echo "| — | — | — | :warning: $(( offregistry_count - offregistry_rows )) more not on the configured registry (rows capped) |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            if [ "$vendored_count" -gt "$vendored_rows" ]; then
+              echo "| — | — | — | :information_source: $(( vendored_count - vendored_rows )) more new non-registry source(s) (rows capped) |" >> "$GITHUB_STEP_SUMMARY"
             fi
 
             # Guard against "registry outage → every package skipped → workflow
