@@ -382,10 +382,22 @@ jobs:
           # MUST be called under `$(...)`, as every binding does: the two coding-error
           # guards `exit`, and a bare `if new_lines_since_base ...; then` would take the
           # script down mid-run instead of reaching the caller's fail-closed branch.
-          # Tools: git, mktemp, sort, comm. Each caller declares them in its own
-          # preflight::require_tools list; a new binding owes that list an edit too.
+          # Tools: git, sort, comm — and mktemp unless a path is supplied. Each
+          # caller declares them in its own preflight::require_tools list; a new
+          # binding owes that list an edit too.
+          #
+          # Optional 4th argument <base_blob>: a caller-owned path. When given, the
+          # base image is written THERE and left for the caller, instead of into a
+          # temp file this function removes on return. For an ecosystem that wants
+          # to say something about a base image that contributed nothing (pnpm's
+          # absent/vendored/unreadable/empty classification, package-lock's
+          # lockfileVersion-1 probe) without a second `git show` of a 10 MB blob.
+          # Untouched when the base has no image, so a caller probes existence the
+          # same way this function does before reading it. The caller owns cleanup —
+          # and, if it reuses one path across manifests, truncation between them:
+          # nothing here empties a file it did not write to.
           preflight::new_lines_since_base() {
-            local file="$1" base_rev="$2" parser_fn="$3"
+            local file="$1" base_rev="$2" parser_fn="$3" base_blob="${4:-}"
 
             # Two coding errors, and both `exit` rather than return: a misspelled
             # parser name would otherwise fail per-image below and be rendered by
@@ -440,11 +452,12 @@ jobs:
               # to a temp file anyway). Same mktemp + `trap ... RETURN` idiom as
               # npm_age::published_at; the trap fires when THIS function returns,
               # not when the parser it calls does.
-              local base_blob
-              base_blob=$(mktemp) \
-                || { echo "::error::could not create a temporary file for the base image" >&2; return 2; }
-              # shellcheck disable=SC2064
-              trap "rm -f \"$base_blob\"" RETURN
+              if [ -z "$base_blob" ]; then
+                base_blob=$(mktemp) \
+                  || { echo "::error::could not create a temporary file for the base image" >&2; return 2; }
+                # shellcheck disable=SC2064
+                trap "rm -f \"$base_blob\"" RETURN
+              fi
               if ! git show "${base_rev}:./${file}" > "$base_blob"; then
                 echo "::error file=${file}::could not read ${file} at the merge base (${base_rev}) — git show failed; see its message above" >&2
                 return 2
@@ -1080,6 +1093,12 @@ jobs:
           #   Which is exactly why tier 4 does NOT run on every API failure. The
           #   authenticated failure is classified first (see the verdict `kind` block
           #   further down), and a TRANSIENT one — rate limit, 5xx, anything
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 2 of 3)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   unrecognized — fails closed instead of falling through. Otherwise an
           #   unrelated blip would silently convert a tier-1 block into a tier-4 pass on
           #   the very rev whose Release was published today; re-running the job is the
@@ -1093,12 +1112,6 @@ jobs:
           # GITHUB.COM-ONLY (non-github hosts handled explicitly — qurl-service#890):
           #   Age probing uses the GitHub REST API, so only github.com hooks are
           #   verifiable. A non-github host (GitLab/Codeberg/self-hosted) is treated as
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Assemble the age-check library (part 2 of 3)
-        run: |
-          set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   UNVERIFIABLE and FAILS CLOSED — the quarantine's natural parallel to the
           #   bot gate's "defer forever, never adopt". Because the check is diff-scoped
           #   (only newly added/changed revs), this blocks ONLY the PR that introduces or
@@ -2008,6 +2021,12 @@ jobs:
 
           # Best-effort ISO-8601 timestamp the tag became public; return 1 if
           # unverifiable. Four tiers: three authenticated, then a credential-free git
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 3 of 3)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # read (see header for the age-basis rationale and what tier 4 cannot cover).
           precommit_age::publish_dt() {
             local slug="$1" tag="$2" ts ref obj_type sha api_reason api_kind git_reason
@@ -2020,12 +2039,6 @@ jobs:
             # tier 4 alone was not enough: `timeout 30` bounds one `gh api` call, but a
             # PR bumping 15 hooks issues up to 45 of them, and 45 x 30s is well past the
             # reusable's `timeout-minutes` — the run would be CANCELLED before tier 4
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Assemble the age-check library (part 3 of 3)
-        run: |
-          set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # ever observed the deadline it owns, which is the annotations-suppressed
             # outcome the whole mechanism exists to prevent. Past it, a rev costs no
             # network at all and is recorded unverifiable immediately.

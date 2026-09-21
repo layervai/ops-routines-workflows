@@ -330,10 +330,22 @@ jobs:
           # MUST be called under `$(...)`, as every binding does: the two coding-error
           # guards `exit`, and a bare `if new_lines_since_base ...; then` would take the
           # script down mid-run instead of reaching the caller's fail-closed branch.
-          # Tools: git, mktemp, sort, comm. Each caller declares them in its own
-          # preflight::require_tools list; a new binding owes that list an edit too.
+          # Tools: git, sort, comm — and mktemp unless a path is supplied. Each
+          # caller declares them in its own preflight::require_tools list; a new
+          # binding owes that list an edit too.
+          #
+          # Optional 4th argument <base_blob>: a caller-owned path. When given, the
+          # base image is written THERE and left for the caller, instead of into a
+          # temp file this function removes on return. For an ecosystem that wants
+          # to say something about a base image that contributed nothing (pnpm's
+          # absent/vendored/unreadable/empty classification, package-lock's
+          # lockfileVersion-1 probe) without a second `git show` of a 10 MB blob.
+          # Untouched when the base has no image, so a caller probes existence the
+          # same way this function does before reading it. The caller owns cleanup —
+          # and, if it reuses one path across manifests, truncation between them:
+          # nothing here empties a file it did not write to.
           preflight::new_lines_since_base() {
-            local file="$1" base_rev="$2" parser_fn="$3"
+            local file="$1" base_rev="$2" parser_fn="$3" base_blob="${4:-}"
 
             # Two coding errors, and both `exit` rather than return: a misspelled
             # parser name would otherwise fail per-image below and be rendered by
@@ -388,11 +400,12 @@ jobs:
               # to a temp file anyway). Same mktemp + `trap ... RETURN` idiom as
               # npm_age::published_at; the trap fires when THIS function returns,
               # not when the parser it calls does.
-              local base_blob
-              base_blob=$(mktemp) \
-                || { echo "::error::could not create a temporary file for the base image" >&2; return 2; }
-              # shellcheck disable=SC2064
-              trap "rm -f \"$base_blob\"" RETURN
+              if [ -z "$base_blob" ]; then
+                base_blob=$(mktemp) \
+                  || { echo "::error::could not create a temporary file for the base image" >&2; return 2; }
+                # shellcheck disable=SC2064
+                trap "rm -f \"$base_blob\"" RETURN
+              fi
               if ! git show "${base_rev}:./${file}" > "$base_blob"; then
                 echo "::error file=${file}::could not read ${file} at the merge base (${base_rev}) — git show failed; see its message above" >&2
                 return 2
@@ -1042,6 +1055,12 @@ jobs:
           # ----- Separable: find changed action/workflow files ------------------------
 
           # Split `git diff` from the awk filter so a diff failure (missing
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 2 of 3)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # base ref, invalid workflow_dispatch ref, etc.) doesn't silently
           # pass as "no changes detected." Caller is expected to have already
           # invoked `preflight::verify_base_ref`.
@@ -1059,12 +1078,6 @@ jobs:
           # Extract added `uses: OWNER/REPO[/subpath]@REF` lines. Emits one ref per line.
           # `|| true` on the awk/grep/sed pipeline is safe: it only catches the
           # expected "no matching lines" case. The diff itself is guarded above
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Assemble the age-check library (part 2 of 3)
-        run: |
-          set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # it — preflight verifies the base ref exists, not that the diff runs.
           actions_age::added_uses() {
             local file="$1" base_rev="$2"
@@ -1977,6 +1990,12 @@ jobs:
                 fi
                 if [ -z "$ts" ]; then
                   echo "::error file=${file}::No committer date for ${owner}/${repo}@${ref_part}"
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 3 of 3)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   echo "| \`${safe_owner_repo}\` | \`${safe_sha_short}\` | — | :x: no committer date |" >> "$GITHUB_STEP_SUMMARY"
                   preflight::record_unverifiable "$safe_owner_repo" "$safe_sha_short" \
                     "gh api returned no committer date"
@@ -1995,12 +2014,6 @@ jobs:
             done
 
             # A pin dated by tier 2 is a normal outcome for an allow-listed org, but it
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Assemble the age-check library (part 3 of 3)
-        run: |
-          set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # is also what a broken GH_TOKEN looks like — and in that state the check
             # now PASSES on public pins where it used to fail. Without this the only
             # evidence is a per-pin stderr line inside a collapsed `::group::`, so say

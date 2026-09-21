@@ -344,10 +344,22 @@ jobs:
           # MUST be called under `$(...)`, as every binding does: the two coding-error
           # guards `exit`, and a bare `if new_lines_since_base ...; then` would take the
           # script down mid-run instead of reaching the caller's fail-closed branch.
-          # Tools: git, mktemp, sort, comm. Each caller declares them in its own
-          # preflight::require_tools list; a new binding owes that list an edit too.
+          # Tools: git, sort, comm — and mktemp unless a path is supplied. Each
+          # caller declares them in its own preflight::require_tools list; a new
+          # binding owes that list an edit too.
+          #
+          # Optional 4th argument <base_blob>: a caller-owned path. When given, the
+          # base image is written THERE and left for the caller, instead of into a
+          # temp file this function removes on return. For an ecosystem that wants
+          # to say something about a base image that contributed nothing (pnpm's
+          # absent/vendored/unreadable/empty classification, package-lock's
+          # lockfileVersion-1 probe) without a second `git show` of a 10 MB blob.
+          # Untouched when the base has no image, so a caller probes existence the
+          # same way this function does before reading it. The caller owns cleanup —
+          # and, if it reuses one path across manifests, truncation between them:
+          # nothing here empties a file it did not write to.
           preflight::new_lines_since_base() {
-            local file="$1" base_rev="$2" parser_fn="$3"
+            local file="$1" base_rev="$2" parser_fn="$3" base_blob="${4:-}"
 
             # Two coding errors, and both `exit` rather than return: a misspelled
             # parser name would otherwise fail per-image below and be rendered by
@@ -402,11 +414,12 @@ jobs:
               # to a temp file anyway). Same mktemp + `trap ... RETURN` idiom as
               # npm_age::published_at; the trap fires when THIS function returns,
               # not when the parser it calls does.
-              local base_blob
-              base_blob=$(mktemp) \
-                || { echo "::error::could not create a temporary file for the base image" >&2; return 2; }
-              # shellcheck disable=SC2064
-              trap "rm -f \"$base_blob\"" RETURN
+              if [ -z "$base_blob" ]; then
+                base_blob=$(mktemp) \
+                  || { echo "::error::could not create a temporary file for the base image" >&2; return 2; }
+                # shellcheck disable=SC2064
+                trap "rm -f \"$base_blob\"" RETURN
+              fi
               if ! git show "${base_rev}:./${file}" > "$base_blob"; then
                 echo "::error file=${file}::could not read ${file} at the merge base (${base_rev}) — git show failed; see its message above" >&2
                 return 2
@@ -1079,6 +1092,12 @@ jobs:
                   case "$spec" in
                     scratch|"") continue ;;
                   esac
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 2 of 2)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   if [[ "$spec" == *"@sha256:"* ]]; then
                     # strip any trailing "AS <stage>"
                     echo "PINNED:${spec%% *}"
@@ -1105,12 +1124,6 @@ jobs:
             url="https://hub.docker.com/v2/repositories/${ns}/${name}/tags/?page_size=100"
 
             # Follow `.next` pagination up to 10 pages (≈1000 tags) for popular
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Assemble the age-check library (part 2 of 2)
-        run: |
-          set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # base images with many tags (node, python, alpine). Bound iterations
             # so a broken `.next` loop can't spin the job. Per-request timeout
             # already caps time per call. Return first match; stop paginating

@@ -445,10 +445,22 @@ jobs:
           # MUST be called under `$(...)`, as every binding does: the two coding-error
           # guards `exit`, and a bare `if new_lines_since_base ...; then` would take the
           # script down mid-run instead of reaching the caller's fail-closed branch.
-          # Tools: git, mktemp, sort, comm. Each caller declares them in its own
-          # preflight::require_tools list; a new binding owes that list an edit too.
+          # Tools: git, sort, comm — and mktemp unless a path is supplied. Each
+          # caller declares them in its own preflight::require_tools list; a new
+          # binding owes that list an edit too.
+          #
+          # Optional 4th argument <base_blob>: a caller-owned path. When given, the
+          # base image is written THERE and left for the caller, instead of into a
+          # temp file this function removes on return. For an ecosystem that wants
+          # to say something about a base image that contributed nothing (pnpm's
+          # absent/vendored/unreadable/empty classification, package-lock's
+          # lockfileVersion-1 probe) without a second `git show` of a 10 MB blob.
+          # Untouched when the base has no image, so a caller probes existence the
+          # same way this function does before reading it. The caller owns cleanup —
+          # and, if it reuses one path across manifests, truncation between them:
+          # nothing here empties a file it did not write to.
           preflight::new_lines_since_base() {
-            local file="$1" base_rev="$2" parser_fn="$3"
+            local file="$1" base_rev="$2" parser_fn="$3" base_blob="${4:-}"
 
             # Two coding errors, and both `exit` rather than return: a misspelled
             # parser name would otherwise fail per-image below and be rendered by
@@ -503,11 +515,12 @@ jobs:
               # to a temp file anyway). Same mktemp + `trap ... RETURN` idiom as
               # npm_age::published_at; the trap fires when THIS function returns,
               # not when the parser it calls does.
-              local base_blob
-              base_blob=$(mktemp) \
-                || { echo "::error::could not create a temporary file for the base image" >&2; return 2; }
-              # shellcheck disable=SC2064
-              trap "rm -f \"$base_blob\"" RETURN
+              if [ -z "$base_blob" ]; then
+                base_blob=$(mktemp) \
+                  || { echo "::error::could not create a temporary file for the base image" >&2; return 2; }
+                # shellcheck disable=SC2064
+                trap "rm -f \"$base_blob\"" RETURN
+              fi
               if ! git show "${base_rev}:./${file}" > "$base_blob"; then
                 echo "::error file=${file}::could not read ${file} at the merge base (${base_rev}) — git show failed; see its message above" >&2
                 return 2
@@ -1148,6 +1161,18 @@ jobs:
           #              the fail-closed branches, so npm and pre-commit
           #              (precommit_age::changed_pins / ::pairs_from_text) cannot
           #              drift on any of them. Format-agnostic by construction.
+          #              Since the pnpm fold every parser here goes through it;
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 2 of 5)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          #              nothing in this file compares images itself.
+          #              diff_package_lock and diff_pnpm_lock add format-specific
+          #              diagnosis around that one call, reading the base image
+          #              the helper leaves behind (its optional 4th argument)
+          #              rather than a second time.
           #
           # Keeping the two apart is what makes "new lockfile", "missing base" and
           # "bumped pin" fall out of ONE code path instead of each needing a
@@ -1164,12 +1189,6 @@ jobs:
           # comment renderer treats a non-empty failures file as a failed run. See
           # npm_age::report_unreadable_format.
           #
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Assemble the age-check library (part 2 of 5)
-        run: |
-          set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # ============================================================================
 
           # Guard against double-sourcing — IFS and `set -e` state are caller's.
@@ -1631,7 +1650,7 @@ jobs:
           # parsed. main() renders exactly that split. Every diagnostic is on
           # stderr: stdout is the work-list channel, read back with
           # `new_deps=$(...)`.
-          npm_age::changed_pins() {   # <lockfile> <base_rev> <extractor>
+          npm_age::changed_pins() {   # <lockfile> <base_rev> <extractor> [base_blob]
             preflight::new_lines_since_base "$@"
           }
 
@@ -1729,25 +1748,37 @@ jobs:
             # the work-list. That is the unbounded run that times out, and without
             # this probe it would happen with no stated cause.
             #
-            # This does re-read and re-parse the base blob that changed_pins is
-            # about to read again — measured at ~60ms on a 1MB lockfile, against a
-            # budget dominated by ~0.45s per package of registry traffic. Kept
-            # separate deliberately: folding it into the extractor would either
-            # buffer a multi-megabyte image in a shell variable or cost the
+            # The probe reads the base image the comparator leaves in $base_blob —
+            # one jq pass, no second `git show` — so it runs AFTER the comparison
+            # and only on an image that was read and parsed successfully; a base
+            # the comparator could not read has already returned rc 2 above it.
+            # Kept out of the extractor deliberately: folding it in would cost the
             # per-image file context this warning needs to be actionable.
             # Only when the HEAD is readable: if it is not, the probe above already
             # said so, and "every head pin is treated as new" would be false — a v1
             # head yields no pins at all. Two contradictory warnings on one file is
-            # worse than one accurate one.
+            # worse than one accurate one. `-s`: an absent base image leaves the
+            # file empty, and the promotion warning is pnpm's to give, not this.
+            # The weaker test than pnpm's `rev-parse` probe, deliberately: a
+            # zero-byte base image is not JSON, so jq rejects it either way.
+            local base_blob new_pins
+            base_blob=$(mktemp) \
+              || { echo "::error::could not create a temporary file for the base image" >&2; return 2; }
+            # shellcheck disable=SC2064
+            trap "rm -f \"$base_blob\"" RETURN
+            new_pins=$(npm_age::changed_pins "$lockfile" "$base_rev" npm_age::pkglock_pins "$base_blob") \
+              || return $?
             if [ "$head_unreadable" -eq 0 ] \
+               && [ -s "$base_blob" ] \
                && npm_age::lockfile_changed "$lockfile" "$base_rev" \
-               && git cat-file -e "${base_rev}:./${lockfile}" 2>/dev/null \
-               && git show "${base_rev}:./${lockfile}" 2>/dev/null \
-                  | jq -e 'has("packages") | not' >/dev/null 2>&1; then
+               && jq -e 'has("packages") | not' "$base_blob" >/dev/null 2>&1; then
               npm_age::report_unreadable_format "$lockfile" \
                 "base image has no \`packages\` object (lockfileVersion 1 -> 3 migration?); every head pin is treated as new"
             fi
-            npm_age::changed_pins "$lockfile" "$base_rev" npm_age::pkglock_pins
+            # Guarded: a bare printf of an empty result would put a blank line on
+            # the work-list channel.
+            [ -n "$new_pins" ] && printf '%s\n' "$new_pins"
+            return 0
           }
 
           npm_age::diff_yarn_lock() {
@@ -2044,6 +2075,12 @@ jobs:
                   # whose prose contains the word — cannot land on it, because YAML
                   # requires block content to sit deeper than the key introducing
                   # it, and that key is itself at four spaces. `in_packages` rules
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 3 of 5)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   # out the same line under `importers:` or `snapshots:`, where v9
                   # repeats every package. Both are load-bearing: a bare grep -c
                   # would double the denominator on every real v9 lockfile.
@@ -2073,12 +2110,6 @@ jobs:
                   # npmjs-resolved, and one less level of nesting is one less
                   # thing between a reader and that decision.
                   #
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Assemble the age-check library (part 3 of 5)
-        run: |
-          set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   # `in_res || pending_res == ""` because once the resolution is
                   # captured every remaining body line (engines, dependencies,
                   # dev, ...) would pay for a substitution and a match that both
@@ -2324,10 +2355,13 @@ jobs:
           # reformatted or re-indented one, and a diff-scraper cannot tell a
           # genuinely new resolution from a line that merely moved.
           #
-          # `precommit_age::changed_pins` in lib/age-check-precommit.sh is the
-          # same shape (parse base image, parse head image, emit head-only lines)
-          # against .pre-commit-config.yaml. The two are worth folding into one
-          # _preflight helper once a third ecosystem wants it.
+          # The comparison itself is preflight::new_lines_since_base, the comparator
+          # pre-commit and the package-lock/yarn parsers above share. What this
+          # function adds around that call is pnpm-specific, and stays here because
+          # the shared helper deliberately owns only the mechanism: the
+          # unchanged-file short-circuit, the head-side triage (pin count, the
+          # `counts` probe, the shortfall guard, allow_registry_free), and the
+          # classification of a base image that contributed nothing.
           npm_age::diff_pnpm_lock() {
             local lockfile="$1" base_rev="$2"
 
@@ -2515,57 +2549,63 @@ jobs:
               esac
             fi
 
-            # The base image. It used to be read only once the head had something
-            # to gate, which meant the allow_registry_free pass returned without it — and so could not
-            # report a vendored arrival on exactly the repo shape most likely to
-            # vendor something. An absent base image means a brand-new lockfile,
-            # and an empty base set is the right answer for it.
-            # `<rev>:./<path>` — see diff_package_lock: the "./" keeps this
-            # cwd-relative and therefore consistent with the `git diff` pathspec
-            # above under the caller's `working_directory`.
+            # The comparison — through the shared helper, which reads the base
+            # image and parses both images itself. It used to be read only once the
+            # head had something to gate, which meant the allow_registry_free pass
+            # returned without it — and so could not report a vendored arrival on
+            # exactly the repo shape most likely to vendor something; now every
+            # pass that reaches this point takes the same difference, and vendored
+            # records ride it, so only one that ARRIVED on this branch is emitted.
+            # The helper parses the head image again — one more awk pass, the price
+            # of keeping the triage above out of the shared mechanism, the same
+            # trade diff_package_lock makes for its base probe. Its exit codes
+            # propagate unchanged: rc 2 is a base image that could not be read or
+            # parsed, rc 1 a head image that could not — both already announced on
+            # stderr, and both rendered by main as their own row.
             #
-            # Via a temp file, not a process substitution and not a variable. A
-            # process substitution's exit status is unobservable, so a mid-stream
-            # `git show` failure would silently truncate the base set and every
-            # unread package would read as newly added; a variable would hold a
-            # monorepo lockfile (10 MB+ is ordinary) in memory and copy it again
-            # through the pipe. The redirect gives the error check for neither
-            # cost. (The parsed entry lists below are still shell variables —
-            # smaller than the blob by a large constant, but not free.) Same
-            # mktemp + `trap ... RETURN` idiom as npm_age::published_at — the trap
-            # fires only when THIS function returns, not when the parser it calls
-            # does.
-            local base_blob
-            # Checked: errexit is suppressed for this whole function, so an
-            # unchecked mktemp would leave base_blob empty and let `git show > ""`
-            # fail in its place, blaming an image that was never the problem. rc 2
-            # on purpose — the base image could not be obtained, and the log line
-            # says why; main renders rc 1 as a head-lockfile parse failure, which
-            # this is not.
+            # The base image is left in $base_blob for the classification below,
+            # so it is READ once — but parsed twice, the same trade as the head:
+            # the helper discards its base-side lines, and the classifier needs
+            # them. Checked mktemp: errexit is suppressed for this whole function,
+            # so an unchecked one would hand the helper an empty path — which it
+            # would read as "no caller path" and quietly use its own. rc 2 on
+            # purpose: the base image could not be obtained, and main renders rc 1
+            # as a head-lockfile parse failure, which this is not.
+            local base_blob new_entries
             base_blob=$(mktemp) \
               || { echo "::error::could not create a temporary file for the base image" >&2; return 2; }
             # shellcheck disable=SC2064
             trap "rm -f \"$base_blob\"" RETURN
+            new_entries=$(preflight::new_lines_since_base "$lockfile" "$base_rev" npm_age::parse_pnpm_lock "$base_blob") \
+              || return $?
 
-            # Classify the base side, then report once. The promotion warning used
-            # to live inside the cat-file branch, so it never fired for an ABSENT
-            # base image — which is the case that most often causes the promotion:
-            # a lockfile this branch adds, an untracked one (the ls-files guard
-            # above deliberately routes those here), or a working_directory that
-            # does not match where the lockfile lives.
-            # The stream answers every question the classifier has: pins present
-            # is `ok`; no pins but vendored records is `vendored` — read fine,
-            # everything resolves through git/tarball/link, the ordinary case of a
-            # repo migrating OFF vendored dependencies, and without this arm the
-            # `resolution:` probe claims the image is unreadable. The separate
-            # `counts` pass this arm used to run was a third full traversal of a
-            # blob the comment above puts at 10 MB+.
+            # Classify the base side from the image the helper left behind, then
+            # report once. The promotion warning used to live inside the existence
+            # branch, so it never fired for an ABSENT base image — which is the
+            # case that most often causes the promotion: a lockfile this branch
+            # adds, an untracked one (the ls-files guard above deliberately routes
+            # those here), or a working_directory that does not match where the
+            # lockfile lives. Existence is probed the way the helper probes it
+            # (`rev-parse --verify`, tree-only): a zero-byte base image is a real
+            # image that classifies as `empty`, which `-s` on the blob would
+            # misfile as `absent`.
+            #
+            # The helper already parsed this image and failed closed if it could
+            # not, so the parse below fails only transiently (out of memory, a
+            # TMPDIR that filled up between the two) — still checked, and still rc
+            # 2 with the helper's own wording, because the alternative is an empty
+            # capture falling through to `unreadable` and a promotion warning whose
+            # remedy ("re-running will not help") is exactly wrong for a transient
+            # fault. The stream then answers every question the classifier has:
+            # pins present is `ok`; no pins but vendored records is `vendored` —
+            # read fine, everything resolves through git/tarball/link, the
+            # ordinary case of a repo migrating OFF vendored dependencies, and
+            # without this arm the `resolution:` probe claims the image is
+            # unreadable.
             local base_entries="" base_state=absent
-            if git cat-file -e "${base_rev}:./${lockfile}" 2>/dev/null; then
-              git show "${base_rev}:./${lockfile}" > "$base_blob" \
-                || { echo "::error::git show ${base_rev}:${lockfile} failed" >&2; return 2; }
+            if git rev-parse --verify --quiet "${base_rev}:./${lockfile}" >/dev/null 2>&1; then
               base_entries=$(npm_age::parse_pnpm_lock < "$base_blob") \
-                || { echo "::error file=${lockfile}::could not read the base image of ${lockfile}; the parser itself failed" >&2; return 1; }
+                || { echo "::error file=${lockfile}::${lockfile} at the merge base (${base_rev}) could not be parsed; cannot determine which entries this branch introduces" >&2; return 2; }
               # Counted, not probed with `grep -q`: a reader that exits on the first
               # match leaves the upstream grep writing into a closed pipe once the
               # base has more pins than a pipe buffer holds (~2,600), it dies of
@@ -2613,21 +2653,10 @@ jobs:
               esac
             fi
 
-            # The full-line difference, inline. preflight::new_lines_since_base is
-            # the shared comparator, but it reads and parses both images itself —
-            # this function has already done that, because it classifies the base
-            # image on the way (base_state), which the shared helper deliberately
-            # does not own. `comm` reads an empty operand as the empty set, so the
-            # absent-base case needs nothing special; a failure of the comparison
-            # itself is a failure, not "nothing changed". Vendored records ride the
-            # same difference, so only one that ARRIVED on this branch is emitted:
-            # the entries already live across the fleet do not re-announce
-            # themselves on every PR that touches their lockfile. `rc` is 4 on the
-            # allow_registry_free pass and 0 otherwise.
-            LC_ALL=C comm -13 \
-              <(printf '%s\n' "$base_entries" | LC_ALL=C sort -u) \
-              <(printf '%s\n' "$head_entries" | LC_ALL=C sort -u) \
-              || { echo "::error file=${lockfile}::could not compare ${lockfile} against its base image" >&2; return 1; }
+            # The work-list the helper computed above. Guarded: a bare printf of an
+            # empty result would put a blank line on the work-list channel. `rc` is
+            # 4 on the allow_registry_free pass and 0 otherwise.
+            [ -n "$new_entries" ] && printf '%s\n' "$new_entries"
             return "$rc"
           }
 
@@ -2878,6 +2907,12 @@ jobs:
           #   WHERE a pin comes from without moving its version — `resolved`
           #   swapping registry host, or `integrity` changing under a fixed
           #   version — produces an identical pin and is invisible to the
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 4 of 5)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   comparison. The old key-line scrape missed it too; noted because
           #   "every pkg@version this branch would newly ship" reads stronger than
           #   what is actually gated.
@@ -2903,12 +2938,6 @@ jobs:
           #   the exact four-space indent, inside `packages:` only) and the pins
           #   plus the vendored records must account for all of them. A shortfall
           #   — a respelled key beside a readable one — fails the run with the
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Assemble the age-check library (part 4 of 5)
-        run: |
-          set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   counts (rc 5), reported as a partial parse rather than an unreadable
           #   file, because the operator is looking at a lockfile that parses.
           # - The pnpm parser has not been fuzzed against workspace / overrides
@@ -3802,6 +3831,12 @@ jobs:
                   # No MAX_PINS in the environment: this is an older pinned
                   # reusable running a newer lib. Naming `max_pins` here would send
                   # the reader looking for an input their revision lacks.
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 5 of 5)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   remedy="update the pinned ops-routines reusable to a revision that exposes the max_pins and timeout_minutes inputs"
                 fi
                 echo "::error file=${safe_target}::${total_pins_so_far} pins to verify across this run exceeds the ${MAX_PINS}-pin budget. This is a lockfile regeneration or a format migration rather than a dependency bump — review it by hand, ${remedy}, or add the 'age-check-bypass' label."
@@ -3832,12 +3867,6 @@ jobs:
                   local off_pin="${dep_entry#*$'\t'}"
                   local safe_off safe_off_ver
                   safe_off=$(preflight::safe_for_md "${off_pin%@*}")
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Assemble the age-check library (part 5 of 5)
-        run: |
-          set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   safe_off_ver=$(preflight::safe_for_md "${off_pin##*@}")
                   # A `::warning file=` like every sibling skip branch, so the skip
                   # shows in the PR's Files-changed view and not only in the job
