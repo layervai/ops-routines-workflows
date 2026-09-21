@@ -1,7 +1,7 @@
 # ============================================================================
 # REUSABLE: pip Dependency Age Check (supply-chain guard, PUBLIC mirror)
 # ----------------------------------------------------------------------------
-# Self-contained: the bash lib is inlined below. No cross-repo checkout,
+# Self-contained: the bash lib is embedded below. No cross-repo checkout,
 # no secrets required, no GitHub App involved. Public consumer repos
 # point at this file (at the equivalent `layervai/ops-routines-workflows`
 # mirror) because GitHub blocks public → internal reusable-workflow calls.
@@ -69,17 +69,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check pip dependency upload ages
-        working-directory: ${{ inputs.working_directory }}
-        env:
-          MIN_AGE_DAYS: ${{ inputs.min_age_days }}
-          LOCKFILE_PATH: ${{ inputs.lockfile_path }}
-          BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
-          # `record_failure` writes a TSV row here for each too-new pkg
-          # so the post-step below can render the data into a comment
-          # without redoing classification. Unset → no-op.
-          AGE_CHECK_FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
+      - name: Assemble the age-check library (part 1 of 2)
         run: |
+          set -euo pipefail
+          rm -f "${RUNNER_TEMP}/ops-routines-age-check.sh"
+          cat > "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # ============================================================================
           # _preflight.sh - Shared preflight helpers for age-check-*.sh
           # ============================================================================
@@ -1092,6 +1086,12 @@ jobs:
             local poetry
             poetry=$(printf '%s\n' "$added_lines" \
               | grep -oE "^[[:space:]]*[A-Za-z0-9][A-Za-z0-9._-]*[[:space:]]*=[[:space:]]*[\"'][[:space:]]*==[[:space:]]*[A-Za-z0-9][A-Za-z0-9._+-]*[[:space:]]*[\"']" \
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 2 of 2)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               | sed -E "s/^[[:space:]]+//;s/[[:space:]]*=[[:space:]]*[\"'][[:space:]]*==[[:space:]]*/==/;s/[[:space:]]*[\"']\$//" \
               || true)
 
@@ -1259,6 +1259,24 @@ jobs:
             preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS" "$skipped_count"
             echo "All pip dependencies are at least ${MIN_AGE_DAYS} days old"
           }
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Check pip dependency upload ages
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          MIN_AGE_DAYS: ${{ inputs.min_age_days }}
+          LOCKFILE_PATH: ${{ inputs.lockfile_path }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
+          # `record_failure` writes a TSV row here for each too-new pkg
+          # so the post-step below can render the data into a comment
+          # without redoing classification. Unset → no-op.
+          AGE_CHECK_FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
+        run: |
+          # Assembled by the `Assemble the age-check library` step(s) above; see
+          # the header of scripts/embed-lib-into-workflows.py for why the library
+          # is written to a file rather than inlined here.
+          # shellcheck source=/dev/null
+          source "${RUNNER_TEMP}/ops-routines-age-check.sh"
           pip_age::main
 
       - name: Comment retry-after dates on PR

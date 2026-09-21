@@ -1,7 +1,7 @@
 # ============================================================================
 # REUSABLE: pre-commit Hook Rev Age Check (supply-chain guard, PUBLIC mirror)
 # ----------------------------------------------------------------------------
-# Self-contained: the bash lib is inlined below. No cross-repo checkout,
+# Self-contained: the bash lib is embedded below. No cross-repo checkout,
 # no secrets required, no GitHub App involved. Public consumer repos
 # point at this file (at the equivalent `layervai/ops-routines-workflows`
 # mirror) because GitHub blocks public → internal reusable-workflow calls.
@@ -112,47 +112,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run age-check-precommit.sh
-        env:
-          MIN_AGE_DAYS: ${{ inputs.min_age_days }}
-          BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
-          # No AGE_CHECK_SKIP_SELF_REFS: unlike the actions check, pre-commit
-          # hooks never reference the age-check infra, so there is no
-          # self-block to dodge (see lib/age-check-precommit.sh header).
-          #
-          # `record_failure` writes a TSV row here for each too-new pin
-          # so the post-step below can render the data into a comment
-          # without redoing classification. Unset → no-op.
-          AGE_CHECK_FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
-          PRECOMMIT_AGE_DEADLINE_SECONDS: ${{ inputs.age_check_deadline_seconds }}
-          # Ceiling for the input above, derived from THIS flavour's
-          # `timeout-minutes` (900s) minus an allowance for the setup that
-          # runs before the check's clock starts. Not a consumer input: a
-          # caller cannot see `timeout-minutes`, so it cannot size this.
-          PRECOMMIT_AGE_DEADLINE_MAX_SECONDS: 480
-          # What an EMPTY (not omitted) value falls back to. Kept equal to
-          # this flavour's YAML `default:` above, so a shim forwarding its own
-          # unset optional gets the same deadline as a caller who omits the
-          # input entirely — a YAML default only applies to an OMITTED key.
-          PRECOMMIT_AGE_DEADLINE_DEFAULT_SECONDS: 420
-          # The consumer's default token drives the three authenticated
-          # tiers, but it is NOT sufficient on its own: an org running a
-          # GitHub IP allow list answers 403 to an AUTHENTICATED read from a
-          # hosted runner even for a PUBLIC repo, which used to make this
-          # check permanently red for any hook it publishes. Revs blocked that
-          # way — and revs the API reports absent — now fall back to a
-          # credential-free git read, which an allow list does not gate. No
-          # extra permission or secret is involved.
-          #
-          # TRANSIENT failures (rate limit, 5xx) deliberately do NOT fall back
-          # and still fail closed: the release date may exist and simply be
-          # unreadable this minute, so re-run the job rather than accepting an
-          # older basis. If you are debugging a red check, that is a withheld
-          # fallback, not a broken one — see the tier-4 section of
-          # lib/age-check-precommit.sh. Non-github hosts still fail closed
-          # without any network call at all.
-          GH_TOKEN: ${{ github.token }}
+      - name: Assemble the age-check library (part 1 of 3)
         run: |
+          set -euo pipefail
+          rm -f "${RUNNER_TEMP}/ops-routines-age-check.sh"
+          cat > "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # ============================================================================
           # _preflight.sh - Shared preflight helpers for age-check-*.sh
           # ============================================================================
@@ -1129,6 +1093,12 @@ jobs:
           # GITHUB.COM-ONLY (non-github hosts handled explicitly — qurl-service#890):
           #   Age probing uses the GitHub REST API, so only github.com hooks are
           #   verifiable. A non-github host (GitLab/Codeberg/self-hosted) is treated as
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 2 of 3)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   UNVERIFIABLE and FAILS CLOSED — the quarantine's natural parallel to the
           #   bot gate's "defer forever, never adopt". Because the check is diff-scoped
           #   (only newly added/changed revs), this blocks ONLY the PR that introduces or
@@ -2050,6 +2020,12 @@ jobs:
             # tier 4 alone was not enough: `timeout 30` bounds one `gh api` call, but a
             # PR bumping 15 hooks issues up to 45 of them, and 45 x 30s is well past the
             # reusable's `timeout-minutes` — the run would be CANCELLED before tier 4
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 3 of 3)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # ever observed the deadline it owns, which is the annotations-suppressed
             # outcome the whole mechanism exists to prevent. Past it, a rev costs no
             # network at all and is recorded unverifiable immediately.
@@ -2402,6 +2378,54 @@ jobs:
             preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS"
             echo "All pre-commit hook revs are at least ${MIN_AGE_DAYS} days old"
           }
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Run age-check-precommit.sh
+        env:
+          MIN_AGE_DAYS: ${{ inputs.min_age_days }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
+          # No AGE_CHECK_SKIP_SELF_REFS: unlike the actions check, pre-commit
+          # hooks never reference the age-check infra, so there is no
+          # self-block to dodge (see lib/age-check-precommit.sh header).
+          #
+          # `record_failure` writes a TSV row here for each too-new pin
+          # so the post-step below can render the data into a comment
+          # without redoing classification. Unset → no-op.
+          AGE_CHECK_FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
+          PRECOMMIT_AGE_DEADLINE_SECONDS: ${{ inputs.age_check_deadline_seconds }}
+          # Ceiling for the input above, derived from THIS flavour's
+          # `timeout-minutes` (900s) minus an allowance for the setup that
+          # runs before the check's clock starts. Not a consumer input: a
+          # caller cannot see `timeout-minutes`, so it cannot size this.
+          PRECOMMIT_AGE_DEADLINE_MAX_SECONDS: 480
+          # What an EMPTY (not omitted) value falls back to. Kept equal to
+          # this flavour's YAML `default:` above, so a shim forwarding its own
+          # unset optional gets the same deadline as a caller who omits the
+          # input entirely — a YAML default only applies to an OMITTED key.
+          PRECOMMIT_AGE_DEADLINE_DEFAULT_SECONDS: 420
+          # The consumer's default token drives the three authenticated
+          # tiers, but it is NOT sufficient on its own: an org running a
+          # GitHub IP allow list answers 403 to an AUTHENTICATED read from a
+          # hosted runner even for a PUBLIC repo, which used to make this
+          # check permanently red for any hook it publishes. Revs blocked that
+          # way — and revs the API reports absent — now fall back to a
+          # credential-free git read, which an allow list does not gate. No
+          # extra permission or secret is involved.
+          #
+          # TRANSIENT failures (rate limit, 5xx) deliberately do NOT fall back
+          # and still fail closed: the release date may exist and simply be
+          # unreadable this minute, so re-run the job rather than accepting an
+          # older basis. If you are debugging a red check, that is a withheld
+          # fallback, not a broken one — see the tier-4 section of
+          # lib/age-check-precommit.sh. Non-github hosts still fail closed
+          # without any network call at all.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Assembled by the `Assemble the age-check library` step(s) above; see
+          # the header of scripts/embed-lib-into-workflows.py for why the library
+          # is written to a file rather than inlined here.
+          # shellcheck source=/dev/null
+          source "${RUNNER_TEMP}/ops-routines-age-check.sh"
           precommit_age::main
 
       - name: Comment retry-after dates on PR

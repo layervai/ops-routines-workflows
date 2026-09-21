@@ -1,7 +1,7 @@
 # ============================================================================
 # REUSABLE: GitHub Actions Pin Age Check (supply-chain guard, PUBLIC mirror)
 # ----------------------------------------------------------------------------
-# Self-contained: the bash lib is inlined below. No cross-repo checkout,
+# Self-contained: the bash lib is embedded below. No cross-repo checkout,
 # no secrets required, no GitHub App involved. Public consumer repos
 # point at this file (at the equivalent `layervai/ops-routines-workflows`
 # mirror) because GitHub blocks public → internal reusable-workflow calls.
@@ -60,24 +60,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run age-check-actions.sh
-        env:
-          MIN_AGE_DAYS: ${{ inputs.min_age_days }}
-          BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
-          # Default skip-list includes this very workflow repo so fresh
-          # releases here don't self-block. Override via env to tighten
-          # or widen the list.
-          AGE_CHECK_SKIP_SELF_REFS: "layervai/ops-routines layervai/ops-routines-workflows"
-          # Binds the self-reference rollout seam to the caller's organization.
-          # The checker still requires the exact pin to be a verified commit on
-          # the exact repository's protected default branch.
-          ACTIONS_AGE_TRUSTED_OWNER: ${{ github.repository_owner }}
-          # `record_failure` writes a TSV row here for each too-new pin
-          # so the post-step below can render the data into a comment
-          # without redoing classification. Unset → no-op.
-          AGE_CHECK_FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
-          GH_TOKEN: ${{ github.token }}
+      - name: Assemble the age-check library (part 1 of 3)
         run: |
+          set -euo pipefail
+          rm -f "${RUNNER_TEMP}/ops-routines-age-check.sh"
+          cat > "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # ============================================================================
           # _preflight.sh - Shared preflight helpers for age-check-*.sh
           # ============================================================================
@@ -1072,6 +1059,12 @@ jobs:
           # Extract added `uses: OWNER/REPO[/subpath]@REF` lines. Emits one ref per line.
           # `|| true` on the awk/grep/sed pipeline is safe: it only catches the
           # expected "no matching lines" case. The diff itself is guarded above
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 2 of 3)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # it — preflight verifies the base ref exists, not that the diff runs.
           actions_age::added_uses() {
             local file="$1" base_rev="$2"
@@ -2002,6 +1995,12 @@ jobs:
             done
 
             # A pin dated by tier 2 is a normal outcome for an allow-listed org, but it
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Assemble the age-check library (part 3 of 3)
+        run: |
+          set -euo pipefail
+          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # is also what a broken GH_TOKEN looks like — and in that state the check
             # now PASSES on public pins where it used to fail. Without this the only
             # evidence is a per-pin stderr line inside a collapsed `::group::`, so say
@@ -2028,6 +2027,31 @@ jobs:
             preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS" "$skipped_count"
             echo "All GitHub Actions dependencies are at least ${MIN_AGE_DAYS} days old"
           }
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Run age-check-actions.sh
+        env:
+          MIN_AGE_DAYS: ${{ inputs.min_age_days }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
+          # Default skip-list includes this very workflow repo so fresh
+          # releases here don't self-block. Override via env to tighten
+          # or widen the list.
+          AGE_CHECK_SKIP_SELF_REFS: "layervai/ops-routines layervai/ops-routines-workflows"
+          # Binds the self-reference rollout seam to the caller's organization.
+          # The checker still requires the exact pin to be a verified commit on
+          # the exact repository's protected default branch.
+          ACTIONS_AGE_TRUSTED_OWNER: ${{ github.repository_owner }}
+          # `record_failure` writes a TSV row here for each too-new pin
+          # so the post-step below can render the data into a comment
+          # without redoing classification. Unset → no-op.
+          AGE_CHECK_FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Assembled by the `Assemble the age-check library` step(s) above; see
+          # the header of scripts/embed-lib-into-workflows.py for why the library
+          # is written to a file rather than inlined here.
+          # shellcheck source=/dev/null
+          source "${RUNNER_TEMP}/ops-routines-age-check.sh"
           actions_age::main
 
       - name: Comment retry-after dates on PR
