@@ -3977,7 +3977,39 @@ jobs:
           # npmjs. The fold has to be applied to the ENTRY host too, not just
           # here: the pnpm awk, the package-lock jq and the yarn awk each repeat
           # it, because their host never passes through this function. All three
-          # are repeat sites — change the fold and change them together.
+          # are repeat sites — change the fold and change them together, and the
+          # same holds for the three normalisations above it. That is enforced
+          # rather than asked for by a drift canary that drives this function and
+          # the three entry-side copies over one shared host set, and goes red if
+          # any one of them drops any one step.
+          #
+          # Fenced by: test_host_canonicalisation_does_not_drift_between_extractors
+          #
+          # That line is a marker, not prose: a guard in the same file checks every
+          # `Fenced by:` name still resolves to a test that is both defined AND
+          # registered, so this pointer cannot rot into a comment aimed at nothing.
+          # Citation is opt-in through that marker precisely so an ordinary
+          # `test_dir` mentioned in any lib comment is not mistaken for one.
+          #
+          # Scope, so the next person does not over-trust it: the canary covers the
+          # four URL->host derivations only. npm_age::parse_pnpm_lock has a FIFTH
+          # host comparison — the v5 registry-qualified KEY arm — which prefix-
+          # matches a raw lockfile key against this function's already-canonical
+          # output, so a key qualified `registry.yarnpkg.com/`, `Registry.NpmJS.org/`
+          # or `registry.npmjs.org:443/` misses it and the entry is counted
+          # non-registry. By default that is fail-closed — the file returns rc 3
+          # and the run goes red as "resolves nothing from a registry", which is
+          # the very red that arm exists to prevent. It is NOT fail-closed under
+          # `allow_registry_free`: the same miscount reaches rc 4, a pass, so a
+          # repo that set that flag while it genuinely had no registry deps gets a
+          # green check over a v5 lockfile full of real ones.
+          #
+          # The fix, stated here rather than pointed at, so this comment stays
+          # useful wherever it is read: canonicalise the key's host segment before
+          # that prefix match, with the same steps as above minus the
+          # scheme-gating, since a key carries no scheme. It is deliberately not
+          # done in the change that added this note — that one is test-only, and
+          # this moves a supply-chain gate's verdict.
           npm_age::registry_host() {
             local url="$1" scheme=""
             case "$url" in *://*) scheme="${url%%://*}" ;; esac
@@ -4656,6 +4688,13 @@ jobs:
 
           # Fetches the registry response for $1 and emits the publish time for
           # version $2 on stdout. Exit codes:
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   0 - success (stdout may still be empty if the version isn't in .time)
           #   1 - registry says 404/410 (package private, scope-only, unpublished)
           #   3 - registry says 401/403: reachable, but refusing us. Distinct from
@@ -4692,13 +4731,6 @@ jobs:
 
             # -sS: silent, but show errors on stderr. --compressed: negotiate
             # gzip/deflate for large packuments. --retry 2 with backoff handles
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # transient 5xx and network blips. `|| echo "000"` covers curl
             # crashing before -w can print, falling us through to the transient
             # branch below.
