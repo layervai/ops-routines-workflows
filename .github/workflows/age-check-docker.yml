@@ -74,7 +74,7 @@ jobs:
           go install github.com/google/go-containerregistry/cmd/crane@latest
           echo "${HOME}/go/bin" >> "${GITHUB_PATH}"
 
-      - name: Write the age-check library — lib/_preflight.sh, lib/age-check-docker.sh (part 1 of 2)
+      - name: Write the age-check library — lib/_preflight.sh (part 1 of 2)
         run: |
           set -euo pipefail
           rm -rf "${RUNNER_TEMP:?}/ops-routines-lib"
@@ -145,8 +145,13 @@ jobs:
               command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
             done
             if [ ${#missing[@]} -gt 0 ]; then
-              echo "::error::Required tools not available on runner: ${missing[*]}. This workflow depends on ubuntu-latest (or a runner image with these installed)."
-              exit 1
+              # A not_run row, like the base-ref failures below: the remedy is the
+              # runner image, so the PR comment must not offer a re-run or the
+              # bypass label. Joined by safe_list_for_md, not `${missing[*]}`: the
+              # libs set IFS to newline+tab, so `*` would join on a newline that
+              # _record_reason_row strips, jamming "curl jq" into "curljq".
+              local safe_missing; safe_missing=$(preflight::safe_list_for_md "${missing[@]}")
+              preflight::fail_not_run "runner" "required tools not available on the runner: ${safe_missing} — this workflow depends on ubuntu-latest, or a runner image with them installed"
             fi
           }
 
@@ -156,8 +161,7 @@ jobs:
           # regression if the runner ever stops providing GNU date.
           preflight::require_gnu_date() {
             if ! date -d @0 >/dev/null 2>&1; then
-              echo "::error::GNU date -d not available on runner — this workflow depends on GNU date's \`@\`-prefix epoch syntax. Fix: run on an \`ubuntu-latest\` / Linux runner, or replace the \`date -d\` calls with a portable alternative (e.g., \`python -c 'from datetime import datetime; ...'\`)."
-              exit 1
+              preflight::fail_not_run "runner" "GNU date -d is not available on the runner — this workflow depends on GNU date's @-prefix epoch syntax; run on an ubuntu-latest / Linux runner, or replace the date -d calls with a portable alternative"
             fi
           }
 
@@ -176,13 +180,25 @@ jobs:
             # Require at least one digit, reject non-digits. The `10#` base-10
             # prefix on the arithmetic below sidesteps bash's octal interpretation
             # of leading zeros (`$((07))` is 7 but `$((08))` is a syntax error).
+            # not_run rows (see fail_not_run): the remedy is the workflow input,
+            # so the PR comment must not offer a re-run or the bypass label — with
+            # MIN_AGE_DAYS=0 the label would switch the gate off on a repo whose
+            # quarantine is already a no-op. The value came from the caller's
+            # workflow and is rendered as markdown, so it is sanitized first.
+            # "unset" only when it IS unset: a value that sanitizes to nothing
+            # (`%%%`, whitespace) is present and wrong, and saying "unset" would
+            # send the operator to add an input they already have. Parentheses,
+            # not angle brackets: this reaches two markdown surfaces, and GitHub
+            # drops an unknown tag like `<unprintable>` on both.
+            local shown="unset"
+            if [ -n "$raw" ]; then
+              shown=$(preflight::safe_for_md "$raw"); shown="${shown:-(unprintable)}"
+            fi
             if ! [[ "$raw" =~ ^[0-9]+$ ]]; then
-              echo "::error::MIN_AGE_DAYS must be a positive integer (got: ${raw:-<unset>})"
-              exit 1
+              preflight::fail_not_run "MIN_AGE_DAYS" "MIN_AGE_DAYS must be a positive integer (got: ${shown})"
             fi
             if [ "$((10#$raw))" -lt 1 ]; then
-              echo "::error::MIN_AGE_DAYS must be >= 1 (got: ${raw}). Zero would make the quarantine a silent-pass no-op."
-              exit 1
+              preflight::fail_not_run "MIN_AGE_DAYS" "MIN_AGE_DAYS must be at least 1 (got: ${shown}) — zero would make the quarantine a silent-pass no-op"
             fi
             # Normalize to the base-10 numeric form so all subsequent callers do
             # integer comparisons without re-parsing leading zeros. Exported
@@ -252,8 +268,9 @@ jobs:
           # record_not_run for why that row gets its own section) and the
           # step-summary footer. For the failures a consumer repo reaches through
           # an ordinary workflow setting — an unfetched base branch, a shallow
-          # checkout — because the PR comment is the one surface an operator sees
-          # without opening the run log. That comment only exists when there is a
+          # checkout, a runner image without a required tool, a MIN_AGE_DAYS that
+          # is not a positive integer — because the PR comment is the one surface
+          # an operator sees without opening the run log. That comment only exists when there is a
           # pull request to put it on: the render step is gated on a PR number,
           # so a `push` or `workflow_dispatch` run — the shapes that reach these
           # failures most easily — gets the ::error and the summary footer only.
@@ -261,9 +278,11 @@ jobs:
           # header, since preflight runs first; its text stands on its own.
           #
           # Both arguments arrive SANITIZED (see verify_base_ref): they are rendered
-          # as markdown twice over. `reason` is one lowercase clause with no
-          # terminal period — the footer wraps it as `— ${reason}.` and the
-          # comment renders it in a table cell beside short sibling clauses.
+          # as markdown twice over. `display_id` names WHERE the fix goes — the
+          # base ref, the runner, the input — and heads the comment's "Where"
+          # column. `reason` is one lowercase clause with no terminal period — the
+          # footer wraps it as `— ${reason}.` and the comment renders it in a
+          # table cell beside short sibling clauses.
           preflight::fail_not_run() {
             local display_id="$1" reason="$2"
             echo "::error::${reason}"
@@ -661,7 +680,10 @@ jobs:
           preflight::_record_reason_row() {
             local file="${AGE_CHECK_FAILURES_FILE:-}"
             [ -z "$file" ] && return 0
-            local display_id="$1" display_version="$2" reason="$3" kind="$4"
+            # An id that sanitized away entirely (a FROM spec made of characters
+            # safe_for_md strips) must still render: the comment's loops skip a
+            # row with an empty id, leaving a section header over an empty table.
+            local display_id="${1:-(unprintable)}" display_version="$2" reason="$3" kind="$4"
             reason=$(printf '%s' "$reason" | tr -d '\t\n|')
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
               "$display_id" "$display_version" "?" \
@@ -743,6 +765,11 @@ jobs:
             if ! publish_epoch=$(preflight::iso8601_to_epoch "$publish_time"); then
               echo "::error${file_prefix}Could not parse publish timestamp for ${full_id}: ${publish_time}"
               echo "| \`${display_id}\` | ${display_version} | — | :x: parse error |" >> "$GITHUB_STEP_SUMMARY"
+              # Its own row: this fails the run, and without one the exit guard's
+              # generic row would stand in for a pin the check did look at. The
+              # raw timestamp stays in the log only — it is registry data.
+              preflight::record_unverifiable "$display_id" "$display_version" \
+                "the registry returned a publish timestamp that could not be parsed — see the job log"
               return 3
             fi
 
@@ -874,6 +901,21 @@ jobs:
           # string collapses "package-lock.json, yarn.lock" into
           # "package-lock.jsonyarn.lock". Map-then-join makes the safe order the
           # obvious one for the next caller.
+          # Sanitize a lib-authored SENTENCE that carries a config value — a
+          # validator's own "::error::" line, reused as a not_run row's reason —
+          # for the markdown cells it lands in. safe_for_md's allowlist would
+          # strip the spaces; this strips only what is markdown-active in a table
+          # cell or a blockquote (backticks, emphasis, brackets, angle brackets,
+          # backslashes), drops non-printing bytes — so hand it ONE line: a
+          # newline is deleted, not spaced — and caps the length. The pipe is
+          # stripped again by _record_reason_row.
+          preflight::safe_sentence_for_md() {
+            # `'\\'` reaches tr as an escaped backslash; a lone one at the end of
+            # the set makes GNU tr print a portability warning on every call.
+            # shellcheck disable=SC1003
+            printf '%s' "$1" | tr -d '`*[]<>\\' | tr -cd '[:print:]' | cut -c1-320
+          }
+
           preflight::safe_list_for_md() {
             local out="" item safe
             for item in "$@"; do
@@ -979,6 +1021,159 @@ jobs:
               echo ""
               echo "> **Nothing could be verified — ${reason}.** No dependency was age-checked in this run, so this fails rather than reporting a pass it cannot support."
             } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          # Fail a run that could not even read one manifest's diff, on every
+          # surface an operator reads — the log annotation, the summary ROW
+          # (record_unverifiable writes only the TSV, and a footer over an empty
+          # table is exactly what this prevents), the failures TSV and the summary
+          # footer — then exit 1. Every ecosystem captures its separable parsers
+          # with `$(...)`; before this, a parser whose `git diff` failed killed the
+          # step under `set -e` with the failures file EMPTY, and
+          # templates/snippets/comment-on-failure.sh — which runs on
+          # `!cancelled()` and gates on `[ -s "$FAILURES_FILE" ]` — then took its
+          # DELETE branch, erasing a legitimate "these pins are too new" sticky
+          # from an earlier run and leaving a red check whose only evidence was
+          # one log line.
+          #
+          # The caller closes any open `::group::` first and hands in <safe_file>
+          # already sanitized — it is rendered as markdown twice over — plus the
+          # RAW path as <path> for the `file=` annotation, which attaches to the
+          # Files Changed tab only under the path as it is, not one with its
+          # spaces stripped or its length capped (it defaults to <safe_file> for
+          # a caller that has only that); and it owns the accuracy of <reason>: this helper writes what it is told, so
+          # a caller that maps every non-zero parser status to one sentence must
+          # be sure the parser has only that one failure mode. <cell> is the
+          # status column of the summary row; <reason> is one lowercase clause
+          # with no terminal period, as for fail_not_run, and must name the file,
+          # since the footer and the comment cell both stand on their own.
+          #
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/age-check-docker.sh
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          # Deliberately not step_summary_failed: that footer hands out the
+          # age-check-bypass label, which clears the check — the wrong remedy for
+          # a transient git failure, where a re-run is. (The PR comment still
+          # offers the label for every `unverifiable` row; see the renderer.)
+          preflight::fail_unverifiable_file() {
+            local safe_file="$1" cell="$2" reason="$3" path="${4:-$1}"
+            echo "::error file=${path}::${reason}"
+            preflight::_fail_unverifiable_row "$safe_file" "$cell" "$reason"
+          }
+
+          # The shared tail of the two failures above: summary row, TSV row,
+          # footer, exit. The version column carries the "n/a" sentinel every
+          # whole-file row uses; the renderer prints a sentinel-versioned id
+          # without its separator, so it does not read as a pin.
+          preflight::_fail_unverifiable_row() {
+            local display="$1" cell="$2" reason="$3"
+            echo "| \`${display}\` | — | — | ${cell} |" >> "$GITHUB_STEP_SUMMARY"
+            preflight::record_unverifiable "$display" "n/a" "$reason"
+            preflight::step_summary_unverifiable "$reason"
+            exit 1
+          }
+
+          # The per-file parser's `git diff` failed: close the group the caller
+          # opened for <raw_file>, then fail as above. Every ecosystem runs its
+          # per-file parser as `x=$(parser "$file" "$rev") || preflight::fail_unreadable_diff "$file"`
+          # — `||` rather than a bare capture, because under `set -e` the bare
+          # form is the abort this whole family exists to prevent. The one sentence
+          # names the failure the parsers announce: git_diff_or_fail's. Under
+          # `pipefail` a later stage of a parser's pipeline failing (an awk that
+          # cannot run) returns non-zero too and lands here misnamed — still
+          # closed, with the job log to disambiguate — so a parser that grows a
+          # failure mode of its own should announce it and route it elsewhere.
+          preflight::fail_unreadable_diff() {
+            echo "::endgroup::"
+            local safe_file; safe_file=$(preflight::safe_for_md "$1")
+            preflight::fail_unverifiable_file "$safe_file" ":x: diff could not be read" \
+              "git diff against the merge base failed for ${safe_file}, so nothing in it was age-checked — re-run the job, and see its log if this repeats" \
+              "$1"
+          }
+
+          # The file-discovery parser's `git diff --name-only` failed, before the
+          # ecosystem header was written and before any file was named: write the
+          # header for <header> unless this step's summary already carries it (a
+          # header-first caller would otherwise get two), annotate without a file
+          # (the failing operation is repo-wide, and a `file=` on a path that may
+          # not be in the diff attaches nowhere), and fail as above with <display>
+          # — the manifest kind, e.g. `go.sum` — as the row's id and <noun> as its
+          # plural in the sentence.
+          preflight::fail_unlisted_files() {
+            local header="$1" display="$2" noun="$3"
+            local reason="git diff --name-only against the merge base failed, so the changed ${noun} could not be listed and nothing was age-checked — re-run the job, and see its log if this repeats"
+            # `-s`: the summary is /dev/null outside Actions, and reads as empty.
+            # <header> lands in a BRE unescaped: the five ecosystem labels are
+            # plain words, and a new one must stay free of regex metacharacters.
+            grep -qs "^## Dependency Age Check — ${header}\$" "$GITHUB_STEP_SUMMARY" \
+              || preflight::step_summary_header "$header"
+            echo "::error::${reason}"
+            preflight::_fail_unverifiable_row "$display" ":x: changed files could not be listed" "$reason"
+          }
+
+          # Last-resort row for a red exit that recorded none, so that no failing
+          # exit that reaches a trap leaves the failures file empty for the comment
+          # renderer's delete branch (see fail_unverifiable_file). Specific paths
+          # still record their own, better-worded rows first — the preflight exits
+          # above are `not_run` rows, the parser failures name their file, a pin
+          # that fails names itself — and this only fires when nothing did. Its
+          # sentence says only what is then known: a red exit with no per-item
+          # reason recorded; NOT "verified nothing", which a future path that
+          # fails red without a row (as docker's unpinned FROM once did) would
+          # make false. Installed by install_exit_guard; `$?` at function entry
+          # is the status the EXIT trap fired with.
+          #
+          # What it cannot cover: a run step that never starts (a checkout failure
+          # ahead of it), a syntax error in the embedded script, or a SIGKILL —
+          # the runner's follow-up to an unanswered SIGTERM — none of which reach
+          # a trap. Those leave the file empty and the renderer deleting; closing
+          # them needs the renderer to be told the run step's outcome.
+          preflight::exit_guard() {
+            local ecosystem="$1" rc="${2:-$?}"
+            if [ "$rc" -ne 0 ] \
+               && [ -n "${AGE_CHECK_FAILURES_FILE:-}" ] \
+               && [ ! -s "$AGE_CHECK_FAILURES_FILE" ]; then
+              local reason="the age check failed without recording a per-item reason (exit ${rc}) — see the job log"
+              preflight::record_unverifiable "$ecosystem" "—" "$reason"
+              # The summary too: on this path nothing else has written it, and an
+              # empty Job Summary panel was the other half of the original symptom.
+              preflight::step_summary_unverifiable "$reason"
+            fi
+          }
+
+          # Install exit_guard for <ecosystem> as this shell's EXIT trap, followed
+          # by <cleanup> (optional shell text), and make a TERM/INT — how a
+          # `timeout-minutes` kill arrives — exit through it with the conventional
+          # status, so the row names the kill. Each ecosystem calls this first
+          # thing in main, ahead of the preflight helpers that `exit`. Cleanup runs
+          # AFTER the guard, so its status cannot mask the exit status the guard
+          # reads, and inside `{ ...; } || true`, so under the libs' `set -e` a
+          # failing command in it can neither cut the trap short nor carry its own
+          # status out as the step's. It names its files as `"${VAR:-}"` because
+          # the trap can fire before they exist. `trap ... EXIT` replaces rather
+          # than appends: every EXIT-time action belongs in <cleanup>, never in a
+          # second `trap` — tests/workflow_lint_test.sh fails any other EXIT trap
+          # in lib/.
+          #
+          # Best effort on a signal: bash runs the handler only once the foreground
+          # command returns, so a step killed mid-`curl` and then SIGKILLed after
+          # the grace period records nothing (see exit_guard).
+          preflight::install_exit_guard() {
+            local ecosystem="$1" cleanup="${2:-}"
+            # The guard is wrapped the same way as the cleanup: its row is one
+            # `printf >>`, and if that fails (the file's directory gone, ENOSPC)
+            # errexit inside the trap would skip the cleanup and make the printf's
+            # status the step's.
+            local handler; printf -v handler '{ preflight::exit_guard %q; } || true' "$ecosystem"
+            [ -n "$cleanup" ] && handler="${handler}; { ${cleanup}; } || true"
+            # shellcheck disable=SC2064
+            trap "$handler" EXIT
+            trap 'exit 143' TERM
+            trap 'exit 130' INT
           }
 
           # Guard against "registry outage → every package skipped → workflow
@@ -1093,13 +1288,6 @@ jobs:
                   while (i <= NF && substr($i, 1, 2) == "--") i++
                   if (i <= NF) print $i
                 }' \
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-docker.sh (part 2 of 2)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-docker.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               | while IFS= read -r spec; do
                   [ -z "$spec" ] && continue
                   case "$spec" in
@@ -1188,6 +1376,11 @@ jobs:
           # ----- Main -----------------------------------------------------------------
 
           docker_age::main() {
+            # First, before anything that can exit — the preflight helpers below
+            # `exit` from inside _preflight.sh — so that no red exit leaves the
+            # failures file empty for the comment renderer's delete branch.
+            preflight::install_exit_guard docker
+
             preflight::require_tools curl jq awk sed grep sort
             preflight::require_gnu_date
             preflight::validate_min_age_days
@@ -1200,7 +1393,12 @@ jobs:
             local failed=false
             local checked_count=0
 
-            local files; files=$(docker_age::changed_dockerfiles "$base_rev")
+            # `|| helper`, not a bare capture: under `set -e` a parser whose
+            # `git diff` failed would kill the step here with an empty failures
+            # file (see preflight::fail_unlisted_files). It has said why on stderr.
+            local files
+            files=$(docker_age::changed_dockerfiles "$base_rev") \
+              || preflight::fail_unlisted_files "Docker" "Dockerfile" "Dockerfiles"
             if [ -z "$files" ]; then
               echo "No Dockerfile changes detected"
               preflight::step_summary_no_changes "Docker" "No Dockerfile changes detected in this diff."
@@ -1211,7 +1409,8 @@ jobs:
 
             for file in $files; do
               echo "::group::Checking ${file}"
-              local froms; froms=$(docker_age::added_froms "$file" "$base_rev")
+              local froms
+              froms=$(docker_age::added_froms "$file" "$base_rev") || preflight::fail_unreadable_diff "$file"
               if [ -z "$froms" ]; then
                 echo "No new FROM lines in ${file}"
                 echo "::endgroup::"
@@ -1227,6 +1426,11 @@ jobs:
                     local safe_raw; safe_raw=$(preflight::safe_for_md "$raw")
                     echo "::error file=${file}::FROM ${raw} is not pinned by @sha256:<digest>; refusing"
                     echo "| \`${safe_raw}\` | — | — | :x: not pinned by @sha256 |" >> "$GITHUB_STEP_SUMMARY"
+                    # Its own row, naming the fix: this is the failure the docker
+                    # check exists to produce, and without a row the exit guard's
+                    # generic "see the job log" would be all the PR comment said.
+                    preflight::record_unverifiable "$safe_raw" "—" \
+                      "not pinned by an @sha256 digest, so it has no age to check — pin it; a re-run will not help"
                     failed=true
                     ;;
                   PINNED:*)
@@ -1238,6 +1442,8 @@ jobs:
                       local safe_ref; safe_ref=$(preflight::safe_for_md "$ref")
                       echo "::error file=${file}::FROM ${safe_ref} — image reference failed shape validation (rejected)"
                       echo "| \`${safe_ref}\` | — | — | :x: invalid ref shape |" >> "$GITHUB_STEP_SUMMARY"
+                      preflight::record_unverifiable "$safe_ref" "—" \
+                        "image reference failed shape validation — fix the FROM line; a re-run will not help"
                       failed=true
                       continue
                     fi
@@ -1440,10 +1646,27 @@ jobs:
               unverifiable_out="${unverifiable_failures}" \
               not_run_out="${not_run_failures}" \
               "${deduped_failures}" "${deduped_failures}"; then
-              echo "::warning::age-check renderer failed to split rows by kind; falling back to a flat list — some entries may be unverifiable rather than too-new (see the per-pin annotations in this run for the real classification)."
-              cp "${deduped_failures}" "${too_new_failures}"
-              : > "${unverifiable_failures}"
-              : > "${not_run_failures}"
+              echo "::warning::age-check renderer failed to split rows by kind; falling back to a split without cross-kind dedupe — a pin that is both too-new and unverifiable in one run may be listed twice (see the per-pin annotations in this run for the real classification)."
+              # Each kind still gets its own section — the not_run copy is the
+              # remedy (a setting, not a re-run), and the too-new columns would
+              # put an unverifiable reason under "Eligible after" — split by the
+              # kind column with grep, since awk is what just failed. What is lost
+              # is only the cross-kind dedupe above.
+              grep $'\tnot_run$' "${deduped_failures}" > "${not_run_failures}" || true
+              grep $'\tunverifiable$' "${deduped_failures}" > "${unverifiable_failures}" || true
+              grep -vE $'\t(not_run|unverifiable)$' "${deduped_failures}" > "${too_new_failures}" || true
+            fi
+
+            # A sentinel version (`n/a`, `—`) marks a row for a whole file or a
+            # whole run, which is not a "Module" or "Package"; head the id column
+            # of BOTH tables neutrally when any such row is present — decided on
+            # the raw rows, so the degraded fallback above (every row into the
+            # too-new table) gets the same header as the split render — and with
+            # grep, not awk, so the fallback that exists for a broken awk still
+            # heads the table right.
+            id_column="${ITEM_COLUMN}"
+            if grep -qE $'^[^\t]*\t(n/a|—)\t' "${deduped_failures}"; then
+              id_column="Item"
             fi
 
             # shellcheck disable=SC2016
@@ -1458,8 +1681,8 @@ jobs:
               # shares a comment with the two pin sections below.
               if [ -s "${not_run_failures}" ]; then
                 printf '#### The check could not run\n\n'
-                printf 'The check stopped before examining any dependency. The reason names the fix — a checkout setting, not a registry outage — so running the check again will not help until that setting is changed.\n\n'
-                printf '| Base ref | Reason |\n'
+                printf 'The check stopped before examining any dependency. The reason names the fix — a checkout or workflow setting, not a registry outage — so running the check again will not help until that setting is changed.\n\n'
+                printf '| Where | Reason |\n'
                 printf '|---|---|\n'
                 while IFS=$'\t' read -r id _ver _age _min reason _remaining _kind; do
                   [ -z "${id}" ] && continue
@@ -1471,25 +1694,37 @@ jobs:
               if [ -s "${too_new_failures}" ]; then
                 printf '#### Pins below quarantine\n\n'
                 printf 'New pin(s) below have not yet reached the **%s-day** quarantine. Wait until the eligible date, push any new commit, and the check will pass.\n\n' "${MIN_AGE_DAYS}"
-                printf '| %s | Age (days) | Eligible after | Days remaining |\n' "${ITEM_COLUMN}"
+                printf '| %s | Age (days) | Eligible after | Days remaining |\n' "${id_column}"
                 printf '|---|---:|---|---:|\n'
                 while IFS=$'\t' read -r id ver age _min eligible remaining _kind; do
                   [ -z "${id}" ] && continue
-                  printf '| `%s%s%s` | %s | %s | %s |\n' \
-                    "${id}" "${SEPARATOR}" "${ver}" "${age}" "${eligible}" "${remaining}"
+                  # Sentinel-aware like the unverifiable loop below: the degraded
+                  # fallback above dumps every row here, sentinel versions included.
+                  case "${ver}" in
+                    n/a|—) printf '| `%s` | %s | %s | %s |\n' \
+                             "${id}" "${age}" "${eligible}" "${remaining}" ;;
+                    *)     printf '| `%s%s%s` | %s | %s | %s |\n' \
+                             "${id}" "${SEPARATOR}" "${ver}" "${age}" "${eligible}" "${remaining}" ;;
+                  esac
                 done < "${too_new_failures}"
                 printf '\n'
               fi
 
               if [ -s "${unverifiable_failures}" ]; then
                 printf '#### Pins that could not be verified\n\n'
-                printf 'Upstream metadata fetch failed for the pin(s) below. This is usually a transient registry/API issue — re-run the failed check from the Actions tab; if it keeps failing, open an issue with the reason text.\n\n'
-                printf '| %s | Reason |\n' "${ITEM_COLUMN}"
+                printf 'The item(s) below could not be age-checked. The reason names the cause and, where there is one, the fix. For an upstream fetch failure or a git error — usually transient — re-run the failed check from the Actions tab, and open an issue with the reason text if it keeps failing.\n\n'
+                printf '| %s | Reason |\n' "${id_column}"
                 printf '|---|---|\n'
                 while IFS=$'\t' read -r id ver _age _min reason _remaining _kind; do
                   [ -z "${id}" ] && continue
-                  printf '| `%s%s%s` | %s |\n' \
-                    "${id}" "${SEPARATOR}" "${ver}" "${reason}"
+                  # A row for a whole file or a whole run carries a sentinel
+                  # version; joining it with the separator renders `go.sum@n/a`,
+                  # which reads as a pin that does not exist.
+                  case "${ver}" in
+                    n/a|—) printf '| `%s` | %s |\n' "${id}" "${reason}" ;;
+                    *)     printf '| `%s%s%s` | %s |\n' \
+                             "${id}" "${SEPARATOR}" "${ver}" "${reason}" ;;
+                  esac
                 done < "${unverifiable_failures}"
                 printf '\n'
               fi
