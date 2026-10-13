@@ -74,11 +74,13 @@ jobs:
           go install github.com/google/go-containerregistry/cmd/crane@latest
           echo "${HOME}/go/bin" >> "${GITHUB_PATH}"
 
-      - name: Assemble the age-check library (part 1 of 2)
+      - name: Write the age-check library — lib/_preflight.sh, lib/age-check-docker.sh (part 1 of 2)
         run: |
           set -euo pipefail
-          rm -f "${RUNNER_TEMP}/ops-routines-age-check.sh"
-          cat > "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          rm -rf "${RUNNER_TEMP:?}/ops-routines-lib"
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat > "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          #!/usr/bin/env bash
           # ============================================================================
           # _preflight.sh - Shared preflight helpers for age-check-*.sh
           # ============================================================================
@@ -989,7 +991,9 @@ jobs:
               echo "> **No packages could be verified** (all ${skipped_count} were skipped). Treating as failure to avoid silent pass on registry outage."
             } >> "$GITHUB_STEP_SUMMARY"
           }
-
+          OPS_ROUTINES_AGE_CHECK_LIB
+          cat > "${RUNNER_TEMP}/ops-routines-lib/age-check-docker.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          #!/usr/bin/env bash
           # ============================================================================
           # age-check-docker.sh - Block newly published container images (supply chain)
           # ============================================================================
@@ -1021,6 +1025,8 @@ jobs:
           MIN_AGE_DAYS="${MIN_AGE_DAYS:-14}"
           BASE_REF="${BASE_REF:-main}"
 
+          # shellcheck source=lib/_preflight.sh
+          source "$(dirname "${BASH_SOURCE[0]}")/_preflight.sh"
 
           # ----- Input validation: image reference ------------------------------------
 
@@ -1087,17 +1093,18 @@ jobs:
                   while (i <= NF && substr($i, 1, 2) == "--") i++
                   if (i <= NF) print $i
                 }' \
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-docker.sh (part 2 of 2)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-docker.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               | while IFS= read -r spec; do
                   [ -z "$spec" ] && continue
                   case "$spec" in
                     scratch|"") continue ;;
                   esac
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Assemble the age-check library (part 2 of 2)
-        run: |
-          set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   if [[ "$spec" == *"@sha256:"* ]]; then
                     # strip any trailing "AS <stage>"
                     echo "PINNED:${spec%% *}"
@@ -1274,6 +1281,13 @@ jobs:
             preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS"
             echo "All Docker dependencies are at least ${MIN_AGE_DAYS} days old"
           }
+
+          if [ "${BASH_SOURCE[0]}" = "$0" ] || [ -z "${BASH_SOURCE[0]:-}" ]; then
+            docker_age::main "$@"
+          fi
+
+          # Example:
+          #   MIN_AGE_DAYS=14 BASE_REF=main bash lib/age-check-docker.sh
           OPS_ROUTINES_AGE_CHECK_LIB
 
       - name: Check Docker base-image ages
@@ -1289,11 +1303,12 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="${HOME}/go/bin:${PATH}"
-          # Assembled by the `Assemble the age-check library` step(s) above; see
-          # the header of scripts/embed-lib-into-workflows.py for why the library
-          # is written to a file rather than inlined here.
+          # Written verbatim from lib/ by the `Write the age-check library` step(s)
+          # above, into the same directory, so this resolves the shared libs the
+          # way a local checkout does. See the header of
+          # scripts/embed-lib-into-workflows.py.
           # shellcheck source=/dev/null
-          source "${RUNNER_TEMP}/ops-routines-age-check.sh"
+          source "${RUNNER_TEMP}/ops-routines-lib/age-check-docker.sh"
           docker_age::main
 
       - name: Comment retry-after dates on PR

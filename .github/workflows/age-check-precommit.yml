@@ -112,11 +112,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Assemble the age-check library (part 1 of 3)
+      - name: Write the age-check library — lib/_preflight.sh, lib/age-check-precommit.sh (part 1 of 3)
         run: |
           set -euo pipefail
-          rm -f "${RUNNER_TEMP}/ops-routines-age-check.sh"
-          cat > "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          rm -rf "${RUNNER_TEMP:?}/ops-routines-lib"
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat > "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          #!/usr/bin/env bash
           # ============================================================================
           # _preflight.sh - Shared preflight helpers for age-check-*.sh
           # ============================================================================
@@ -1027,7 +1029,9 @@ jobs:
               echo "> **No packages could be verified** (all ${skipped_count} were skipped). Treating as failure to avoid silent pass on registry outage."
             } >> "$GITHUB_STEP_SUMMARY"
           }
-
+          OPS_ROUTINES_AGE_CHECK_LIB
+          cat > "${RUNNER_TEMP}/ops-routines-lib/age-check-precommit.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          #!/usr/bin/env bash
           # ============================================================================
           # age-check-precommit.sh - Block newly-pinned pre-commit hook revs (supply chain)
           # ============================================================================
@@ -1095,10 +1099,11 @@ jobs:
           #   further down), and a TRANSIENT one — rate limit, 5xx, anything
           OPS_ROUTINES_AGE_CHECK_LIB
 
-      - name: Assemble the age-check library (part 2 of 3)
+      - name: Write the age-check library — lib/age-check-precommit.sh (part 2 of 3)
         run: |
           set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-precommit.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   unrecognized — fails closed instead of falling through. Otherwise an
           #   unrelated blip would silently convert a tier-1 block into a tier-4 pass on
           #   the very rev whose Release was published today; re-running the job is the
@@ -1191,6 +1196,8 @@ jobs:
           MIN_AGE_DAYS="${MIN_AGE_DAYS:-7}"
           BASE_REF="${BASE_REF:-main}"
 
+          # shellcheck source=lib/_preflight.sh
+          source "$(dirname "${BASH_SOURCE[0]}")/_preflight.sh"
 
           # ----- Input validation: github slug + tag ----------------------------------
 
@@ -2019,14 +2026,15 @@ jobs:
             printf '%s' "$ts"
           }
 
-          # Best-effort ISO-8601 timestamp the tag became public; return 1 if
-          # unverifiable. Four tiers: three authenticated, then a credential-free git
           OPS_ROUTINES_AGE_CHECK_LIB
 
-      - name: Assemble the age-check library (part 3 of 3)
+      - name: Write the age-check library — lib/age-check-precommit.sh (part 3 of 3)
         run: |
           set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-precommit.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          # Best-effort ISO-8601 timestamp the tag became public; return 1 if
+          # unverifiable. Four tiers: three authenticated, then a credential-free git
           # read (see header for the age-basis rationale and what tier 4 cannot cover).
           precommit_age::publish_dt() {
             local slug="$1" tag="$2" ts ref obj_type sha api_reason api_kind git_reason
@@ -2391,6 +2399,13 @@ jobs:
             preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS"
             echo "All pre-commit hook revs are at least ${MIN_AGE_DAYS} days old"
           }
+
+          if [ "${BASH_SOURCE[0]}" = "$0" ] || [ -z "${BASH_SOURCE[0]:-}" ]; then
+            precommit_age::main "$@"
+          fi
+
+          # Example:
+          #   MIN_AGE_DAYS=7 BASE_REF=main GH_TOKEN=ghs_xxx bash lib/age-check-precommit.sh
           OPS_ROUTINES_AGE_CHECK_LIB
 
       - name: Run age-check-precommit.sh
@@ -2434,11 +2449,12 @@ jobs:
           # without any network call at all.
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Assembled by the `Assemble the age-check library` step(s) above; see
-          # the header of scripts/embed-lib-into-workflows.py for why the library
-          # is written to a file rather than inlined here.
+          # Written verbatim from lib/ by the `Write the age-check library` step(s)
+          # above, into the same directory, so this resolves the shared libs the
+          # way a local checkout does. See the header of
+          # scripts/embed-lib-into-workflows.py.
           # shellcheck source=/dev/null
-          source "${RUNNER_TEMP}/ops-routines-age-check.sh"
+          source "${RUNNER_TEMP}/ops-routines-lib/age-check-precommit.sh"
           precommit_age::main
 
       - name: Comment retry-after dates on PR

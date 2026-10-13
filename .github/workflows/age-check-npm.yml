@@ -175,11 +175,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Assemble the age-check library (part 1 of 5)
+      - name: Write the age-check library — lib/_preflight.sh, lib/_npm-lockfile-parsers.sh (part 1 of 3)
         run: |
           set -euo pipefail
-          rm -f "${RUNNER_TEMP}/ops-routines-age-check.sh"
-          cat > "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          rm -rf "${RUNNER_TEMP:?}/ops-routines-lib"
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat > "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          #!/usr/bin/env bash
           # ============================================================================
           # _preflight.sh - Shared preflight helpers for age-check-*.sh
           # ============================================================================
@@ -1090,7 +1092,9 @@ jobs:
               echo "> **No packages could be verified** (all ${skipped_count} were skipped). Treating as failure to avoid silent pass on registry outage."
             } >> "$GITHUB_STEP_SUMMARY"
           }
-
+          OPS_ROUTINES_AGE_CHECK_LIB
+          cat > "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          #!/usr/bin/env bash
           # ============================================================================
           # _npm-lockfile-parsers.sh - Lockfile -> pkg@version work-list, for npm
           # ============================================================================
@@ -1161,13 +1165,14 @@ jobs:
           #              the fail-closed branches, so npm and pre-commit
           #              (precommit_age::changed_pins / ::pairs_from_text) cannot
           #              drift on any of them. Format-agnostic by construction.
-          #              Since the pnpm fold every parser here goes through it;
           OPS_ROUTINES_AGE_CHECK_LIB
 
-      - name: Assemble the age-check library (part 2 of 5)
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
         run: |
           set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          #              Since the pnpm fold every parser here goes through it;
           #              nothing in this file compares images itself.
           #              diff_package_lock and diff_pnpm_lock add format-specific
           #              diagnosis around that one call, reading the base image
@@ -2074,13 +2079,14 @@ jobs:
                   # A `resolution:` inside a nested block scalar — a `deprecated: |`
                   # whose prose contains the word — cannot land on it, because YAML
                   # requires block content to sit deeper than the key introducing
-                  # it, and that key is itself at four spaces. `in_packages` rules
           OPS_ROUTINES_AGE_CHECK_LIB
 
-      - name: Assemble the age-check library (part 3 of 5)
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 3)
         run: |
           set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+                  # it, and that key is itself at four spaces. `in_packages` rules
                   # out the same line under `importers:` or `snapshots:`, where v9
                   # repeats every package. Both are load-bearing: a bare grep -c
                   # would double the denominator on every real v9 lockfile.
@@ -2659,7 +2665,9 @@ jobs:
             [ -n "$new_entries" ] && printf '%s\n' "$new_entries"
             return "$rc"
           }
-
+          OPS_ROUTINES_AGE_CHECK_LIB
+          cat > "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          #!/usr/bin/env bash
           # ============================================================================
           # age-check-npm.sh - Block newly published npm dependencies (supply chain)
           # ============================================================================
@@ -2906,13 +2914,14 @@ jobs:
           # - The work-list is keyed on `pkg@version`, so a change that alters
           #   WHERE a pin comes from without moving its version — `resolved`
           #   swapping registry host, or `integrity` changing under a fixed
-          #   version — produces an identical pin and is invisible to the
           OPS_ROUTINES_AGE_CHECK_LIB
 
-      - name: Assemble the age-check library (part 4 of 5)
+      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 3)
         run: |
           set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          #   version — produces an identical pin and is invisible to the
           #   comparison. The old key-line scrape missed it too; noted because
           #   "every pkg@version this branch would newly ship" reads stronger than
           #   what is actually gated.
@@ -3004,6 +3013,8 @@ jobs:
             REGISTRY_URL="${REGISTRY_URL%/}"
           done
 
+          # shellcheck source=lib/_preflight.sh
+          source "$(dirname "${BASH_SOURCE[0]}")/_preflight.sh"
 
           # ----- Input validation: package name --------------------------------------
 
@@ -3283,6 +3294,8 @@ jobs:
           # and readable on purpose. See that file's header for the extractor /
           # comparator seam.
 
+          # shellcheck source=lib/_npm-lockfile-parsers.sh
+          source "$(dirname "${BASH_SOURCE[0]}")/_npm-lockfile-parsers.sh"
 
           # ----- Registry fetch: ISO-8601 timestamp on stdout ------------------------
 
@@ -3827,16 +3840,17 @@ jobs:
                 local remedy
                 if [ "$NPM_AGE_MAX_PINS_FROM_ENV" -eq 1 ]; then
                   remedy="raise both max_pins and timeout_minutes on the calling workflow"
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 else
                   # No MAX_PINS in the environment: this is an older pinned
                   # reusable running a newer lib. Naming `max_pins` here would send
                   # the reader looking for an input their revision lacks.
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Assemble the age-check library (part 5 of 5)
-        run: |
-          set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   remedy="update the pinned ops-routines reusable to a revision that exposes the max_pins and timeout_minutes inputs"
                 fi
                 echo "::error file=${safe_target}::${total_pins_so_far} pins to verify across this run exceeds the ${MAX_PINS}-pin budget. This is a lockfile regeneration or a format migration rather than a dependency bump — review it by hand, ${remedy}, or add the 'age-check-bypass' label."
@@ -4093,6 +4107,14 @@ jobs:
             preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS" "$skipped_count"
             echo "All npm dependencies are at least ${MIN_AGE_DAYS} days old"
           }
+
+          # Only execute main when invoked directly (not when sourced).
+          if [ "${BASH_SOURCE[0]}" = "$0" ] || [ -z "${BASH_SOURCE[0]:-}" ]; then
+            npm_age::main "$@"
+          fi
+
+          # Example:
+          #   MIN_AGE_DAYS=7 BASE_REF=main bash lib/age-check-npm.sh
           OPS_ROUTINES_AGE_CHECK_LIB
 
       - name: Run age-check-npm.sh
@@ -4114,11 +4136,12 @@ jobs:
           AGE_CHECK_ALLOW_REGISTRY_FREE: ${{ inputs.allow_registry_free && '1' || '' }}
           AGE_CHECK_REGISTRY_URL: ${{ inputs.registry_url }}
         run: |
-          # Assembled by the `Assemble the age-check library` step(s) above; see
-          # the header of scripts/embed-lib-into-workflows.py for why the library
-          # is written to a file rather than inlined here.
+          # Written verbatim from lib/ by the `Write the age-check library` step(s)
+          # above, into the same directory, so this resolves the shared libs the
+          # way a local checkout does. See the header of
+          # scripts/embed-lib-into-workflows.py.
           # shellcheck source=/dev/null
-          source "${RUNNER_TEMP}/ops-routines-age-check.sh"
+          source "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh"
           npm_age::main
 
       - name: Comment retry-after dates on PR

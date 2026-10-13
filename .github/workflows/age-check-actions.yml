@@ -60,11 +60,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Assemble the age-check library (part 1 of 3)
+      - name: Write the age-check library — lib/_preflight.sh, lib/age-check-actions.sh (part 1 of 3)
         run: |
           set -euo pipefail
-          rm -f "${RUNNER_TEMP}/ops-routines-age-check.sh"
-          cat > "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          rm -rf "${RUNNER_TEMP:?}/ops-routines-lib"
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat > "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          #!/usr/bin/env bash
           # ============================================================================
           # _preflight.sh - Shared preflight helpers for age-check-*.sh
           # ============================================================================
@@ -975,7 +977,9 @@ jobs:
               echo "> **No packages could be verified** (all ${skipped_count} were skipped). Treating as failure to avoid silent pass on registry outage."
             } >> "$GITHUB_STEP_SUMMARY"
           }
-
+          OPS_ROUTINES_AGE_CHECK_LIB
+          cat > "${RUNNER_TEMP}/ops-routines-lib/age-check-actions.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          #!/usr/bin/env bash
           # ============================================================================
           # age-check-actions.sh - Block newly published GitHub Actions refs
           # ============================================================================
@@ -1023,6 +1027,8 @@ jobs:
           BASE_REF="${BASE_REF:-main}"
           ACTIONS_AGE_TRUSTED_OWNER="${ACTIONS_AGE_TRUSTED_OWNER:-}"
 
+          # shellcheck source=lib/_preflight.sh
+          source "$(dirname "${BASH_SOURCE[0]}")/_preflight.sh"
 
           # ----- Input validation: owner/repo slug ------------------------------------
 
@@ -1052,15 +1058,16 @@ jobs:
             [[ "$slug" != */../* && "$slug" != */.. ]] || return 1
           }
 
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-actions.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-actions.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # ----- Separable: find changed action/workflow files ------------------------
 
           # Split `git diff` from the awk filter so a diff failure (missing
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Assemble the age-check library (part 2 of 3)
-        run: |
-          set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # base ref, invalid workflow_dispatch ref, etc.) doesn't silently
           # pass as "no changes detected." Caller is expected to have already
           # invoked `preflight::verify_base_ref`.
@@ -1989,13 +1996,14 @@ jobs:
                   continue
                 fi
                 if [ -z "$ts" ]; then
-                  echo "::error file=${file}::No committer date for ${owner}/${repo}@${ref_part}"
           OPS_ROUTINES_AGE_CHECK_LIB
 
-      - name: Assemble the age-check library (part 3 of 3)
+      - name: Write the age-check library — lib/age-check-actions.sh (part 3 of 3)
         run: |
           set -euo pipefail
-          cat >> "${RUNNER_TEMP}/ops-routines-age-check.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-actions.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+                  echo "::error file=${file}::No committer date for ${owner}/${repo}@${ref_part}"
                   echo "| \`${safe_owner_repo}\` | \`${safe_sha_short}\` | — | :x: no committer date |" >> "$GITHUB_STEP_SUMMARY"
                   preflight::record_unverifiable "$safe_owner_repo" "$safe_sha_short" \
                     "gh api returned no committer date"
@@ -2040,6 +2048,13 @@ jobs:
             preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS" "$skipped_count"
             echo "All GitHub Actions dependencies are at least ${MIN_AGE_DAYS} days old"
           }
+
+          if [ "${BASH_SOURCE[0]}" = "$0" ] || [ -z "${BASH_SOURCE[0]:-}" ]; then
+            actions_age::main "$@"
+          fi
+
+          # Example:
+          #   MIN_AGE_DAYS=7 BASE_REF=main GH_TOKEN=ghs_xxx bash lib/age-check-actions.sh
           OPS_ROUTINES_AGE_CHECK_LIB
 
       - name: Run age-check-actions.sh
@@ -2060,11 +2075,12 @@ jobs:
           AGE_CHECK_FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Assembled by the `Assemble the age-check library` step(s) above; see
-          # the header of scripts/embed-lib-into-workflows.py for why the library
-          # is written to a file rather than inlined here.
+          # Written verbatim from lib/ by the `Write the age-check library` step(s)
+          # above, into the same directory, so this resolves the shared libs the
+          # way a local checkout does. See the header of
+          # scripts/embed-lib-into-workflows.py.
           # shellcheck source=/dev/null
-          source "${RUNNER_TEMP}/ops-routines-age-check.sh"
+          source "${RUNNER_TEMP}/ops-routines-lib/age-check-actions.sh"
           actions_age::main
 
       - name: Comment retry-after dates on PR
