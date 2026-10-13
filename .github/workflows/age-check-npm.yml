@@ -1314,6 +1314,121 @@ jobs:
               echo "> **No packages could be verified** (all ${skipped_count} were skipped). Treating as failure to avoid silent pass on registry outage."
             } >> "$GITHUB_STEP_SUMMARY"
           }
+
+          # ----- Step-summary notes ----------------------------------------------------
+          #
+          # A diagnostic that does not fail the run — a registry the check could
+          # not match, an input it is taking on its word — is emitted as a bare
+          # `::warning::` / `::notice::`. That reaches the Annotations panel and
+          # the raw log, and nothing else; and it fires on runs that PASS, which
+          # are exactly the runs nobody opens the log of. These two helpers give
+          # such a line a second surface in the step summary.
+          #
+          # NOT the failures TSV. A row there means failed=true to
+          # comment-on-failure.sh — it renders a "Dependency Age Check failed"
+          # sticky — so an informational line must never be written to it (the
+          # same reason npm_age::report_unreadable_format keeps its non-failing
+          # gap out). A note changes no verdict, no counter and no exit status.
+          #
+          # Buffered in a file and rendered once, at the end: the summary is a
+          # markdown table being appended to row by row, and a list item written
+          # mid-run would land inside it. A file rather than a variable so a note
+          # raised inside `$(...)` survives the subshell.
+          #
+          # The caller owns the file: set PREFLIGHT_NOTES_FILE to a fresh mktemp
+          # before the first note and call preflight::step_summary_notes on exit.
+          # With it unset the annotation is still emitted and nothing is buffered,
+          # so a script that has not opted in behaves exactly as before.
+
+          # Rendered notes are capped for the reason every other row cap in these
+          # scripts exists: past 1 MiB Actions discards the step summary whole.
+          # 20 notes of about 1000 bytes each bound the section near 20 KiB. A
+          # note cut to fit says so. The annotation itself is never truncated or
+          # capped.
+          PREFLIGHT_NOTES_ROW_CAP=20
+          PREFLIGHT_NOTES_MAX_BYTES=1000
+
+          # Emit `::<level>::<message>` on stdout and buffer the same message for
+          # the summary. One call, so the annotation text is the only wording
+          # there is — the summary cannot drift from it.
+          #
+          # Args:
+          #   $1 level     `warning` or `notice`
+          #   $2 message   the annotation text. Interpolated values must arrive
+          #                sanitized (preflight::safe_for_md), as for the record_*
+          #                helpers: this renders as markdown. Tabs and newlines
+          #                are flattened to spaces — a newline would end the
+          #                workflow command early and split the buffered row.
+          #                `%` is sent as `%25` in the annotation only: Actions
+          #                decodes it back, so both surfaces read the same, and a
+          #                literal `%0A` in a value cannot become a line break.
+          preflight::annotate_with_note() {
+            local level="$1" message="$2"
+            message=$(printf '%s' "$message" | tr '\t\r\n' '   ')
+            echo "::${level}::${message//%/%25}"
+            local file="${PREFLIGHT_NOTES_FILE:-}"
+            [ -n "$file" ] || return 0
+            # Best-effort: a note that cannot be buffered must not fail a check
+            # whose annotation already went out.
+            printf '%s\t%s\n' "$level" "$message" >> "$file" 2>/dev/null || true
+          }
+
+          # Append the buffered notes to the step summary as a `### Notes` list,
+          # then remove the buffer — so a second call (the TERM handler runs the
+          # exit path twice) writes nothing. Identical notes collapse to one: the
+          # npm check loads registry config once per lockfile, and two lockfiles
+          # under one .npmrc raise the same line twice. (Identical means level
+          # and text: one text raised at both levels renders twice.) Always
+          # returns 0; safe to call from an EXIT trap on a passing or a failing
+          # run.
+          preflight::step_summary_notes() {
+            local file="${PREFLIGHT_NOTES_FILE:-}"
+            [ -n "$file" ] || return 0
+            if [ -s "$file" ]; then
+              {
+                echo ""
+                echo "### Notes"
+                echo ""
+                echo "Raised during this run, and also shown as annotations on it. None of them fails the check on its own."
+                echo ""
+                # `<` is the one character the static wording never uses and
+                # markdown would act on; escaping it costs the legitimate text
+                # nothing. Backticks are left alone — the messages use them.
+                # Nothing else needs escaping: every item starts with `- `, so a
+                # `>`, `#` or `|` can never open a line.
+                #
+                # LC_ALL=C so every awk counts bytes, and the cut is the same on
+                # gawk, mawk and BSD awk. A byte cut can land inside a multi-byte
+                # character (the messages use an em dash), so a trailing lead
+                # byte and its continuation bytes are dropped rather than left to
+                # render as a replacement character. That also drops a whole
+                # character ending exactly at the cut: a few bytes lost before
+                # " [truncated]".
+                LC_ALL=C awk -F '\t' -v cap="$PREFLIGHT_NOTES_ROW_CAP" -v max="$PREFLIGHT_NOTES_MAX_BYTES" '
+                  seen[$0]++ { next }
+                  {
+                    n++
+                    if (n > cap) next
+                    text = $2
+                    gsub(/</, "\\&lt;", text)
+                    if (length(text) > max) {
+                      text = substr(text, 1, max)
+                      sub(/[\300-\367][\200-\277]*$/, "", text)
+                      # Not mid-entity either: a cut `&lt;` would leave `&`, `&l`
+                      # or `&lt`. Exactly those, so a real trailing `&word` stays
+                      # (a literal `&`, `&l` or `&lt` ending at the cut goes too).
+                      sub(/&(l|lt)?$/, "", text)
+                      text = text " [truncated]"
+                    }
+                    print "- " ($1 == "warning" ? ":warning:" : ":information_source:") " " text
+                  }
+                  END {
+                    if (n > cap) print "- " (n - cap) " more note(s) not shown here; each is an annotation on this run."
+                  }' "$file"
+              } 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+            fi
+            rm -f "$file" 2>/dev/null || true
+          }
           OPS_ROUTINES_AGE_CHECK_LIB
           cat > "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #!/usr/bin/env bash
@@ -1973,6 +2088,13 @@ jobs:
                 #
                 # Testing for "not scheme-shaped" was not enough: yarn v1`s GitHub
                 # shorthand, `lodash@lodash/lodash#patched`, has no scheme, so it
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # was accepted and the pin became `lodash@4.17.21` — looked up as
                 # the real lodash and rendered green, for a tarball that came from
                 # codeload.github.com. Forks conventionally keep the upstream
@@ -2069,13 +2191,6 @@ jobs:
               #
               # v1 ignores unknown keys, so ANY per-block marker is forgeable in
               # principle; narrowing to keys v1 never writes makes the forgery an
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               # obviously alien line rather than one the block plausibly needs.
               /^  "?(resolution|checksum|languageName|linkType)"?[[:space:]]*:/ { block_berry = 1 }
               # The descriptor itself, CONFIRMED rather than assumed to agree with
@@ -2883,6 +2998,13 @@ jobs:
                                || key ~ /^[^\/]+\.[^\/]+\//)) {
                   # Keys that name a source rather than a package. Three shapes:
                   #   scheme://...    https://host/x.tgz, git+https://host/r.git#sha
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   #   host/path/rev   example.com/pkg/1.0.0, github.com/o/r/<sha>
                   #   scheme:path      file:./x, link:../y, workspace:*, git+...
                   #
@@ -2997,13 +3119,6 @@ jobs:
           # genuinely new resolution from a line that merely moved.
           #
           # The comparison itself is preflight::new_lines_since_base, the comparator
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # pre-commit and the package-lock/yarn parsers above share. What this
           # function adds around that call is pnpm-specific, and stays here because
           # the shared helper deliberately owns only the mechanism: the
@@ -3686,6 +3801,13 @@ jobs:
           #   what is actually gated.
           # - The package-lock.json and yarn.lock work-lists are built by
           #   comparing the base and head images of the lockfile. Scraping added
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   (`+`) diff lines — what both used to do — cannot see a version bump
           #   of a package that already exists, because only the block body
           #   changes while the key/header line stays unchanged context. That made
@@ -3782,13 +3904,6 @@ jobs:
           # characters in $pkg from reaching the curl URL (defense against crafted
           # lockfile entries with path-traversal / query injection in the URL
           # path). Critical security primitive — DO NOT bypass.
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           npm_age::is_valid_pkg_name() {
             local name="$1"
             # 214 = npm's maximum package name length (includes the `@scope/`
@@ -4370,7 +4485,7 @@ jobs:
               case "$e" in
                 *"=?unreadable")
                   safe_scope=$(preflight::safe_for_md "${e%%=*}")
-                  echo "::warning::${name} for ${safe_dir} configures a registry for ${safe_scope} that this check could not parse, so ${qualifier}packages in that scope are reported as skipped rather than age-checked.${remedy:+ }${remedy}" ;;
+                  preflight::annotate_with_note warning "${name} for ${safe_dir} configures a registry for ${safe_scope} that this check could not parse, so ${qualifier}packages in that scope are reported as skipped rather than age-checked.${remedy:+ }${remedy}" ;;
               esac
             done
           }
@@ -4389,7 +4504,7 @@ jobs:
             # real problem instead.
             case "$host" in
               "?unreadable-scopes")
-                echo "::warning::${name} for ${safe_dir} has an npmScopes map this check cannot read — written inline (\`npmScopes: {...}\`), or with a line the block structure does not admit — so it cannot tell which scopes are overridden and reports every ${qualifier}package as skipped rather than age-checked. Rewrite npmScopes in block style with one consistent indent."
+                preflight::annotate_with_note warning "${name} for ${safe_dir} has an npmScopes map this check cannot read — written inline (\`npmScopes: {...}\`), or with a line the block structure does not admit — so it cannot tell which scopes are overridden and reports every ${qualifier}package as skipped rather than age-checked. Rewrite npmScopes in block style with one consistent indent."
                 return 0 ;;
               "?unreadable")
                 # The generic half is true of both files; only the remedy differs,
@@ -4397,11 +4512,11 @@ jobs:
                 # Telling an .npmrc operator to rewrite their YAML in block style is
                 # the kind of confidently wrong instruction that costs more than
                 # saying nothing.
-                echo "::warning::${name} for ${safe_dir} configures a registry this check could not parse, so ${qualifier}packages are reported as skipped rather than age-checked.${remedy:+ }${remedy}"
+                preflight::annotate_with_note warning "${name} for ${safe_dir} configures a registry this check could not parse, so ${qualifier}packages are reported as skipped rather than age-checked.${remedy:+ }${remedy}"
                 return 0 ;;
             esac
             local safe_host; safe_host=$(preflight::safe_for_md "$host")
-            echo "::warning::${name} for ${safe_dir} sets a default registry (${safe_host}) other than the configured registry_url (${NPM_AGE_WANT_HOST}); ${qualifier}packages resolving through it are reported as skipped, not age-checked. Set registry_url to age them."
+            preflight::annotate_with_note warning "${name} for ${safe_dir} sets a default registry (${safe_host}) other than the configured registry_url (${NPM_AGE_WANT_HOST}); ${qualifier}packages resolving through it are reported as skipped, not age-checked. Set registry_url to age them."
           }
 
           npm_age::load_registry_config() {
@@ -4522,7 +4637,7 @@ jobs:
               # treatment the all-skipped remedy gives REGISTRY_URL.
               if [ "$berry_lock" = 1 ] && [ -z "$default" ] && [ "$NPM_AGE_WANT_HOST" != "$NPM_AGE_PUBLIC_HOST" ]; then
                 local safe_lock; safe_lock=$(preflight::safe_for_md "$lockfile")
-                echo "::notice::${safe_lock} is a yarn Berry lockfile and no default npmRegistryServer is set in .yarnrc.yml, so entries not covered by an npmScopes rule or an __archiveUrl in their resolution are aged against registry_url (${NPM_AGE_WANT_HOST}) on that input alone — Berry's own default here is registry.yarnpkg.com. If yarn's registry is set only in CI (YARN_NPM_REGISTRY_SERVER), commit it as npmRegistryServer in .yarnrc.yml so this check can see where the packages come from."
+                preflight::annotate_with_note notice "${safe_lock} is a yarn Berry lockfile and no default npmRegistryServer is set in .yarnrc.yml, so entries not covered by an npmScopes rule or an __archiveUrl in their resolution are aged against registry_url (${NPM_AGE_WANT_HOST}) on that input alone — Berry's own default here is registry.yarnpkg.com. If yarn's registry is set only in CI (YARN_NPM_REGISTRY_SERVER), commit it as npmRegistryServer in .yarnrc.yml so this check can see where the packages come from."
               fi
             fi
           }
@@ -4577,6 +4692,13 @@ jobs:
 
             # -sS: silent, but show errors on stderr. --compressed: negotiate
             # gzip/deflate for large packuments. --retry 2 with backoff handles
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # transient 5xx and network blips. `|| echo "000"` covers curl
             # crashing before -w can print, falling us through to the transient
             # branch below.
@@ -4672,10 +4794,19 @@ jobs:
             # failures file empty for the comment renderer's delete branch (see
             # preflight::exit_guard, which also explains what a `timeout-minutes`
             # kill can and cannot leave behind; MAX_PINS is the main mitigation
-            # for reaching one at all). The marker is npm's only EXIT-time cleanup.
+            # for reaching one at all).
+            #
+            # The cleanup removes the marker and renders the buffered notes. The
+            # notes go here, AFTER the guard, rather than at the end of main():
+            # main has a dozen exits, the notes belong under whichever footer the
+            # run ended on, and the guard's own fallback footer is one of them.
+            # The buffer is cleared before the trap is armed, because rendering
+            # REMOVES the file and an inherited value must not reach it on a
+            # preflight exit that happens before main assigns its own.
             # Single quotes on purpose: the trap expands the names when it fires.
+            PREFLIGHT_NOTES_FILE=""
             # shellcheck disable=SC2016
-            preflight::install_exit_guard npm 'rm -f "${NPM_AGE_UNREADABLE_MARKER:-}" 2>/dev/null || true'
+            preflight::install_exit_guard npm 'rm -f "${NPM_AGE_UNREADABLE_MARKER:-}" 2>/dev/null || true; preflight::step_summary_notes'
 
             preflight::require_tools curl jq awk sed grep sort comm
             preflight::require_gnu_date
@@ -4686,13 +4817,6 @@ jobs:
             # a typo would render as "nothing is on your registry" rather than as
             # the configuration error it is.
             if ! npm_age::is_valid_registry_url "$REGISTRY_URL"; then
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               local safe_reg; safe_reg=$(preflight::safe_for_md "$REGISTRY_URL")
               echo "::error::registry_url is not a valid http(s) registry URL: ${safe_reg}"
               # Its own row, so the PR comment names the malformed input rather
@@ -4770,6 +4894,10 @@ jobs:
 
             NPM_AGE_UNREADABLE_MARKER=$(mktemp)
             export NPM_AGE_UNREADABLE_MARKER
+            # Buffer for preflight::annotate_with_note; rendered and removed by
+            # the EXIT cleanup installed at the top of main.
+            PREFLIGHT_NOTES_FILE=$(mktemp)
+            export PREFLIGHT_NOTES_FILE
 
             local now_epoch; now_epoch=$(date +%s)
             local failed=false

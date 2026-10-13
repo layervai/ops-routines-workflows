@@ -1224,6 +1224,121 @@ jobs:
               echo "> **No packages could be verified** (all ${skipped_count} were skipped). Treating as failure to avoid silent pass on registry outage."
             } >> "$GITHUB_STEP_SUMMARY"
           }
+
+          # ----- Step-summary notes ----------------------------------------------------
+          #
+          # A diagnostic that does not fail the run — a registry the check could
+          # not match, an input it is taking on its word — is emitted as a bare
+          # `::warning::` / `::notice::`. That reaches the Annotations panel and
+          # the raw log, and nothing else; and it fires on runs that PASS, which
+          # are exactly the runs nobody opens the log of. These two helpers give
+          # such a line a second surface in the step summary.
+          #
+          # NOT the failures TSV. A row there means failed=true to
+          # comment-on-failure.sh — it renders a "Dependency Age Check failed"
+          # sticky — so an informational line must never be written to it (the
+          # same reason npm_age::report_unreadable_format keeps its non-failing
+          # gap out). A note changes no verdict, no counter and no exit status.
+          #
+          # Buffered in a file and rendered once, at the end: the summary is a
+          # markdown table being appended to row by row, and a list item written
+          # mid-run would land inside it. A file rather than a variable so a note
+          # raised inside `$(...)` survives the subshell.
+          #
+          # The caller owns the file: set PREFLIGHT_NOTES_FILE to a fresh mktemp
+          # before the first note and call preflight::step_summary_notes on exit.
+          # With it unset the annotation is still emitted and nothing is buffered,
+          # so a script that has not opted in behaves exactly as before.
+
+          # Rendered notes are capped for the reason every other row cap in these
+          # scripts exists: past 1 MiB Actions discards the step summary whole.
+          # 20 notes of about 1000 bytes each bound the section near 20 KiB. A
+          # note cut to fit says so. The annotation itself is never truncated or
+          # capped.
+          PREFLIGHT_NOTES_ROW_CAP=20
+          PREFLIGHT_NOTES_MAX_BYTES=1000
+
+          # Emit `::<level>::<message>` on stdout and buffer the same message for
+          # the summary. One call, so the annotation text is the only wording
+          # there is — the summary cannot drift from it.
+          #
+          # Args:
+          #   $1 level     `warning` or `notice`
+          #   $2 message   the annotation text. Interpolated values must arrive
+          #                sanitized (preflight::safe_for_md), as for the record_*
+          #                helpers: this renders as markdown. Tabs and newlines
+          #                are flattened to spaces — a newline would end the
+          #                workflow command early and split the buffered row.
+          #                `%` is sent as `%25` in the annotation only: Actions
+          #                decodes it back, so both surfaces read the same, and a
+          #                literal `%0A` in a value cannot become a line break.
+          preflight::annotate_with_note() {
+            local level="$1" message="$2"
+            message=$(printf '%s' "$message" | tr '\t\r\n' '   ')
+            echo "::${level}::${message//%/%25}"
+            local file="${PREFLIGHT_NOTES_FILE:-}"
+            [ -n "$file" ] || return 0
+            # Best-effort: a note that cannot be buffered must not fail a check
+            # whose annotation already went out.
+            printf '%s\t%s\n' "$level" "$message" >> "$file" 2>/dev/null || true
+          }
+
+          # Append the buffered notes to the step summary as a `### Notes` list,
+          # then remove the buffer — so a second call (the TERM handler runs the
+          # exit path twice) writes nothing. Identical notes collapse to one: the
+          # npm check loads registry config once per lockfile, and two lockfiles
+          # under one .npmrc raise the same line twice. (Identical means level
+          # and text: one text raised at both levels renders twice.) Always
+          # returns 0; safe to call from an EXIT trap on a passing or a failing
+          # run.
+          preflight::step_summary_notes() {
+            local file="${PREFLIGHT_NOTES_FILE:-}"
+            [ -n "$file" ] || return 0
+            if [ -s "$file" ]; then
+              {
+                echo ""
+                echo "### Notes"
+                echo ""
+                echo "Raised during this run, and also shown as annotations on it. None of them fails the check on its own."
+                echo ""
+                # `<` is the one character the static wording never uses and
+                # markdown would act on; escaping it costs the legitimate text
+                # nothing. Backticks are left alone — the messages use them.
+                # Nothing else needs escaping: every item starts with `- `, so a
+                # `>`, `#` or `|` can never open a line.
+                #
+                # LC_ALL=C so every awk counts bytes, and the cut is the same on
+                # gawk, mawk and BSD awk. A byte cut can land inside a multi-byte
+                # character (the messages use an em dash), so a trailing lead
+                # byte and its continuation bytes are dropped rather than left to
+                # render as a replacement character. That also drops a whole
+                # character ending exactly at the cut: a few bytes lost before
+                # " [truncated]".
+                LC_ALL=C awk -F '\t' -v cap="$PREFLIGHT_NOTES_ROW_CAP" -v max="$PREFLIGHT_NOTES_MAX_BYTES" '
+                  seen[$0]++ { next }
+                  {
+                    n++
+                    if (n > cap) next
+                    text = $2
+                    gsub(/</, "\\&lt;", text)
+                    if (length(text) > max) {
+                      text = substr(text, 1, max)
+                      sub(/[\300-\367][\200-\277]*$/, "", text)
+                      # Not mid-entity either: a cut `&lt;` would leave `&`, `&l`
+                      # or `&lt`. Exactly those, so a real trailing `&word` stays
+                      # (a literal `&`, `&l` or `&lt` ending at the cut goes too).
+                      sub(/&(l|lt)?$/, "", text)
+                      text = text " [truncated]"
+                    }
+                    print "- " ($1 == "warning" ? ":warning:" : ":information_source:") " " text
+                  }
+                  END {
+                    if (n > cap) print "- " (n - cap) " more note(s) not shown here; each is an annotation on this run."
+                  }' "$file"
+              } 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+            fi
+            rm -f "$file" 2>/dev/null || true
+          }
           OPS_ROUTINES_AGE_CHECK_LIB
           cat > "${RUNNER_TEMP}/ops-routines-lib/age-check-precommit.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #!/usr/bin/env bash
@@ -1910,6 +2025,13 @@ jobs:
           # actions/checkout vector explicitly rather than leaving it to inference.
           #
           # The READS matter as much as the fetch: `--filter=blob:none` makes the temp
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-precommit.sh (part 2 of 2)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-precommit.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # repo a promisor, so an object read that missed locally would hit the network
           # — unbounded and unscrubbed without this. `timeout` bounds each call. 20s, not
           # 30: tier 4 can make two attempts per rev, once per changed pin. The aggregate
@@ -2010,13 +2132,6 @@ jobs:
               # GHES without `uploadpack.allowAnySHA1InWant`. Distinct from absent,
               # because the remedy is different: nothing about the rev is wrong.
               *"unadvertised object"*)
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-precommit.sh (part 2 of 2)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-precommit.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 precommit_age::set_reason "the public repository does not serve unadvertised objects" ;;
               *"could not read Username"*|*"Authentication failed"*|*"Repository not found"*)
                 precommit_age::set_reason "repository is not publicly readable and the API read failed" ;;
