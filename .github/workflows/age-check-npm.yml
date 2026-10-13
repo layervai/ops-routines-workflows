@@ -64,30 +64,40 @@ on:
         default: 350
       allow_registry_free:
         description: |
-          Pass, with a warning, when a **pnpm** lockfile resolves nothing
-          from a registry — for a repo that genuinely vendors every
-          dependency through git or tarball URLs, which would otherwise
-          get a red check on every PR that touches the lockfile.
-          Deliberately narrow: it cannot weaken a lockfile that has even
-          one registry package, so it is not a general opt-out of the
-          age check.
+          A STANDING DECISION, not a one-off. Set this and every future
+          change whose new pins all resolve from outside a registry
+          passes too. Read that before enabling it: the flag is for a
+          repo that genuinely vendors and would otherwise get a red
+          check on every PR touching its lockfile, not for clearing one
+          build.
 
-          pnpm only. package-lock.json and yarn.lock drop non-registry
-          entries at parse time and report no new dependencies, so a
-          fully-vendored repo on those already passes. Note the yarn
-          distinction: a git/tarball/`file:` entry is REJECTED AT THE
-          HEADER and never becomes a pin, whereas a registry-shaped entry
-          whose `resolved` names some other host is TAGGED and reported
-          as skipped — so a yarn repo on a private registry is not
-          "vendored" and needs `registry_url`, not this. Setting this
-          changes nothing for them.
+          All three lockfile kinds. A dependency that resolves from no
+          registry at all — a git URL, a tarball, a committed `file:`
+          archive — has no publish date, so there is nothing for the age
+          gate to measure. A change whose new pins are ALL of that kind
+          therefore fails rather than reporting `Verified 0 package(s)`,
+          which is a green tick on a change verified in no way at all.
+          This input turns that failure into a warning.
 
-          Whether or not this is set, a pnpm entry NEWLY vendored on the
-          branch (git, tarball, link:, file:, workspace:, portal:) is annotated
-          as a `::notice` on the lockfile and an info row in the step
-          summary. Visibility only: it never fails the run and is never
-          counted as skipped. package-lock.json and yarn.lock get no
-          such notice today.
+          Vendored is not the same as off-registry. A registry-shaped
+          entry whose resolution names some OTHER host is tagged and
+          reported as skipped — so a repo on a private registry is not
+          "vendored" and needs `registry_url`, not this.
+
+          What it cannot do is suppress a too-new registry pin the
+          branch actually moved: it applies only when nothing at all
+          could be age-checked, so a change that also moves a registry
+          pin is gated on that pin regardless.
+
+          Whether or not it is set, every newly vendored arrival is
+          annotated as a `::notice` naming the source and an info row in
+          the step summary, so a reviewer can judge what arrived.
+
+          A `file:`, `link:`, `portal:` or `workspace:` path naming a
+          DIRECTORY is the repo's own tree, not vendoring, and is not
+          counted — except when it names a tarball
+          (`file:vendor/pkg-1.0.0.tgz`), which is a fetched artifact
+          that happens to be committed.
 
           One caveat in a repo with more than one lockfile kind: this
           makes the pnpm file pass, but the run as a whole can still
@@ -1330,18 +1340,30 @@ jobs:
           #              RECORD GRAMMAR:  [ "offregistry" TAB ] pkg "@" version
           #                             |  "vendored" TAB key
           #
-          #              A `vendored` record is a pnpm key that names a SOURCE
-          #              rather than a version — git, tarball, link:, file:,
-          #              workspace:, portal:, or a v5 key qualified with another registry
-          #              host — carried verbatim (minus YAML quoting) so a
-          #              reviewer can grep the lockfile for it. It has no publish
-          #              date, so main REPORTS it and never gates on it. It is in
-          #              the stream, rather than only counted, for the same reason
-          #              the offregistry tag is: a record that reaches neither
-          #              side of the set difference is invisible, and a PR that
-          #              vendored a brand-new dependency into a lockfile whose
-          #              registry pins did not move used to report "No new
-          #              dependencies" and go green with no annotation.
+          #              A `vendored` record names a SOURCE rather than a version
+          #              — git, tarball, link:, file:, workspace:, portal:, or a
+          #              v5 key qualified with another registry host. ALL THREE
+          #              extractors emit it. pnpm carries its key verbatim (minus
+          #              YAML quoting), since a pnpm key already embeds the
+          #              source; package-lock emits `name@resolved` and yarn its
+          #              header spec, plus the `resolved` line when that adds
+          #              something. Each payload names the source, which is what
+          #              the notice asks a reviewer to judge — and, because it is
+          #              the source rather than the version, a dependency re-pinned
+          #              to a new COMMIT with its version unchanged still reads as
+          #              a change. Keyed on the version it would not, and that is
+          #              the commonest vendored change there is.
+          #
+          #              It has no publish date, so it can never be age-checked.
+          #              main REPORTS every arrival and, when an arrival is ALL the
+          #              change brought in, gates on it — see the guard at the end
+          #              of npm_age::main. It is in the stream rather than only
+          #              counted for the same reason the offregistry tag is: a
+          #              record that reaches neither side of the set difference is
+          #              invisible, and a PR that vendored a brand-new dependency
+          #              into a lockfile whose registry pins did not move used to
+          #              report "No new dependencies" and go green with no
+          #              annotation at all.
           #
           #              Classifying the registry is an extractor OBLIGATION, not
           #              an option. An extractor that emits a bare `pkg@version`
@@ -1407,6 +1429,26 @@ jobs:
             return 0
           fi
           _NPM_LOCKFILE_PARSERS_SOURCED=1
+
+          # True when the caller has opted this repo out of the registry-free
+          # failure. One definition, because an accepted spelling that drifted
+          # between call sites would mean a flag that weakens a supply-chain
+          # control behaves differently depending on which lockfile kind a repo
+          # happens to use.
+          #
+          # Explicit truthy match, not `-n`: `=false` or `=0` turning it ON is a
+          # footgun for a local run or a future template edit, and a `type:
+          # boolean` workflow input renders as the literal string `false`. The
+          # workflow expression yields '' for false, so the supported path is
+          # unaffected either way. `on`/`ON` are deliberately absent: omitting a
+          # spelling from a list that weakens a control fails CLOSED, which is the
+          # safe direction.
+          npm_age::registry_free_allowed() {
+            case "${AGE_CHECK_ALLOW_REGISTRY_FREE:-}" in
+              1|true|TRUE|True|yes|YES|Yes) return 0 ;;
+            esac
+            return 1
+          }
 
           # The two ways a record stream is split by its kind column, kept beside
           # the grammar so the predicate is spelled once. A tagged record is
@@ -1491,9 +1533,46 @@ jobs:
           NPM_AGE_JQ_ENTRIES='
             .packages // {} | to_entries[]
             | select(.key != "" and (.value.version // null) != null)
-            | select((.value.resolved // "") | startswith("https://"))
             | . as $e
-            | ($e.key | sub("^node_modules/"; "") | split("/node_modules/") | last) as $path_name
+            | ($e.value.resolved // "") as $r
+            # A pin that resolves from no registry AT ALL — a git URL, a tarball,
+            # a committed `file:` archive — becomes a `vendored` record instead of
+            # being dropped. Dropped, it reached neither checked_count nor
+            # skipped_count, so the all-skipped guard could not fire and a change
+            # moving only such pins rendered "Verified 0 package(s)
+            # :white_check_mark:" on a change verified in no way at all. pnpm has
+            # emitted this record since #165; this is the same record from the
+            # package-lock side, so one guard in main covers all three formats.
+            #
+            # Two exclusions, both load-bearing. An ABSENT `.resolved` is not
+            # vendored: npm writes that shape for nested dependencies of ordinary
+            # registry packages, and absence of provenance is not evidence of
+            # vendoring. A LOCAL PATH is not vendored either — `file:`, `link:`,
+            # `portal:`, `workspace:` naming a directory are this repo`s own tree,
+            # source reviewed in the same PR rather than an artifact fetched from
+            # somewhere this check cannot date. The exception is a tarball behind
+            # such a path (`file:vendor/pkg-1.0.0.tgz`), which IS a fetched
+            # artifact that happens to be committed — layervai/qurl-desktop ships
+            # one — and that exception is what makes this a shape test rather than
+            # a protocol test.
+            #
+            # The payload is `name@resolved`, mirroring the pnpm key that already
+            # embeds its source. Naming the SOURCE is what the notice asks a
+            # reviewer to judge, and it is also what moves when a vendored
+            # dependency is re-pinned to a new commit while its version stays put
+            # — an install path alone would make that re-pin invisible to the
+            # base-vs-head difference, which is the commonest vendored change
+            # there is.
+            | if (($r | startswith("https://")) | not) then
+                (if ($r != ""
+                     and (($r | test("^(file|link|portal|workspace):") | not)
+                          or ($r | test("\\.(tgz|tar\\.gz|tar)([?#].*)?$"))))
+                 then "vendored\t"
+                      + ($e.key | sub("^node_modules/"; "") | split("/node_modules/") | last)
+                      + "@" + $r
+                 else empty end)
+              else
+            ($e.key | sub("^node_modules/"; "") | split("/node_modules/") | last) as $path_name
             | (($e.value.resolved // "") | split("/-/")[0] | split("/")) as $seg
             | (if (($seg[-2] // "") | startswith("@"))
                then ($seg[-2:] | join("/"))
@@ -1504,8 +1583,9 @@ jobs:
                 end) + "@" + $e.value.version) as $pin
             | (($seg[2] // "") | sub("[?#\\\\].*$"; "") | ascii_downcase | sub("^.*@"; "") | sub(":443$"; "")) as $h
             | (if $h == "registry.yarnpkg.com" then "registry.npmjs.org" else $h end) as $host_c
-            | if $host_c == $host then $pin
-              else "offregistry\t" + $pin end'
+            | (if $host_c == $host then $pin
+               else "offregistry\t" + $pin end)
+              end'
 
           npm_age::pkglock_pins() {
             # jq's stderr is deliberately NOT suppressed: when this fails the
@@ -1544,6 +1624,22 @@ jobs:
             NPM_AGE_YARN_DEFAULT_HOST="$NPM_AGE_YARN_DEFAULT_HOST" \
             NPM_AGE_YARN_SCOPE_MAP="$NPM_AGE_YARN_SCOPE_MAP" \
             awk '
+              # A selector naming a path in this repo`s own tree rather than an
+              # artifact fetched from somewhere. Source reviewed in the same PR is
+              # not vendoring; a tarball behind such a path is, which makes this a
+              # SHAPE test rather than a protocol test. The `name@` strip is
+              # conditional because a local path can carry an `@` of its own
+              # (`workspace:packages/@acme/ui`), and stripping unconditionally
+              # would eat the protocol and stop it reading as local.
+              # (No apostrophes: single-quoted awk program.)
+              function local_path(sel,   t) {
+                t = sel
+                if (t !~ /^(file|link|portal|workspace):/ && match(t, /^@?[^@]+@/)) t = substr(t, RLENGTH + 1)
+                if (t !~ /^(file|link|portal|workspace):/) return 0
+                if (t ~ /\.(tgz|tar\.gz|tar)([?#].*)?$/) return 0
+                return 1
+              }
+
               # Deserialises NPM_AGE_YARN_SCOPE_MAP, the space-separated
               # `@scope=host` list load_registry_config folds .yarnrc.yml into.
               # Mirrors the BEGIN in npm_age::parse_pnpm_lock, which decodes the
@@ -1715,6 +1811,21 @@ jobs:
               # a block can end. Mirrors the flush() in npm_age::parse_pnpm_lock,
               # which buffers for exactly the same reason.
               function flush(   h) {
+                if (pending_vendored != "") {
+                  # Buffered for the same reason a pin is: `resolved` sits BELOW the
+                  # header, and the record has to carry it. The header alone is
+                  # enough when package.json pins an exact commit, but when it pins
+                  # a BRANCH the header is stable and only the resolution moves — so
+                  # without this a re-pin produces an identical record on both sides
+                  # and the base-vs-head difference sees nothing.
+                  # Appended only when it ADDS something. For an exact-commit pin
+                  # the header already contains the resolution verbatim, and
+                  # repeating it makes the notice unreadable; for a branch pin the
+                  # header is stable and the resolution is the only moving part.
+                  print "vendored\t" pending_vendored \
+                        ((block_res == "" || index(pending_vendored, block_res) > 0) ? "" : " -> " block_res)
+                  pending_vendored = ""
+                }
                 if (pending_name == "") return
                 # block_conflict forces the tag regardless of host — see the
                 # `resolved` and `resolution:` rules.
@@ -1797,7 +1908,7 @@ jobs:
               # the buffered entry and the block host are per-file too, and a
               # half-reset here would colour file N+1s first flush with file Ns
               # host if that ever changed.
-              FNR == 1 { flush(); name = ""; block_host = ""; block_conflict = 0; block_berry = 0; block_resolved = 0; block_badloc = 0 }
+              FNR == 1 { flush(); name = ""; block_host = ""; block_conflict = 0; block_berry = 0; block_resolved = 0; block_badloc = 0; pending_vendored = ""; block_res = "" }
               # Counts any line that is not blank and not a comment. MUST come
               # before the header rule: that rule ends in `next`, which skips every
               # remaining rule for the line, so a counter placed after it would
@@ -1823,7 +1934,7 @@ jobs:
                 # descriptor), whose `resolved` line must not colour the entry
                 # buffered before it.
                 flush()
-                block_host = ""; block_conflict = 0; block_berry = 0; block_resolved = 0; block_badloc = 0
+                block_host = ""; block_conflict = 0; block_berry = 0; block_resolved = 0; block_badloc = 0; block_res = ""
                 line = $0
                 sub(/:[[:space:]]*$/, "", line)
                 split(line, parts, ",")
@@ -1890,6 +2001,33 @@ jobs:
                 # guard cannot read a file of pure patch/protocol descriptors as a
                 # parse failure.
                 if (name != "") specs++
+                # A header the allowlist above REJECTED still names a dependency —
+                # `github:`, `git+ssh://`, a tarball URL, yarn v1 GitHub shorthand.
+                # Emit it as a `vendored` record, the same one the pnpm extractor
+                # has produced since #165, so main sees one kind of record for
+                # "arrived, and cannot be dated" whatever the lockfile format.
+                # Dropped instead, such a pin reached neither checked_count nor
+                # skipped_count, and a change moving only those rendered
+                # "Verified 0 package(s) :white_check_mark:".
+                #
+                # The record carries the SPEC, not a name@version. The spec is what
+                # identifies the source to a reviewer, and it is what moves when a
+                # vendored dependency is re-pinned to a new commit while its
+                # version stays put — so a version-keyed record would make that
+                # re-pin invisible to the base-vs-head difference. It also needs no
+                # buffering, unlike a pin, which must wait for its `version` line.
+                #
+                # `patch:` is excluded: it wraps a pin that already appears under
+                # its own header, so the wrapped release is what gets age-checked.
+                # local_path() excludes a selector naming this repo`s own tree.
+                # Both are read off the FIRST non-scope `@`, because a rejected
+                # selector routinely contains an `@` of its own
+                # (`pkg@git+ssh://git@github.com/...`), and the last-`@` split the
+                # accepted path uses would cut the name apart mid-URL.
+                if (name == "" && spec ~ /.@/ && match(spec, /^@?[^@]+/)) {
+                  sel = substr(spec, RSTART + RLENGTH + 1)
+                  if (sel !~ /^patch:/ && !local_path(sel)) pending_vendored = spec
+                }
                 next
               }
               # Matches the OWN version line of a block. It cannot be tripped by a
@@ -1931,6 +2069,13 @@ jobs:
               #
               # v1 ignores unknown keys, so ANY per-block marker is forgeable in
               # principle; narrowing to keys v1 never writes makes the forgery an
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               # obviously alien line rather than one the block plausibly needs.
               /^  "?(resolution|checksum|languageName|linkType)"?[[:space:]]*:/ { block_berry = 1 }
               # The descriptor itself, CONFIRMED rather than assumed to agree with
@@ -2041,6 +2186,15 @@ jobs:
               # all four were verified to make yarn fetch the URL, so matching
               # only the canonical one left three ways to hand the gate a pin
               # whose origin it never read.
+              # Kept WHOLE for the vendored record. block_host below is only the
+              # host, which cannot tell a re-pin apart: a vendored dependency moved
+              # to a new commit keeps both its version and its host.
+              /^  "?(resolved|resolution)"?[[:space:]:]/ {
+                block_res = $0
+                sub(/\r$/, "", block_res)
+                sub(/^[[:space:]]*"?(resolved|resolution)"?[[:space:]]*:?[[:space:]]*/, "", block_res)
+                gsub(/^"|"$/, "", block_res)
+              }
               /^  "?resolved"?[[:space:]:]/ {
                 url = $0
                 sub(/\r$/, "", url)
@@ -2059,13 +2213,6 @@ jobs:
               # changed_pins is unreachable for yarn: an unreadable image would
               # yield an empty `before` and quietly promote the whole head
               # lockfile into the work-list. Only fires when the file IS
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               # yarn-shaped (real `pkg@range:` headers) but no body version could
               # be read — a comments-only or dependency-free lockfile has no specs
               # and stays a legitimate empty result.
@@ -2850,6 +2997,13 @@ jobs:
           # genuinely new resolution from a line that merely moved.
           #
           # The comparison itself is preflight::new_lines_since_base, the comparator
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # pre-commit and the package-lock/yarn parsers above share. What this
           # function adds around that call is pnpm-specific, and stays here because
           # the shared helper deliberately owns only the mechanism: the
@@ -2969,13 +3123,6 @@ jobs:
               # does exist, or it fails a required check while forbidding every
               # escape it mentions.
               if grep -qE '^[[:space:]]+resolution:' "$lockfile"; then
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 echo "::error file=${lockfile}::${lockfile} declares resolved packages but no package key could be parsed — its lockfileVersion is not one this check understands, so nothing was verified. Until this check is taught the new format, pin your caller to the previous ops-routines-workflows release SHA and tell the ops-routines maintainers." >&2
                 return 1
               fi
@@ -3038,16 +3185,15 @@ jobs:
               # is a footgun for a local run or a future template edit. The
               # workflow expression yields '' for false, so the supported path is
               # unaffected either way.
-              case "${AGE_CHECK_ALLOW_REGISTRY_FREE:-}" in
-                1|true|TRUE|True|yes|YES|Yes)
-                  echo "::warning file=${lockfile}::${lockfile} resolves ${nonregistry} package(s), none of them from a registry — nothing in this file was age-checked. Passing because allow_registry_free is set." >&2
-                  rc=4
-                  ;;
-                *)
-                  echo "::error file=${lockfile}::${lockfile} resolves ${nonregistry} package(s), none of them from the public npm registry (git, tarball, link:, file:, workspace: or portal: sources — or, in a v5 lockfile, keys qualified with a private registry host) — nothing could be age-checked. If that is this repo's permanent shape, pass allow_registry_free: true to the reusable workflow; age-check-bypass is for verified-CVE overrides only (runbooks/phase-0-checklist.md) and should not be applied every PR." >&2
-                  return 3
-                  ;;
-              esac
+              # Spelling lives in npm_age::registry_free_allowed, shared with the
+              # whole-run guard in main so the two cannot drift.
+              if npm_age::registry_free_allowed; then
+                echo "::warning file=${lockfile}::${lockfile} resolves ${nonregistry} package(s), none of them from a registry — nothing in this file was age-checked. Passing because allow_registry_free is set." >&2
+                rc=4
+              else
+                echo "::error file=${lockfile}::${lockfile} resolves ${nonregistry} package(s), none of them from the public npm registry (git, tarball, link:, file:, workspace: or portal: sources — or, in a v5 lockfile, keys qualified with a private registry host) — nothing could be age-checked. If that is this repo's permanent shape, pass allow_registry_free: true to the reusable workflow; age-check-bypass is for verified-CVE overrides only (runbooks/phase-0-checklist.md) and should not be applied every PR." >&2
+                return 3
+              fi
             fi
 
             # The comparison — through the shared helper, which reads the base
@@ -3266,19 +3412,29 @@ jobs:
           #   `http://`, or no `.resolved` at all never enters the work-list, so
           #   it counts toward neither checked_count nor skipped_count; a change
           #   that moves only such pins prints "No new dependencies" and the
-          #   footer renders "Verified 0 package(s) :white_check_mark:". pnpm NO
-          #   LONGER has this hole: its parser emits a `vendored` record for every
-          #   key naming a source (see the RECORD GRAMMAR in
-          #   lib/_npm-lockfile-parsers.sh), the record rides the same base/head
-          #   difference as a pin, and one that ARRIVED on the branch renders as a
-          #   `::notice` on the lockfile and an `:information_source:` row. That
-          #   is visibility only — no publish date, so nothing to threshold — and
-          #   it never touches skipped_count, because counting it there would feed
-          #   the all-skipped guard and fail a lockfile whose only change is one
-          #   vendored entry. Bringing package-lock and yarn up to the same
-          #   behaviour needs an inverted jq predicate with its own extraction,
-          #   and a non-registry classifier yarn does not have yet; tracked
-          #   separately.
+          #   footer rendered "Verified 0 package(s) :white_check_mark:" — a green
+          #   tick on a change verified in no way at all. ALL THREE parsers now
+          #   emit a `vendored` record for every key naming a source (see the
+          #   RECORD GRAMMAR in lib/_npm-lockfile-parsers.sh); the record rides
+          #   the same base/head difference as a pin, so one that ARRIVED on the
+          #   branch renders as a `::notice` on the lockfile and an
+          #   `:information_source:` row.
+          #
+          #   The record is visibility; the guard in main decides what it MEANS.
+          #   When checked_count is 0 and an arrival exists, the run FAILS: a
+          #   vendored pin has no publish date, so nothing could be age-checked,
+          #   and certifying that as a pass is the conflation this check exists to
+          #   remove. `allow_registry_free` turns it back into a warning for a repo
+          #   that vendors permanently. It still never touches skipped_count —
+          #   feeding the all-skipped guard would produce a worse-worded failure
+          #   for the same condition.
+          #
+          #   Deliberately narrow in both directions: it needs checked_count to be
+          #   0, so a change that also moves a registry pin passes on that pin
+          #   with the arrival named beside it; and it needs an arrival, so a
+          #   change touching no dependency stays a quiet pass. What remains
+          #   dropped in silence is an entry with NO `.resolved` at all, which npm
+          #   writes for nested dependencies of ordinary registry packages.
           # - WHICH REGISTRY a pin came from is decided from its RESOLUTION, never
           #   from its key, and only pins on AGE_CHECK_REGISTRY_URL are aged. This
           #   used to be a prefix test for `https://`, which a private registry
@@ -3626,6 +3782,13 @@ jobs:
           # characters in $pkg from reaching the curl URL (defense against crafted
           # lockfile entries with path-traversal / query injection in the URL
           # path). Critical security primitive — DO NOT bypass.
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           npm_age::is_valid_pkg_name() {
             local name="$1"
             # 214 = npm's maximum package name length (includes the `@scope/`
@@ -3764,13 +3927,6 @@ jobs:
           NPM_AGE_WANT_HOST=$(npm_age::registry_host "$REGISTRY_URL")
           # The host a caller who set nothing is judged against. Compared with
           # NPM_AGE_WANT_HOST to tell "registry_url names a private registry" from
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # the default, which is the one distinction the Berry no-.yarnrc.yml
           # notice in npm_age::load_registry_config turns on. Derived through
           # registry_host so an explicit registry.yarnpkg.com folds to the same
@@ -4530,6 +4686,13 @@ jobs:
             # a typo would render as "nothing is on your registry" rather than as
             # the configuration error it is.
             if ! npm_age::is_valid_registry_url "$REGISTRY_URL"; then
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               local safe_reg; safe_reg=$(preflight::safe_for_md "$REGISTRY_URL")
               echo "::error::registry_url is not a valid http(s) registry URL: ${safe_reg}"
               # Its own row, so the PR comment names the malformed input rather
@@ -4667,13 +4830,6 @@ jobs:
             #                          and trusting auto-detection to re-add it
             #                          would drop it entirely: targets ends up
             #                          empty and the run exits 0 with "No npm
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             #                          lockfiles found", a silent pass for a
             #                          `lockfile_path: apps/web/yarn.lock`
             #                          consumer.
@@ -5156,6 +5312,38 @@ jobs:
               echo "::warning::${checked_count} package(s) verified, but ${unreadable_count} lockfile(s) could not be age-checked — this run does not certify them"
               echo "Verified ${checked_count} npm package(s); ${unreadable_count} lockfile(s) could not be age-checked"
               return 0
+            fi
+
+            # Nothing was age-checked, and the reason is that everything this
+            # change brought in resolves from outside a registry. Reporting those
+            # arrivals (above) says what happened; this decides what it MEANS.
+            #
+            # Without it the run reaches the footer below and prints "Verified 0
+            # package(s) at >= N days old :white_check_mark:" — a green tick, on a
+            # change verified in no way at all. That sentence is what anyone
+            # auditing checks at fleet scale reads as a pass WITH coverage, and it
+            # is the whole reason this branch exists. A vendored dependency has no
+            # publish date, so there is nothing for the age gate to measure; the
+            # honest answer is to stop rather than to certify.
+            #
+            # Deliberately narrow, in both directions. It needs checked_count to
+            # be 0, so it cannot fire for a change that also moved a registry pin
+            # — that pin is age-checked on its own merits and a mixed change still
+            # passes, with the arrivals named in the log and the table. And it
+            # needs a vendored arrival, so a change touching no dependency at all
+            # stays the quiet pass it should be.
+            if [ "$checked_count" -eq 0 ] && [ "$vendored_count" -gt 0 ]; then
+              if npm_age::registry_free_allowed; then
+                echo "::warning::${vendored_count} newly-added dependency(ies) resolve from outside a registry and none could be age-checked. Passing because allow_registry_free is set."
+                preflight::step_summary_registry_free "$vendored_count" 0
+                echo "Nothing in this change could be age-checked (allow_registry_free)"
+                return 0
+              fi
+              preflight::step_summary_registry_free "$vendored_count" "$checked_count"
+              echo "::error::${vendored_count} newly-added dependency(ies) resolve from outside a registry (git, tarball, file:) and nothing from a registry, so no dependency could be age-checked. The arrivals are named above — review them on their contents rather than their age. If this repo vendors permanently, pass allow_registry_free: true to the reusable workflow; age-check-bypass is for verified-CVE overrides only (runbooks/phase-0-checklist.md)."
+              preflight::record_unverifiable "npm" "—" \
+                "every dependency this change adds or moves resolves from outside a registry, so none carries a publish date and nothing could be age-checked"
+              return 1
             fi
 
             preflight::step_summary_all_passed "$checked_count" "$MIN_AGE_DAYS" "$skipped_count"
