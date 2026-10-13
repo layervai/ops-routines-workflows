@@ -1580,6 +1580,30 @@ jobs:
           #              report "No new dependencies" and go green with no
           #              annotation at all.
           #
+          #              REPORTING THE DECLARED COUNT is an extractor obligation
+          #              too. Called as `<extractor> declared`, an extractor
+          #              prints how many entries the image declares that its
+          #              record stream MUST account for — counted from structure
+          #              the record grammar does not depend on (a `resolution:`
+          #              line per pnpm key, a `.packages` key, a yarn `name@`
+          #              header), less the exclusions it makes on purpose, each
+          #              spelled as a positive test beside the denominator. Every
+          #              record, pin or vendored, accounts for one;
+          #              npm_age::records_cover_declared fails the run (rc 5) on
+          #              anything left over. The zero-parse guards are
+          #              all-or-nothing: a format that respelled most entries
+          #              while leaving one recognisable would gate that one and
+          #              render "Verified 1 package(s)", and this is the guard
+          #              that sees it. It was documented only on parse_pnpm_lock
+          #              and enforced only in diff_pnpm_lock for one release.
+          #              ONE record per declared entry: the test is "fewer
+          #              records than declared", so an extractor that emitted two
+          #              for one entry would hide an entry dropped elsewhere. The
+          #              per-format invariant tests assert the two counts EQUAL.
+          #              Build the denominator to UNDER-count rather than
+          #              over-count: a shortfall fails the run with no margin, so
+          #              every way the count can be wrong must make it too small.
+          #
           #              Classifying the registry is an extractor OBLIGATION, not
           #              an option. An extractor that emits a bare `pkg@version`
           #              is asserting the pin resolves to $NPM_AGE_WANT_HOST, and
@@ -1608,8 +1632,9 @@ jobs:
           #              it is the single copy of that reasoning, deliberately.
           #
           #   COMPARATOR npm_age::changed_pins — the npm NAME for
-          #              preflight::new_lines_since_base, and nothing more: it
-          #              forwards its three arguments. The shared helper owns the
+          #              preflight::new_lines_since_base, plus one npm-only step
+          #              after it: the declared-count check above. It forwards
+          #              its arguments. The shared helper owns the
           #              probe, the base-image read, both parses (it calls the
           #              extractor twice) and the full-line set difference, with
           #              the fail-closed branches, so npm and pre-commit
@@ -1877,11 +1902,68 @@ jobs:
               }
           '
 
+          # The declared count for package-lock: every non-root `.packages` entry
+          # the stream above must account for with a pin or a vendored record.
+          #
+          # Written as its OWN enumeration, not derived from NPM_AGE_JQ_ENTRIES.
+          # Counting "whatever the entries program emits" would be a tautology;
+          # the point is a second, independent statement of who is in, so that a
+          # `select` added to the entries program — which is how the invisible
+          # vendored arrival was built in the first place — leaves an entry
+          # counted here and emitted nowhere, and fails the run instead of
+          # passing in silence.
+          #
+          # The exclusions are the ones the entries program makes on purpose,
+          # each a POSITIVE test, so an entry in none of them is owed a record:
+          #   `link: true`               a symlink into this repo`s own tree
+          #   key outside node_modules/  a workspace member (`packages/foo`):
+          #                              the repo`s own source, not an install
+          #   version, no `resolved`     npm writes that shape for nested and
+          #                              bundled dependencies of registry
+          #                              packages; absence of provenance is not
+          #                              evidence of vendoring
+          #   version, local directory   `file:`/`link:`/`portal:`/`workspace:`
+          #                              naming a directory, not an archive
+          # What is left over, and therefore a shortfall, is an INSTALLED,
+          # non-link entry with no `version` — not a shape npm writes. That is
+          # the under-counting direction the seam header asks for: a lockfile
+          # whose `version` key a future npm respelled fails closed here, where
+          # it used to yield an empty work-list and "No new dependencies".
+          # The limit, stated rather than hidden: a respelled `resolved` reads as
+          # the third exclusion and is NOT caught — telling it apart from the
+          # resolved-less entries npm really writes would fail real lockfiles.
+          #
+          # The tarball pattern is the same literal as in NPM_AGE_JQ_ENTRIES and
+          # must stay so: an archive behind a local path is vendored there, so it
+          # must be owed a record here.
+          # shellcheck disable=SC2016
+          NPM_AGE_JQ_DECLARED='
+            [ .packages // {} | to_entries[]
+              | select(.key != "")
+              | (.value.resolved // "") as $r
+              | ((.value.version // null) != null) as $versioned
+              | select(
+                  ((.value.link // false) == true
+                   or ((.key | test("(^|/)node_modules/")) | not)
+                   or ($versioned and $r == "")
+                   or ($versioned
+                       and ($r | test("^(file|link|portal|workspace):"))
+                       and (($r | test("\\.(tgz|tar\\.gz|tar)([?#].*)?$")) | not)))
+                  | not)
+            ] | length'
+
+          # $1 selects the output, as parse_pnpm_lock's does: "entries" (default)
+          # is the record stream, "declared" the count the seam header asks for.
           npm_age::pkglock_pins() {
+            local mode="${1:-entries}"
             # jq's stderr is deliberately NOT suppressed: when this fails the
             # caller turns it into a red build, and the operator needs jq's reason
             # (and, via `pipefail`, a git-side failure lands in the same branch).
-            jq -r --arg host "$NPM_AGE_WANT_HOST" "$NPM_AGE_JQ_ENTRIES"
+            case "$mode" in
+              entries)  jq -r --arg host "$NPM_AGE_WANT_HOST" "$NPM_AGE_JQ_ENTRIES" ;;
+              declared) jq -r "$NPM_AGE_JQ_DECLARED" ;;
+              *) echo "::error::npm_age::pkglock_pins: unknown mode '${mode}'" >&2; return 2 ;;
+            esac
           }
 
           # Emits `pkg@version` for every registry-hosted pin in ONE yarn.lock
@@ -1901,7 +1983,25 @@ jobs:
           # and count as skipped — and a commit that bumped only `__metadata`
           # would reach the all-skipped guard with checked_count 0 and fail the
           # PR outright.
+          #
+          # $1 selects the output: "entries" (default) is the record stream,
+          # "declared" the number of block headers that stream must account for —
+          # every header that named a registry package or was held as a vendored
+          # record, which leaves out exactly what the header rule leaves out on
+          # purpose (file metadata, `patch:` wrappers, local directory paths). A
+          # header counted there whose block then yields no record — a body
+          # `version` this parser cannot read, beside blocks it can — is a
+          # shortfall, where it used to be dropped in silence unless EVERY block
+          # failed the same way. The END guard's fail-closed exit applies to both
+          # modes: an image this parser refuses has no trustworthy count.
           npm_age::yarn_pins() {
+            local mode="${1:-entries}"
+            case "$mode" in
+              entries|declared) ;;
+              *) echo "::error::npm_age::yarn_pins: unknown mode '${mode}'" >&2; return 2 ;;
+            esac
+            # `mode` is one of the two literals validated above, so it can ride
+            # `-v`: there is no escape sequence in it to process.
             # The three configuration values reach awk through ENVIRON, not `-v`.
             # POSIX makes a `-v` value undergo string-literal escape processing,
             # so `\040` in a committed .yarnrc.yml value — which usable() passes,
@@ -1913,7 +2013,7 @@ jobs:
             NPM_AGE_WANT_HOST="$NPM_AGE_WANT_HOST" \
             NPM_AGE_YARN_DEFAULT_HOST="$NPM_AGE_YARN_DEFAULT_HOST" \
             NPM_AGE_YARN_SCOPE_MAP="$NPM_AGE_YARN_SCOPE_MAP" \
-            awk "$NPM_AGE_AWK_CANON_HOST"'
+            awk -v mode="$mode" "$NPM_AGE_AWK_CANON_HOST"'
               # A selector naming a path in this repo`s own tree rather than an
               # artifact fetched from somewhere. Source reviewed in the same PR is
               # not vendoring; a tarball behind such a path is, which makes this a
@@ -1985,6 +2085,13 @@ jobs:
                 # empty, so the readable second one landed with no conflict, and
                 # the entry was untagged under one ordering and tagged under the
                 # other. That is the exact asymmetry the two-readable-hosts rule
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # rejects ("picking first or last would each be a false pass under
                 # the opposite ordering"), and the `__archiveUrl` path already
                 # refuses an unreadable value unconditionally — so block_badloc
@@ -2072,8 +2179,9 @@ jobs:
                   # the header already contains the resolution verbatim, and
                   # repeating it makes the notice unreadable; for a branch pin the
                   # header is stable and the resolution is the only moving part.
-                  print "vendored\t" pending_vendored \
-                        ((block_res == "" || index(pending_vendored, block_res) > 0) ? "" : " -> " block_res)
+                  if (mode == "entries")
+                    print "vendored\t" pending_vendored \
+                          ((block_res == "" || index(pending_vendored, block_res) > 0) ? "" : " -> " block_res)
                   pending_vendored = ""
                 }
                 if (pending_name == "") return
@@ -2087,13 +2195,6 @@ jobs:
                 # configured registry would assert something the lockfile never
                 # said. The ways that happens are not exotic — a key spelling the
                 # rule below does not match (yarn v1 accepts `resolved`,
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # `"resolved"`, `resolved:` and `"resolved":` for the same key,
                 # and decodes escapes in keys, so no literal match is complete), a
                 # git conflict marker splitting the block at column 0, or an
@@ -2154,10 +2255,12 @@ jobs:
                 # though — that would change the hostless arm when want_host is
                 # itself empty, which a direct parser caller can reach, and change
                 # it in the fail-OPEN direction.
-                if (block_conflict || h == "" || h != want_host)
-                  print "offregistry\t" pending_name "@" pending_ver
-                else
-                  print pending_name "@" pending_ver
+                if (mode == "entries") {
+                  if (block_conflict || h == "" || h != want_host)
+                    print "offregistry\t" pending_name "@" pending_ver
+                  else
+                    print pending_name "@" pending_ver
+                }
                 pending_name = ""; pending_ver = ""
               }
               # Resets ALL per-file state, not just `name`. Unreachable as written
@@ -2285,6 +2388,11 @@ jobs:
                   sel = substr(spec, RSTART + RLENGTH + 1)
                   if (sel !~ /^patch:/ && !local_path(sel)) pending_vendored = spec
                 }
+                # The denominator for npm_age::records_cover_declared: a header
+                # that named a registry package owes a pin, one held as vendored
+                # owes that record. Counted HERE, at the header, so it does not
+                # depend on the body lines a pin is later built from.
+                if (name != "" || pending_vendored != "") declared++
                 next
               }
               # Matches the OWN version line of a block. It cannot be tripped by a
@@ -2499,6 +2607,7 @@ jobs:
               END {
                 # The last block in the file has no following header to end it.
                 flush()
+                if (mode == "declared") print declared + 0
                 # Each refusal names its own reason on stderr. The comparator that
                 # runs this program (preflight::new_lines_since_base, see "Message
                 # ownership" there) says WHICH image could not be parsed and that
@@ -2548,13 +2657,104 @@ jobs:
           # Exit codes pass through unchanged: 2 for the base image (read or parse
           # — a checkout problem: a partial clone's lazy blob fetch, a corrupt
           # object, no scratch space, a base revision the checkout cannot
-          # resolve), 1 for a head lockfile that could not be parsed. main()
-          # renders exactly that split. Every diagnostic is on stderr: stdout is
-          # the work-list channel, read back with `new_deps=$(...)`. On a parse
-          # failure the helper names WHICH image and the extractor says WHY (jq's
-          # own error; yarn_pins' END diagnostic) — see the helper's header.
+          # resolve), 1 for a head lockfile that could not be parsed, and 5 from
+          # the declared-count check below. main() renders exactly that split.
+          # Every diagnostic is on stderr: stdout is the work-list channel, read
+          # back with `new_deps=$(...)`. On a parse failure the helper names WHICH
+          # image and the extractor says WHY (jq's own error; yarn_pins' END
+          # diagnostic) — see the helper's header.
+          #
+          # The check runs AFTER the comparison, so the comparator's contract —
+          # base side first, unconditionally — is untouched and a checkout
+          # problem still surfaces ahead of a format one; diff_pnpm_lock, which
+          # owns its own zero-pin triage, runs the same check before its base
+          # read instead. It is a head-only question, so a lockfile this branch
+          # deletes has nothing to answer.
+          #
+          # And only for a lockfile this branch CHANGED, the same line
+          # diff_pnpm_lock draws with its unchanged-file short-circuit. main
+          # calls this for every lockfile that merely exists, so an ungated
+          # check would fail every PR in a repo — README-only ones included —
+          # for a shortfall the branch did not introduce and cannot fix; that
+          # is what trains people to reach for a bypass. The ls-files half is
+          # load-bearing for the reason it is there too: `git diff <rev> --
+          # <path>` ignores untracked paths, so an untracked lockfile reads as
+          # unchanged and would skip the check on a file whose every entry is
+          # being promoted. A `git diff` that fails outright reads as changed,
+          # which is the fail-closed direction.
           npm_age::changed_pins() {   # <lockfile> <base_rev> <extractor> [base_blob]
-            preflight::new_lines_since_base "$@"
+            local lockfile="$1" extractor="$3" new_lines head_records
+            new_lines=$(preflight::new_lines_since_base "$@") || return $?
+            if [ -f "$lockfile" ] \
+               && { ! git ls-files --error-unmatch "./${lockfile}" >/dev/null 2>&1 \
+                    || npm_age::lockfile_changed "$lockfile" "$2"; }; then
+              # A third parse of the head image (the comparator does not hand its
+              # own back), checked on its own rather than left to pipefail: the
+              # comparator just parsed this file, so a failure here is transient,
+              # and it must still say so instead of returning a bare rc 1.
+              head_records=$("$extractor" < "$lockfile") \
+                || { echo "::error file=${lockfile}::${lockfile} could not be re-read for the declared-count check" >&2; return 1; }
+              printf '%s\n' "$head_records" \
+                | npm_age::records_cover_declared "$lockfile" "$extractor" \
+                || return $?
+            fi
+            # No trailing newline for an empty result: main tests `-z "$new_deps"`
+            # after stripping vendored records, and the comparator's own no-blank-
+            # line contract is measured byte-exactly by its tests.
+            [ -z "$new_lines" ] || printf '%s\n' "$new_lines"
+          }
+
+          # The declared-count check the seam header describes, format-agnostic:
+          # the HEAD image's record stream on stdin, and `<extractor> declared`
+          # run over <lockfile> for the denominator. Every record — a pin, tagged
+          # or bare, or a vendored entry — accounts for one declared entry;
+          # anything left over exists, resolves to something, and was gated by
+          # nothing. rc 5, rendered by main as "lockfile only partly parsed",
+          # because the operator is looking at a lockfile that parses.
+          #
+          # Fails rather than warns, and with no margin, because each extractor
+          # builds its denominator to under-count rather than over-count: every
+          # way it can be wrong makes the count too SMALL, which cannot trip this
+          # branch. A shortfall therefore means the parser demonstrably missed
+          # something, which is the silent pass this seam exists to stop.
+          #
+          # <detail>, optional, is appended to the counts in the message — pnpm
+          # passes the number of keys whose version it could not read, which the
+          # shared arithmetic cannot see (an unreadable key is deliberately not
+          # accounted for, so it surfaces here instead of being dropped on the
+          # path where other keys parsed).
+          npm_age::records_cover_declared() {   # <lockfile> <extractor> [detail]
+            local lockfile="$1" extractor="$2" detail="${3:-}"
+            local records total vendored declared
+            records=$(cat)
+            # `grep -c` prints a count and exits 1 when that count is 0, so a
+            # printed "0" is the one non-zero status accepted. Anything else — a
+            # read error, grep itself failing — is a real failure and must not be
+            # laundered into "0 accounted", which would fail every lockfile with a
+            # false shortfall.
+            total=$(printf '%s\n' "$records" | grep -c .) \
+              || [ "${total:-}" = 0 ] \
+              || { echo "::error file=${lockfile}::could not count the records parsed from ${lockfile}" >&2; return 1; }
+            # `vendored` only words the message; the verdict below reads `total`.
+            vendored=$(printf '%s\n' "$records" | npm_age::records_of_kind vendored | grep -c .) \
+              || [ "${vendored:-}" = 0 ] \
+              || { echo "::error file=${lockfile}::could not count the vendored records parsed from ${lockfile}" >&2; return 1; }
+            declared=$("$extractor" declared < "$lockfile") \
+              || { echo "::error file=${lockfile}::could not count the entries ${lockfile} declares; the parser itself failed" >&2; return 1; }
+            # One non-negative integer, or fail closed: the test below is
+            # arithmetic, and on an empty or non-numeric value it errors and reads
+            # FALSE — fail-open in exactly the "the parser misbehaved" case this
+            # exists for.
+            case "${declared:-x}" in
+              *[!0-9]*)
+                echo "::error file=${lockfile}::could not count the entries ${lockfile} declares; the parser returned '${declared}'" >&2
+                return 1
+                ;;
+            esac
+            if [ "$declared" -gt "$total" ]; then
+              echo "::error file=${lockfile}::${lockfile} declares $(( declared - total )) more package(s) than this check could account for (${declared} declared; $(( total - vendored )) readable pins, ${vendored} vendored${detail:+, ${detail}}) — its lockfile format is not fully one this check understands, so the packages it did verify are not the whole file. Until this check is taught the format, pin your caller to the previous ops-routines-workflows release SHA and tell the ops-routines maintainers." >&2
+              return 5
+            fi
           }
 
           # An unreadable lockfile FORMAT yields an empty work-list, which reads
@@ -2722,17 +2922,18 @@ jobs:
           # line — `pkg@version`, prefixed with "offregistry<TAB>" for an entry
           # that resolves somewhere other than want_host, or "vendored<TAB>" plus
           # the verbatim key for one that names a source rather than a version;
-          # "counts" prints "<non-registry> <unreadable> <resolutions>". There is
-          # no off-registry count, because such an entry is PRINTED in entries
-          # mode, which makes the zero-pin path that reads "counts" unreachable
-          # for it; the vendored count is kept because that path DOES need it — a
-          # vendored record is not a pin, so a fully vendored lockfile still has
-          # no pins to gate. The caller reads the first two fields on the zero-pin
-          # path, to tell a format it could not read apart from one it read fine
-          # whose every entry is git-, tarball-, link- or workspace-sourced; the
-          # third is the denominator for its shortfall guard (see the
-          # `resolutions` counter below). Both fail closed; asserting the wrong cause is what
-          # burns whoever debugs it.
+          # "counts" prints "<non-registry> <unreadable>"; "declared" prints the
+          # number of `resolution:` lines the `packages:` map carries — the
+          # denominator the seam header asks every extractor for (see the
+          # `resolutions` counter below). There is no off-registry count, because
+          # such an entry is PRINTED in entries mode, which makes the zero-pin
+          # path that reads "counts" unreachable for it; the vendored count is
+          # kept because that path DOES need it — a vendored record is not a pin,
+          # so a fully vendored lockfile still has no pins to gate. The caller
+          # reads "counts" on the zero-pin path, to tell a format it could not
+          # read apart from one it read fine whose every entry is git-, tarball-,
+          # link- or workspace-sourced. Both fail closed; asserting the wrong
+          # cause is what burns whoever debugs it.
           #
           # awk vars: want_host is the configured registry host, default_host the
           # one an integrity-only entry falls back to (.npmrc `registry=`, else the
@@ -2746,10 +2947,17 @@ jobs:
             # as a bash arithmetic error somewhere else entirely.
             local mode="${1:-entries}"
             case "$mode" in
-              entries|counts) ;;
+              entries|counts|declared) ;;
               *) echo "::error::npm_age::parse_pnpm_lock: unknown mode '${mode}'" >&2; return 2 ;;
             esac
             # All three are set once at load time in age-check-npm.sh and narrowed
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # per target by npm_age::load_registry_config. default_host equalling
             # want_host is the honest reading of "no .npmrc evidence": with nothing
             # saying the lockfile was written against some OTHER registry, an
@@ -2953,10 +3161,10 @@ jobs:
                 # If a future pnpm changes that indent this parses to zero and takes
                 # the fail-closed path below — visible, not silent.
                 if ($0 !~ /^  [^[:space:]].*:\r?$/) {
-                  # Denominator for the shortfall guard in diff_pnpm_lock: every
-                  # entry in a pnpm `packages:` map carries exactly one
-                  # `resolution:`, v5 through v9, written as a direct child of the
-                  # two-space key — so EXACTLY four spaces. Counted ONCE per key
+                  # Denominator for npm_age::records_cover_declared (the `declared`
+                  # mode): every entry in a pnpm `packages:` map carries exactly
+                  # one `resolution:`, v5 through v9, written as a direct child of
+                  # the two-space key — so EXACTLY four spaces. Counted ONCE per key
                   # (res_seen), independently of whether the key itself parsed:
                   # the whole point is to know how many entries the file declares
                   # when the key matcher could not read some of them. That is the
@@ -2975,13 +3183,6 @@ jobs:
                   #
                   # res_seen and the indent overlap on purpose. pnpm writes
                   # `resolution:` as the FIRST body line, so under a key that has
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   # one, res_seen alone already ignores anything deeper that
                   # follows; the indent is what stops a nested line from being
                   # counted under a key that has NO resolution of its own — which
@@ -3238,7 +3439,8 @@ jobs:
 
               END {
                 flush()
-                if (mode == "counts") print nonregistry + 0, unreadable + 0, resolutions + 0
+                if (mode == "counts")   print nonregistry + 0, unreadable + 0
+                if (mode == "declared") print resolutions + 0
               }
             '
           }
@@ -3310,30 +3512,29 @@ jobs:
               || [ "${pins_n:-}" = 0 ] \
               || { echo "::error file=${lockfile}::could not count the pins in ${lockfile}" >&2; return 1; }
 
-            # Probed unconditionally, where it used to run only when nothing
-            # parsed: the shortfall guard further down needs the third field on
-            # the path where pins DID parse, which is the path it exists for. One
-            # more awk pass over the head image, only on a lockfile that actually
-            # changed — the unchanged-file short-circuit above still returns
-            # before any of this.
+            # Probed unconditionally: the declared-count check further down
+            # reports `unreadable` beside its own counts on the path where pins
+            # DID parse, which is the path it exists for. One more awk pass over
+            # the head image, only on a lockfile that actually changed — the
+            # unchanged-file short-circuit above still returns before any of this.
             # Checked for the same reason head_entries is: errexit is suppressed
             # for this whole function. Unchecked, a failing awk yields an empty
             # count, falls past the zero-pin branch to the `resolution:` grep, and
             # reports a format this check cannot understand — the misdiagnosis
             # `counts` exists to prevent, reached by a different door.
             # Explicit IFS: the script sets IFS=$'\n\t' globally, so a bare `read`
-            # would not split this triple on its spaces.
-            local counts nonregistry unreadable resolutions
+            # would not split this pair on its space.
+            local counts nonregistry unreadable
             counts=$(npm_age::parse_pnpm_lock counts < "$lockfile") \
               || { echo "::error file=${lockfile}::could not count entries in ${lockfile}; the parser itself failed" >&2; return 1; }
-            IFS=' ' read -r nonregistry unreadable resolutions <<< "$counts"
-            # Three non-negative integers, or fail closed. Every guard below is an
-            # arithmetic test; on an empty or short triple those tests error and
-            # read FALSE, which would sail a lockfile past the unreadable, zero-pin
-            # and shortfall checks at once — fail-open in exactly the "the parser
+            IFS=' ' read -r nonregistry unreadable <<< "$counts"
+            # Two non-negative integers, or fail closed. Every guard below is an
+            # arithmetic test; on an empty or short pair those tests error and
+            # read FALSE, which would sail a lockfile past the unreadable and
+            # zero-pin checks at once — fail-open in exactly the "the parser
             # misbehaved" case they exist for. Unreachable while the awk prints
             # its `+ 0` fields, which is the point of checking it here.
-            case "${nonregistry:-x}${unreadable:-x}${resolutions:-x}" in
+            case "${nonregistry:-x}${unreadable:-x}" in
               *[!0-9]*)
                 echo "::error file=${lockfile}::could not count entries in ${lockfile}; the parser returned '${counts}'" >&2
                 return 1
@@ -3383,32 +3584,18 @@ jobs:
             # respelled most keys while leaving one recognisable would sail past it
             # and render "Verified 1 package(s)": a green check asserting coverage
             # it does not have. So account for every entry the file declares, not
-            # merely for one — and do it HERE, on both paths: a lockfile whose only
-            # readable keys are vendored ones is the same partial parse, and used
-            # to reach the allow_registry_free pass below with no diagnosis at all.
-            #
-            # `resolutions` counts the `resolution:` line pnpm writes under every
-            # key in `packages:`; a key this parser read is either a pin or a
-            # counted vendored entry. Anything left over is an entry that exists,
-            # resolves to something, and was gated by nothing — including the
-            # `unreadable` keys, which are deliberately NOT added to `accounted` so
-            # they surface here instead of being silently dropped on the path
-            # where other entries parsed, and the keys with no "@" at all, which
-            # leave the parser through a branch that counts nothing. Needs no
-            # base image, which is why it sits above the fetch.
-            #
-            # Fails rather than warns, and with no margin, because the denominator
-            # is built to under-count rather than over-count (see the `resolutions`
-            # counter in the parser): every way it can be wrong makes `resolutions`
-            # too SMALL, which cannot trip this branch. A shortfall therefore means
-            # the parser demonstrably missed something, which is the silent pass
-            # this whole function exists to stop.
-            local accounted
-            accounted=$(( pins_n + nonregistry ))
-            if [ "$resolutions" -gt "$accounted" ]; then
-              echo "::error file=${lockfile}::${lockfile} declares $(( resolutions - accounted )) more resolved package(s) than this check could account for (${resolutions} resolved; ${pins_n} readable pins, ${nonregistry} vendored, ${unreadable} unreadable) — its lockfileVersion is not fully one this check understands, so the packages it did verify are not the whole file. Until this check is taught the format, pin your caller to the previous ops-routines-workflows release SHA and tell the ops-routines maintainers." >&2
-              return 5
-            fi
+            # merely for one — the shared check every extractor answers to, run
+            # HERE rather than in changed_pins because this function does not call
+            # changed_pins, and on both paths: a lockfile whose only readable keys
+            # are vendored ones is the same partial parse, and used to reach the
+            # allow_registry_free pass below with no diagnosis at all. Needs no
+            # base image, which is why it sits above the fetch. The `unreadable`
+            # keys are deliberately NOT accounted for, so they surface here
+            # instead of being silently dropped on the path where other entries
+            # parsed; the count rides along as the message's detail.
+            printf '%s\n' "$head_entries" \
+              | npm_age::records_cover_declared "$lockfile" npm_age::parse_pnpm_lock "${unreadable} unreadable" \
+              || return $?
 
             # The remaining zero-pin outcome: vendored entries only. Decided here,
             # BEFORE the base image is fetched, because the failing answer (rc 3)
@@ -3611,11 +3798,14 @@ jobs:
           #   4 - as 3, but `allow_registry_free` says that is intended. A pass,
           #       reported separately so the run does not render as a verified one
           #       when nothing was verified.
-          #   5 - read, but not read WHOLE: the file declares more resolved
-          #       packages than the parser accounted for, so what it did verify is
-          #       not the whole file. Kept apart from 1 because the operator is
-          #       looking at a lockfile that parses. pnpm only, like 3 and 4 —
-          #       package-lock and yarn return only 0, 1 and 2.
+          #   5 - read, but not read WHOLE: the file declares more packages than
+          #       the parser accounted for, so what it did verify is not the whole
+          #       file. Kept apart from 1 because the operator is looking at a
+          #       lockfile that parses. All three parsers: the check is
+          #       npm_age::records_cover_declared, reached through
+          #       npm_age::changed_pins by package-lock and yarn and called by
+          #       diff_pnpm_lock directly. 3 and 4 stay pnpm-only — package-lock
+          #       and yarn return 0, 1, 2 and 5.
           #
           # Exit codes:
           #   0 - every added or bumped dependency is >= MIN_AGE_DAYS old
@@ -3649,6 +3839,13 @@ jobs:
           #   change touching only private pins reaches the all-skipped guard and
           #   fails. That failure is correct (nothing could be verified) but it is
           #   newly common, so the guard names the cause — and, since the registry
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   is now read from the resolution, points at `registry_url` rather than
           #   at a bypass. A wholly-private lockfile CAN be gated now, by naming
           #   that registry; what cannot be gated is one whose registry this runner
@@ -3811,13 +4008,6 @@ jobs:
           #   With no .yarnrc.yml that value IS the configured registry, so Berry
           #   entries stay untagged and adopting this still cannot flip a Berry
           #   repo green -> red.
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   `__archiveUrl` BEATS .yarnrc.yml where the two disagree, which is the
           #   one place in this file that resolves conflicting evidence instead of
           #   refusing it. Deliberate: `__archiveUrl` is not a claim about the
@@ -3954,14 +4144,33 @@ jobs:
           #   future lockfileVersion that renamed or restructured that map would
           #   parse as "no packages" — which is why it fails closed when a lockfile
           #   declares resolved packages it cannot parse, rather than returning an
-          #   empty work-list in silence. That zero-parse guard is all-or-nothing,
-          #   so a second one covers the partial case: every entry in `packages:`
-          #   carries a `resolution:`, those lines are counted (once per key, at
-          #   the exact four-space indent, inside `packages:` only) and the pins
-          #   plus the vendored records must account for all of them. A shortfall
-          #   — a respelled key beside a readable one — fails the run with the
-          #   counts (rc 5), reported as a partial parse rather than an unreadable
-          #   file, because the operator is looking at a lockfile that parses.
+          #   empty work-list in silence. That zero-parse guard is all-or-nothing;
+          #   the partial case is the declared-count check in the next bullet,
+          #   whose pnpm denominator is the `resolution:` line under every key
+          #   (counted once per key, at the exact four-space indent, inside
+          #   `packages:` only).
+          # - EVERY parser must account for every entry its lockfile declares, or
+          #   the run fails with rc 5, reported as a partial parse rather than an
+          #   unreadable file because the operator is looking at a lockfile that
+          #   parses. Each extractor answers `declared` with its own denominator,
+          #   built to under-count: pnpm's `resolution:` lines; package-lock's
+          #   non-root `.packages` keys; yarn's block headers. Each leaves out,
+          #   by a positive test, what its record stream leaves out on purpose —
+          #   for package-lock a `link: true` entry, a workspace member, an entry
+          #   with a version and no `resolved`, and a local directory path; for
+          #   yarn file metadata, `patch:` wrappers and local directory paths.
+          #   What that catches: a pnpm key respelled beside readable ones; a
+          #   yarn block whose body `version` cannot be read beside blocks that
+          #   can (dropped in silence before, unless every block failed alike); a
+          #   package-lock entry installed under node_modules with no `version`
+          #   at all, which is what a respelled `version` key looks like; and any
+          #   future edit that makes an extractor drop an entry without saying
+          #   so. What it does NOT catch: a package-lock whose `resolved` key was
+          #   respelled reads as "version, no resolved", the exclusion npm's own
+          #   resolved-less entries need, and still passes with an empty
+          #   work-list. Closing that would mean failing lockfiles npm really
+          #   writes. A package-lock with no `packages` object at all is the
+          #   separate, announced lockfileVersion-1 case.
           # - The pnpm parser has not been fuzzed against workspace / overrides
           #   edge cases the way the package-lock.json path has.
           #
@@ -4467,6 +4676,13 @@ jobs:
                 # Column 0 opens a section and ends any scope in progress. Only
                 # whether it is the `npmScopes` map is remembered — the same shape
                 # as in_packages in npm_age::parse_pnpm_lock — which is what keeps
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # an npmRegistryServer nested under some OTHER top-level map
                 # (`npmRegistries`, keyed by URL and holding auth) from being read
                 # as the default.
@@ -4692,13 +4908,6 @@ jobs:
           }
 
           # A scope whose registry could not be read. The default-host warning
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # above never sees these — the poison sits in the scope map — so without
           # this every `@acme` pin is tagged and, if those are the only new
           # dependencies, the all-skipped guard fails the PR with nothing in the
@@ -5358,6 +5567,13 @@ jobs:
               # summary ROW (record_unverifiable writes only the TSV), the failures
               # TSV (comment-on-failure is gated on it being non-empty), and the
               # summary FOOTER. The PR comment is the only one an operator sees
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 4 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               # without opening the log, so it has to name the right cause — a
               # base image that cannot be read is not a head-lockfile parse
               # failure, and telling that operator their lockfile is unreadable
@@ -5390,7 +5606,7 @@ jobs:
                     # hunting for a corrupt file rather than for the entries this
                     # check silently could not account for.
                     fail_cell=":x: lockfile only partly parsed"
-                    fail_reason="declares more resolved packages than this check could account for, so the packages it did verify are not the whole file; see the job log for the counts"
+                    fail_reason="declares more packages than this check could account for, so the packages it did verify are not the whole file; see the job log for the counts"
                     ;;
                   *)
                     fail_cell=":x: lockfile could not be parsed"
@@ -5447,7 +5663,7 @@ jobs:
               [ "$off_count" -gt 0 ] && off_note="; ${off_count} more resolve to another registry and are skipped without a request"
               pin_count=$(( $(printf '%s\n' "$new_deps" | grep -c . || true) - off_count ))
               total_pins_so_far=$(( total_pins + pin_count ))
-              echo "::notice::$(preflight::safe_for_md "$file"): ${pin_count} pin(s) to verify, ${total_pins_so_far} across this run (~$(( total_pins_so_far * 45 / 100 ))s at ~0.45s each; job timeout is ${TIMEOUT_MINUTES} min)${off_note}. Counts work-list entries; backstop and invalid-name skips never reach the registry, so this over-estimates slightly."
+              echo "::notice::$(preflight::safe_for_md "$file"): ${pin_count} pin(s) to verify, ${total_pins_so_far} across this run (~$(( total_pins_so_far * 45 / 100 ))s at ~0.45s each; job timeout is ${TIMEOUT_MINUTES} min)${off_note}. Counts work-list entries; invalid-name skips never reach the registry, so this over-estimates slightly."
 
               # Refuse rather than run out the clock. This is the same rule the
               # unparseable-base branch in changed_pins already applies ("fail
@@ -5517,19 +5733,17 @@ jobs:
                 if [ -z "$pkg" ] || [ -z "$ver" ]; then
                   continue
                 fi
-                # Skip non-registry sources. Backstop only — each extractor now
-                # filters these out itself (a package-lock entry fails the
-                # `.resolved | startswith("https://")` test, a yarn block fails
-                # the header protocol test), so this catches a hand-crafted
-                # lockfile that slipped through. Kept in step with the protocol
-                # list in npm_age::yarn_pins above.
-                case "$ver" in
-                  file:*|link:*|workspace:*|git+*|portal:*|patch:*|exec:*)
-                    echo "  SKIP: ${pkg}@${ver} (non-registry)"
-                    skipped_count=$((skipped_count + 1))
-                    continue
-                    ;;
-                esac
+                # No protocol test on $ver here. There used to be a backstop
+                # skipping `file:`/`link:`/`git+`... versions, from when extractors
+                # let such entries through. None can now: yarn and pnpm admit a
+                # version only if it starts with a digit, and both decide the
+                # protocol at the header or key, where a non-registry source
+                # becomes a vendored record or a stated exclusion. The one way to
+                # reach it was a crafted package-lock `version` beside an https
+                # `resolved`, and for that the path below is the better answer —
+                # the registry has no such version, so it renders a visible
+                # "version not in registry" row where the backstop printed one
+                # log line and no row.
 
                 # Validate pkg name BEFORE it reaches curl. Reject with an
                 # auditable warning row rather than silently skipping — makes
@@ -5564,13 +5778,6 @@ jobs:
 
                 local ts
                 local fetch_rc=0
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 4 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 ts=$(npm_age::published_at "$pkg" "$ver") || fetch_rc=$?
 
                 case "$fetch_rc" in
