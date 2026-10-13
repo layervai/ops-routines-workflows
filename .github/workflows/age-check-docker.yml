@@ -1230,8 +1230,8 @@ jobs:
           # What it cannot cover: a run step that never starts (a checkout failure
           # ahead of it), a syntax error in the embedded script, or a SIGKILL —
           # the runner's follow-up to an unanswered SIGTERM — none of which reach
-          # a trap. Those leave the file empty and the renderer deleting; closing
-          # them needs the renderer to be told the run step's outcome.
+          # a trap. Those leave the file empty, and the renderer keeps the sticky
+          # there: the comment step passes it this step's RUN_OUTCOME.
           preflight::exit_guard() {
             local ecosystem="$1" rc="${2:-$?}"
             if [ "$rc" -ne 0 ] \
@@ -1723,6 +1723,7 @@ jobs:
           OPS_ROUTINES_AGE_CHECK_LIB
 
       - name: Check Docker base-image ages
+        id: age_check
         working-directory: ${{ inputs.working_directory }}
         env:
           MIN_AGE_DAYS: ${{ inputs.min_age_days }}
@@ -1752,6 +1753,11 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           MIN_AGE_DAYS: ${{ inputs.min_age_days }}
           FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
+          # An empty failures file only means "nothing to report" when
+          # the check step itself went green. One that never started or
+          # was killed mid-run leaves the same empty file, and the
+          # renderer must not clear the sticky comment on that.
+          RUN_OUTCOME: ${{ steps.age_check.outcome }}
           # Per-ecosystem render parameters. Bash body below is identical
           # across all reusables; only these env values change.
           ECOSYSTEM: docker
@@ -1781,7 +1787,14 @@ jobs:
           # Updates an existing sticky in place
           # (marker is `<!-- ops-routines:age-check-comment:${ECOSYSTEM} -->`);
           # deletes the sticky on a clean run so a stale "X days remaining" doesn't
-          # outlive the failure that produced it.
+          # outlive the failure that produced it. "Clean" means the check step's
+          # own outcome was `success` (RUN_OUTCOME), not merely that the file is
+          # empty: a step that never started (a checkout failure ahead of it), a
+          # syntax error in its `run:` block, or its shell being SIGKILLed or
+          # OOM-killed while the runner survives all leave no rows on a red run,
+          # and the sticky from an earlier run is still the best information the
+          # PR has. (A cancelled job or a lost runner never gets this far: this
+          # step does not run.)
           #
           # Soft-fails on permission denial (typical on Dependabot PRs where the
           # token is read-only) — emits a `::notice` so the run still succeeds and
@@ -1790,6 +1803,9 @@ jobs:
           # Required env (set per-ecosystem in the calling step):
           #   GH_TOKEN, REPO, PR_NUMBER, RUN_URL, MIN_AGE_DAYS, FAILURES_FILE,
           #   ECOSYSTEM, ITEM_COLUMN, SEPARATOR
+          # Optional env:
+          #   RUN_OUTCOME — `steps.<id>.outcome` of the check step. Unset or empty
+          #   reads as `success`, which is the behaviour before it existed.
           # ============================================================================
 
           set -euo pipefail
@@ -2003,9 +2019,23 @@ jobs:
               fi
             fi
             rm -f "${body_file}"
+          elif [ "${RUN_OUTCOME:-success}" != success ]; then
+            # Red (or skipped) check step and no rows: it died before recording
+            # anything, so the empty file says nothing about the pins. Leave any
+            # sticky alone rather than deleting a legitimate "too new" verdict.
+            kept="No age-check comment was posted or changed."
+            if [ -n "${existing_id}" ]; then
+              kept="The existing age-check comment was kept; it reflects an earlier run and may be out of date."
+            fi
+            # `skipped` is a step that never started: an earlier step failed.
+            what="ended with outcome '${RUN_OUTCOME}' before recording any result"
+            if [ "${RUN_OUTCOME}" = skipped ]; then
+              what="did not run because an earlier step failed"
+            fi
+            echo "::notice::The age check ${what}. ${kept} See the job log for why this run stopped."
           elif [ -n "${existing_id}" ]; then
-            # No failures this run (neither too-new nor unverifiable); clear the
-            # stale sticky if one exists so reviewers don't act on outdated
+            # Green run with no failures (neither too-new nor unverifiable); clear
+            # the stale sticky if one exists so reviewers don't act on outdated
             # retry-after dates or stale upstream-error reasons.
             if ! gh api -X DELETE "/repos/${REPO}/issues/comments/${existing_id}" >/dev/null 2>&1; then
               echo "::notice::Could not delete stale age-check comment (id ${existing_id}). Caller workflow may need \`pull-requests: write\`."
