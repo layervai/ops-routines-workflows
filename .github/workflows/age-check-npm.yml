@@ -120,9 +120,15 @@ on:
           (`npmRegistryServer`, `npmScopes.<scope>.npmRegistryServer`) —
           Berry does not read .npmrc. A `::__archiveUrl=` in the
           resolution names a host outright and takes precedence. A Berry
-          repo with NO .yarnrc.yml is aged against this URL unchanged,
-          so setting registry_url alone does not gate it: that repo needs
-          both halves.
+          repo with no default `npmRegistryServer` in .yarnrc.yml — no
+          file, or a file with `npmScopes` rules only — has its remaining
+          entries aged against this URL on this input's word alone: the
+          checkout holds no evidence of where yarn installs them from.
+          When this URL is not the public registry (registry.npmjs.org,
+          or its registry.yarnpkg.com alias) the run says so with a
+          `::notice`, without failing. Set `npmRegistryServer` in
+          .yarnrc.yml to gate them on evidence; a registry set only in
+          CI (YARN_NPM_REGISTRY_SERVER) is invisible here.
 
           This also gives a pnpm v5 repo on a private default registry a
           real gate. Those lockfiles qualify every key with the registry
@@ -1684,7 +1690,10 @@ jobs:
               # green -> red, which is a rollout decision and not one this parser
               # gets to make. It also means a fork PR can reach untagged by
               # DELETING .yarnrc.yml, which is visible in review and the same door
-              # .npmrc already leaves open for pnpm.
+              # .npmrc already leaves open for pnpm. The absence IS announced,
+              # but not from here: load_registry_config emits a `::notice` when
+              # registry_url is private and no .yarnrc.yml names a default, so
+              # this function stays a pure reading of the evidence it was handed.
               #
               # The scope is read from pending_name, which holds the alias TARGET:
               # `string-width-cjs@npm:string-width@^4.2.0` buffers `string-width`.
@@ -2050,10 +2059,6 @@ jobs:
               # changed_pins is unreachable for yarn: an unreadable image would
               # yield an empty `before` and quietly promote the whole head
               # lockfile into the work-list. Only fires when the file IS
-              # yarn-shaped (real `pkg@range:` headers) but no body version could
-              # be read — a comments-only or dependency-free lockfile has no specs
-              # and stays a legitimate empty result.
-              # Two fail-closed cases, both "the file said something we could not
           OPS_ROUTINES_AGE_CHECK_LIB
 
       - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
@@ -2061,6 +2066,10 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
           cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+              # yarn-shaped (real `pkg@range:` headers) but no body version could
+              # be read — a comments-only or dependency-free lockfile has no specs
+              # and stays a legitimate empty result.
+              # Two fail-closed cases, both "the file said something we could not
               # read", which must never present as an empty work-list:
               #   specs>0, pins==0  — real `pkg@range:` headers but no readable
               #                       body version (a format change).
@@ -2960,11 +2969,6 @@ jobs:
               # does exist, or it fails a required check while forbidding every
               # escape it mentions.
               if grep -qE '^[[:space:]]+resolution:' "$lockfile"; then
-                echo "::error file=${lockfile}::${lockfile} declares resolved packages but no package key could be parsed — its lockfileVersion is not one this check understands, so nothing was verified. Until this check is taught the new format, pin your caller to the previous ops-routines-workflows release SHA and tell the ops-routines maintainers." >&2
-                return 1
-              fi
-              # No resolution entries at all: a genuinely dependency-free lockfile.
-              # Nothing to gate, and nothing wrong.
           OPS_ROUTINES_AGE_CHECK_LIB
 
       - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 3)
@@ -2972,6 +2976,11 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
           cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+                echo "::error file=${lockfile}::${lockfile} declares resolved packages but no package key could be parsed — its lockfileVersion is not one this check understands, so nothing was verified. Until this check is taught the new format, pin your caller to the previous ops-routines-workflows release SHA and tell the ops-routines maintainers." >&2
+                return 1
+              fi
+              # No resolution entries at all: a genuinely dependency-free lockfile.
+              # Nothing to gate, and nothing wrong.
               echo "::warning file=${lockfile}::${lockfile} declares no resolved dependencies — nothing to age-check for this file" >&2
               return 0
             fi
@@ -3437,8 +3446,36 @@ jobs:
           #   the ABSENCE of configuration is a rollout decision, not a parser
           #   one. It also means a fork PR can reach untagged by DELETING
           #   .yarnrc.yml — visible in review, and the same door .npmrc already
-          #   leaves open for pnpm. Berry's `npmPublishRegistry` is deliberately
-          #   not read: it is where packages are pushed, not fetched.
+          #   leaves open for pnpm. Note where that door leads: untagged means
+          #   aged against registry_url, so with a private registry_url the
+          #   deleted entry is still judged on the private registry, and with the
+          #   public default the scoped packages it uncovers were being SKIPPED
+          #   (tagged) before, not gated. What IS done about the absence: when
+          #   registry_url names a private registry and a Berry lockfile has no
+          #   .yarnrc.yml naming a default npmRegistryServer, the input and the
+          #   committed yarn configuration disagree about where packages come
+          #   from, and npm_age::load_registry_config says so with a `::notice`
+          #   naming YARN_NPM_REGISTRY_SERVER as the likely reason. A notice, not
+          #   a failure — the aging is still against the registry the caller
+          #   named — and nothing at all against the public registry_url, where
+          #   Berry's default and the input agree. It is a FILE-level fact standing
+          #   in for a per-entry one, and that has one known false-alarm shape: a
+          #   .yarnrc.yml whose `npmScopes` rules cover every package the repo
+          #   installs, or a lockfile whose every resolution carries
+          #   `::__archiveUrl=`, is judged entirely on evidence yet still draws
+          #   the notice on every run, because load_registry_config runs before
+          #   extraction and cannot see that nothing fell through to the default.
+          #   The wording scopes its claim to the entries that DO fall through, so
+          #   it is vacuous there rather than wrong; the only way to clear it is a
+          #   default `npmRegistryServer` the repo does not otherwise need, and
+          #   committing the registry Berry would use anyway is harmless. Expected
+          #   in that shape, not a bug. The same holds one directory up: the walk
+          #   starts at the working directory and never climbs above it (see
+          #   load_registry_config), while Berry itself keeps reading .yarnrc.yml
+          #   up to the filesystem root — so a nested project run with
+          #   `working_directory: services/api` and its .yarnrc.yml at the checkout
+          #   root draws the notice too. Berry's `npmPublishRegistry` is
+          #   deliberately not read: it is where packages are pushed, not fetched.
           #   Two details of the v1 path worth knowing:
           #   a `resolved` is read only at EXACTLY two spaces, the block's direct
           #   child, because `resolved` is a legal package name and a tarball URL
@@ -3473,7 +3510,8 @@ jobs:
           #   yarn would install from is unknowable here and picking first or last
           #   is a false pass under the opposite ordering.
           #   A BERRY entry, naming no host, is judged on .yarnrc.yml — and on
-          #   nothing at all it is emitted untagged, so adopting this cannot flip
+          #   nothing at all it is emitted untagged (and, under a private
+          #   registry_url, noticed — see above), so adopting this cannot flip
           #   a Berry repo from green to red. That exemption does NOT
           #   extend to a v1 block whose `resolved` named no host — a relative or
           #   non-URL value — which is tagged like any other unreadable origin; a
@@ -3567,8 +3605,9 @@ jobs:
           # input, and an Actions expression yields "" rather than leaving the
           # variable out. An empty value here would build every packument request
           # against nothing at all, so it has to fall back like an absent one.
+          NPM_AGE_PUBLIC_REGISTRY_URL="https://registry.npmjs.org"
           REGISTRY_URL="${AGE_CHECK_REGISTRY_URL:-}"
-          [ -n "$REGISTRY_URL" ] || REGISTRY_URL="https://registry.npmjs.org"
+          [ -n "$REGISTRY_URL" ] || REGISTRY_URL="$NPM_AGE_PUBLIC_REGISTRY_URL"
           # A trailing slash is what a caller copying the URL out of their .npmrc
           # will most often pass, and the requests below join with "/". Pure
           # parameter expansion rather than sed: this runs before
@@ -3723,6 +3762,20 @@ jobs:
           # registry and read their dates from another, silently. Tests drive
           # AGE_CHECK_REGISTRY_URL, which moves both together.
           NPM_AGE_WANT_HOST=$(npm_age::registry_host "$REGISTRY_URL")
+          # The host a caller who set nothing is judged against. Compared with
+          # NPM_AGE_WANT_HOST to tell "registry_url names a private registry" from
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+          # the default, which is the one distinction the Berry no-.yarnrc.yml
+          # notice in npm_age::load_registry_config turns on. Derived through
+          # registry_host so an explicit registry.yarnpkg.com folds to the same
+          # answer.
+          NPM_AGE_PUBLIC_HOST=$(npm_age::registry_host "$NPM_AGE_PUBLIC_REGISTRY_URL")
           NPM_AGE_DEFAULT_HOST="$NPM_AGE_WANT_HOST"
           # Space-separated `@scope=host`. Empty, not unset: the append in
           # npm_age::load_registry_config is unguarded and this file runs under
@@ -3779,13 +3832,6 @@ jobs:
                 val = substr(line, eq + 1)
                 gsub(/[[:space:]]/, "", key)
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # \047 is a single quote, spelled octal so this program stays
                 # inside one pair of shell single quotes.
                 gsub(/^"|"$/, "", val)
@@ -4283,13 +4329,44 @@ jobs:
               # kind gate above exists to remove, one format over: a v1 repo with a
               # .yarnrc.yml lying around — common mid-migration, or kept for
               # nodeLinker/yarnPath alone — would be told its Berry packages are
-              # being skipped when it has none. `__metadata:` is the marker yarn v1
-              # never writes, the same evidence the extractor keys Berry on.
-              if [ -z "$lockfile" ] || { [ -f "$lockfile" ] && grep -q '^__metadata:' "$lockfile"; }; then
+              # being skipped when it has none. `__metadata:` is a key yarn v1
+              # never writes — the same KIND of evidence the extractor keys Berry
+              # on, but at file level: the extractor decides per block, on
+              # `resolution:`/`checksum:`/`languageName:`/`linkType:`, and never
+              # reads `__metadata:` for that. A real lockfile is uniformly one
+              # format, so the two agree; this one answers "which file is this",
+              # not "which entry is this".
+              local berry_lock=0
+              [ -f "$lockfile" ] && grep -q '^__metadata:' "$lockfile" && berry_lock=1
+              if [ -z "$lockfile" ] || [ "$berry_lock" = 1 ]; then
                 npm_age::warn_registry_mismatch .yarnrc.yml "$NPM_AGE_YARN_DEFAULT_HOST" "$dir" "Berry " \
                   "Flow-style YAML (\`npmScopes: {…}\`) is not read, a value containing whitespace cannot be used, and \`\${VAR}\` interpolation is refused because this check cannot see the environment yarn expands it from; rewrite it in block style with a plain URL."
                 npm_age::warn_unreadable_scopes .yarnrc.yml "$NPM_AGE_YARN_SCOPE_MAP" "$dir" "Berry " \
                   "A flow-style scope (\`acme: {…}\`) is not read, and a value containing whitespace cannot be used; rewrite it in block style with a plain URL."
+              fi
+              # The other half of that file's story: no .yarnrc.yml default at all,
+              # under a registry_url that is not the public one, so the Berry
+              # entries are aged on that input's word alone. Known limitations
+              # ("WHAT THIS DOES NOT CLOSE") holds the reasoning for why that is a
+              # `::notice` and not a tag; only this call site's guards are
+              # explained here. Gated on the Berry marker itself, not merely a
+              # lockfile argument: a direct caller with no lockfile has nothing to
+              # be told about, and a v1 lockfile never reads .yarnrc.yml. Against
+              # the public registry_url there is nothing to say — Berry's own
+              # default folds to the same host. `default` is also non-empty for
+              # the `?unreadable` / `?unreadable-scopes` sentinels, which the
+              # mismatch warning above already covers.
+              # The wording scopes its claim: an entry under an `npmScopes` rule, or
+              # carrying `::__archiveUrl=`, IS judged on evidence and is not what
+              # the notice is about. And the registry.yarnpkg.com it names is
+              # Berry's own default — a fact about yarn, not the public-npm
+              # constant above, so it is not folded into NPM_AGE_PUBLIC_HOST.
+              # Only the path is sanitised: NPM_AGE_WANT_HOST is the caller's own
+              # input, already reduced to a bare host by registry_host, the same
+              # treatment the all-skipped remedy gives REGISTRY_URL.
+              if [ "$berry_lock" = 1 ] && [ -z "$default" ] && [ "$NPM_AGE_WANT_HOST" != "$NPM_AGE_PUBLIC_HOST" ]; then
+                local safe_lock; safe_lock=$(preflight::safe_for_md "$lockfile")
+                echo "::notice::${safe_lock} is a yarn Berry lockfile and no default npmRegistryServer is set in .yarnrc.yml, so entries not covered by an npmScopes rule or an __archiveUrl in their resolution are aged against registry_url (${NPM_AGE_WANT_HOST}) on that input alone — Berry's own default here is registry.yarnpkg.com. If yarn's registry is set only in CI (YARN_NPM_REGISTRY_SERVER), commit it as npmRegistryServer in .yarnrc.yml so this check can see where the packages come from."
               fi
             fi
           }
@@ -4590,6 +4667,13 @@ jobs:
             #                          and trusting auto-detection to re-add it
             #                          would drop it entirely: targets ends up
             #                          empty and the run exits 0 with "No npm
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             #                          lockfiles found", a silent pass for a
             #                          `lockfile_path: apps/web/yarn.lock`
             #                          consumer.
@@ -4700,13 +4784,6 @@ jobs:
                 # (diff_pnpm_lock says why it still computes them), so the pass is
                 # not a blind one.
                 npm_age::report_vendored_arrivals "$safe_file" "$new_deps"
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 echo "::endgroup::"
                 continue
               fi
@@ -5025,7 +5102,7 @@ jobs:
                 # or bucket behind `resolution: {tarball: ...}`) cannot be named
                 # here at all, so that case has to admit the label exists.
                 local off_remedy
-                if [ "$REGISTRY_URL" = "https://registry.npmjs.org" ]; then
+                if [ "$REGISTRY_URL" = "$NPM_AGE_PUBLIC_REGISTRY_URL" ]; then
                   off_remedy="pass registry_url to the reusable workflow naming the registry this repo installs from — it must serve packuments WITHOUT authentication, because this check sends no credential"
                 else
                   off_remedy="registry_url is already set to ${REGISTRY_URL}, so these resolve somewhere else again — check it names the registry this repo actually installs from; if that host serves no packument API this check cannot age them, and 'age-check-bypass' is the remaining way out"
