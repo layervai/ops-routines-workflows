@@ -4523,10 +4523,24 @@ jobs:
           # against a public homonym: the exact false pass this all exists to
           # close, reached through the one configuration that looks handled.
           # Folds one registry config file, read from each of <dirs...> in turn,
-          # into `<default-host><TAB><scope-map>` on stdout. An EMPTY default means
-          # the file named none, which the caller reads as "leave it at the
+          # into three lines on stdout: the default host, the scope map, and the
+          # provenance of whatever in those two is unreadable. An EMPTY default
+          # means the file named none, which the caller reads as "leave it at the
           # configured registry" — distinct from "?unreadable", which means a
           # registry WAS named and could not be used.
+          #
+          # The provenance line is `<default-src> [<scope>=<src> ...]`. Each <src>
+          # is the zero-based position, in <dirs...>, of the directory whose file
+          # carries the unreadable value IN EFFECT; <default-src> is `-` when the
+          # default is not a sentinel. The fold is the one place that knows this:
+          # the caller sees only the folded result, and the warnings used to name
+          # the TARGET directory — so an unreadable value in the root file, under
+          # a clean `apps/web` one, sent the operator to the clean file. A
+          # position rather than a path because the line is split on spaces and a
+          # directory name may hold one; the caller owns <dirs...> and turns the
+          # position back into a path. A scope appears here exactly when the
+          # entry that WINS for it is unreadable, so this is also the list of
+          # poisoned scopes, and no caller re-derives it from the map.
           #
           # stdout rather than variables set in place: this repo targets bash 3.2,
           # which has no namerefs (same constraint, same solution, as
@@ -4537,7 +4551,12 @@ jobs:
           npm_age::fold_registry_files() {
             local reader="$1" name="$2"; shift 2
             local d scope host default="" map=""
+            # `poisoned` keeps a space on BOTH sides of every record, so
+            # ` ${scope}=` below only ever matches at a record boundary and
+            # `@x@acme=` cannot stand in for `@acme=`.
+            local i=-1 default_src="-" poisoned=" " rest
             for d in "$@"; do
+              i=$((i + 1))
               [ -f "${d}/${name}" ] || continue
               # Explicit IFS: the script sets IFS=$'\n\t' globally, so a bare `read`
               # would not split this pair on its space.
@@ -4579,7 +4598,17 @@ jobs:
                 # a plain `npmRegistryServer` would otherwise lose the signal and
                 # age those packages against public homonyms, fail-OPEN.
                 if [ "$scope" = "default" ]; then
-                  [ "$default" = "?unreadable-scopes" ] || default="$host"
+                  # The provenance follows the value: whichever file sets the
+                  # default in effect is the one named, and a readable default
+                  # clears it. For the sticky sentinel that is the FIRST file to
+                  # emit it, since nothing after it is let through.
+                  if [ "$default" != "?unreadable-scopes" ]; then
+                    default="$host"
+                    case "$host" in
+                      '?unreadable'|'?unreadable-scopes') default_src="$i" ;;
+                      *) default_src="-" ;;
+                    esac
+                  fi
                 else
                   # Later files override an earlier entry for the same scope
                   # because the awk map assignment is last-wins; appending is
@@ -4587,6 +4616,18 @@ jobs:
                   # `acme: {...}` at the root under a readable `acme:` block nearer
                   # the lockfile is exactly the override Berry itself honours.
                   map="${map}${map:+ }${scope}=${host}"
+                  # The same last-wins rule, applied to the provenance: drop the
+                  # record an earlier entry for this scope left, then record this
+                  # one if it is the unreadable kind. A root `acme: {...}` under a
+                  # readable nearer `acme:` therefore leaves nothing here, and no
+                  # warning sends the operator to a file that is not in effect.
+                  # The expansions are quoted, so a scope is matched literally.
+                  case "$poisoned" in
+                    *" ${scope}="*)
+                      rest="${poisoned#*" ${scope}="}"
+                      poisoned="${poisoned%%" ${scope}="*} ${rest#* }" ;;
+                  esac
+                  [ "$host" != "?unreadable" ] || poisoned="${poisoned}${scope}=${i} "
                 fi
               done < <("$reader" "${d}/${name}")
             done
@@ -4595,7 +4636,24 @@ jobs:
             # empty default silently shifts the map into the default field — which
             # sets NPM_AGE_DEFAULT_HOST to `@acme=host`, matches no entry, and
             # tags every package in a repo that only ever configured one scope.
-            printf '%s\n%s\n' "$default" "$map"
+            #
+            # The third line never starts with whitespace (`-` or a position comes
+            # first), so the same trap is not set again for its reader.
+            printf '%s\n%s\n%s\n' "$default" "$map" "${default_src}${poisoned% }"
+          }
+
+          # The path of the config file at position <src> of <dirs...>, as the fold
+          # reported it, in NPM_AGE_REGISTRY_SRC — empty when <src> is not a
+          # position (`-`, or nothing at all because the fold did not finish). A
+          # variable rather than stdout: this runs for every target, and the
+          # common case — nothing unreadable — must not pay a fork for it.
+          npm_age::registry_src_path() {
+            local name="$1" src="$2"; shift 2
+            NPM_AGE_REGISTRY_SRC=""
+            case "$src" in ''|*[!0-9]*) return 0 ;; esac
+            [ "$src" -lt "$#" ] || return 0
+            shift "$src"
+            NPM_AGE_REGISTRY_SRC="${1}/${name}"
           }
 
           # A scope whose registry could not be read. The default-host warning
@@ -4605,47 +4663,66 @@ jobs:
           # log naming the file or the flow-style mapping as the cause. The
           # identical mistake one line up (`npmScopes: {...}` at column 0) gets a
           # precise message; this gives the scope form the same courtesy.
-          # <map> is the space-separated `@scope=host` list; the global IFS holds
-          # no space, hence the explicit split.
+          # <poisoned> is the fold's `<scope>=<src>` list — which scopes, and which
+          # of <dirs...> each one's unreadable value sits in. It is not recovered
+          # from the scope map: that keeps every entry for a scope, and only the
+          # fold knows which one won and where it came from. So there is no
+          # last-wins scan here and nothing to deduplicate — the fold lists a
+          # scope once, and only when the entry in effect for it is unreadable.
+          # The global IFS holds no space, hence the explicit split.
+          #
+          # One warning per scope, as before, each naming the FILE the value is
+          # in: <dir> is only where the lockfile is, and the value may sit in any
+          # config file between it and the working directory.
+          #
+          # All five leading arguments are required, <remedy> included (pass ""
+          # for none): <dirs...> is whatever follows them, and a call one short
+          # would have `shift 5` fail and the positions resolve against the
+          # wrong list.
           npm_age::warn_unreadable_scopes() {
-            local name="$1" map="$2" dir="$3" qualifier="$4" remedy="${5:-}"
-            local e scope last seen=" " safe_dir="" safe_dir_done=0 safe_scope
-            [ -n "$map" ] || return 0
-            local -a entries=()
-            IFS=' ' read -r -a entries <<< "$map"
-            # Padded once: the leading space is what anchors ` ${scope}=` to an
-            # entry boundary below, so `@x@acme=` cannot stand in for `@acme=`.
-            local padded=" ${map} "
-            for e in "${entries[@]}"; do
-              scope="${e%%=*}"
-              # The map keeps EVERY entry for a scope and its consumers are
-              # last-wins, so a scope is poisoned only when its LAST entry is. A
-              # root `acme: {...}` that a nearer readable block overrides is the
-              # override Berry itself honours (see the fold), and warning about it
-              # would send an operator to fix a file that is not in effect. Each
-              # scope is resolved once, whichever entry is met first.
-              case "$seen" in *" ${scope} "*) continue ;; esac
-              seen="${seen}${scope} "
-              last="${padded##* "${scope}"=}"
-              last="${last%% *}"
-              [ "$last" = "?unreadable" ] || continue
-              # Forked only once something will be printed: a repo with a readable
-              # scope map reaches here on every target and must stay fork-free.
-              if [ "$safe_dir_done" = 0 ]; then
-                safe_dir=$(preflight::safe_for_md "$dir"); safe_dir_done=1
-              fi
-              safe_scope=$(preflight::safe_for_md "$scope")
-              preflight::annotate_with_note warning "${name} for ${safe_dir} configures a registry for ${safe_scope} that this check could not parse, so ${qualifier}packages in that scope are reported as skipped rather than age-checked.${remedy:+ }${remedy}"
+            local name="$1" poisoned="$2" dir="$3" qualifier="$4" remedy="$5"; shift 5
+            # Nothing is forked unless something will be printed: a repo with a
+            # readable scope map reaches here on every target.
+            [ -n "$poisoned" ] || return 0
+            local -a pairs=()
+            IFS=' ' read -r -a pairs <<< "$poisoned"
+            local r safe_dir safe_scope safe_file
+            safe_dir=$(preflight::safe_for_md "$dir")
+            for r in "${pairs[@]}"; do
+              npm_age::registry_src_path "$name" "${r##*=}" "$@"
+              safe_scope=$(preflight::safe_for_md "${r%=*}")
+              # 200, not the table-cell default: this is a log annotation, and a
+              # path cut at 80 names a file that does not exist.
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+              safe_file=$(preflight::safe_for_md "$NPM_AGE_REGISTRY_SRC" 200)
+              preflight::annotate_with_note warning "${name} for ${safe_dir} configures a registry for ${safe_scope} that this check could not parse${safe_file:+ (the value is in ${safe_file})}, so ${qualifier}packages in that scope are reported as skipped rather than age-checked.${remedy:+ }${remedy}"
             done
           }
 
           # One wording for both files, so the remedy sentence cannot drift into
           # two versions. <qualifier> narrows the noun for a file that governs only
-          # part of the ecosystem ("Berry ").
+          # part of the ecosystem ("Berry "). <src> is the path of the file whose
+          # value made the default unreadable, from the fold; the two sentinel
+          # warnings name it, because <dir> is only the directory the lockfile is
+          # in and the value may sit in any config file between it and the
+          # working directory. Empty leaves the sentence as it was.
           npm_age::warn_registry_mismatch() {
-            local name="$1" host="$2" dir="$3" qualifier="$4" remedy="${5:-}"
+            local name="$1" host="$2" dir="$3" qualifier="$4" remedy="${5:-}" src="${6:-}"
             [ "$host" != "$NPM_AGE_WANT_HOST" ] || return 0
             local safe_dir; safe_dir=$(preflight::safe_for_md "$dir")
+            # 200, not the table-cell default: this is a log annotation, and a
+            # path cut at 80 names a file that does not exist.
+            local where=""
+            case "$host" in
+              "?unreadable"|"?unreadable-scopes")
+                [ -z "$src" ] || where=" (the value is in $(preflight::safe_for_md "$src" 200))" ;;
+            esac
             # `?unreadable` is a sentinel, not a host, and rendering it as one
             # sends an operator hunting for a default registry they never set —
             # especially for the inline-npmScopes case, where the poison is
@@ -4653,7 +4730,7 @@ jobs:
             # real problem instead.
             case "$host" in
               "?unreadable-scopes")
-                preflight::annotate_with_note warning "${name} for ${safe_dir} has an npmScopes map this check cannot read — written inline (\`npmScopes: {...}\`), or with a line the block structure does not admit — so it cannot tell which scopes are overridden and reports every ${qualifier}package as skipped rather than age-checked. Rewrite npmScopes in block style with one consistent indent."
+                preflight::annotate_with_note warning "${name} for ${safe_dir} has an npmScopes map this check cannot read${where} — written inline (\`npmScopes: {...}\`), or with a line the block structure does not admit — so it cannot tell which scopes are overridden and reports every ${qualifier}package as skipped rather than age-checked. Rewrite npmScopes in block style with one consistent indent."
                 return 0 ;;
               "?unreadable")
                 # The generic half is true of both files; only the remedy differs,
@@ -4661,7 +4738,7 @@ jobs:
                 # Telling an .npmrc operator to rewrite their YAML in block style is
                 # the kind of confidently wrong instruction that costs more than
                 # saying nothing.
-                preflight::annotate_with_note warning "${name} for ${safe_dir} configures a registry this check could not parse, so ${qualifier}packages are reported as skipped rather than age-checked.${remedy:+ }${remedy}"
+                preflight::annotate_with_note warning "${name} for ${safe_dir} configures a registry this check could not parse${where}, so ${qualifier}packages are reported as skipped rather than age-checked.${remedy:+ }${remedy}"
                 return 0 ;;
             esac
             local safe_host; safe_host=$(preflight::safe_for_md "$host")
@@ -4669,7 +4746,11 @@ jobs:
           }
 
           npm_age::load_registry_config() {
-            local dir="$1" kind="${2:-}" lockfile="${3:-}" d default map
+            local dir="$1" kind="${2:-}" lockfile="${3:-}" d default map default_src poisoned
+            # npm_age::registry_src_path's output, scoped to this call: it is a
+            # scratch value read on the line after it is set, and nothing outside
+            # should find a stale path in it.
+            local NPM_AGE_REGISTRY_SRC=""
             # One clause for the four remedies below, so the next edit to it is
             # atomic: `registry=//host/` and `npmRegistryServer: //host/` both
             # parse to no host, and a remedy that names only whitespace and
@@ -4682,13 +4763,6 @@ jobs:
 
             # Which config file governs THIS lockfile. Berry reads .yarnrc.yml and
             # never .npmrc; npm and pnpm read .npmrc and never .yarnrc.yml. Reading
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # the other one is not merely wasted work — its mismatch warning tells
             # an operator that packages "are reported as skipped, not age-checked"
             # when no package of that kind exists, and main() calls this once per
@@ -4739,23 +4813,32 @@ jobs:
               d=$(dirname "$d")
             done
             dirs=("." ${dirs[@]+"${dirs[@]}"})
+            # This ONE list goes to the fold and to everything that resolves the
+            # positions the fold reports (registry_src_path, warn_unreadable_scopes).
+            # A caller that hands them different lists gets a plausible path to the
+            # wrong file, and no error.
 
-            # `IFS=` on each read so neither value is trimmed: the global IFS holds
-            # \n and \t, and the map's own separator is a space, which read would
-            # otherwise have to be told to leave alone.
+            # `IFS=` on the first two reads so neither value is trimmed: the global
+            # IFS holds \n and \t, and the map's own separator is a space, which
+            # read would otherwise have to be told to leave alone. The third line
+            # is the fold's provenance and IS split, once, at its first space: the
+            # default's source, then the poisoned-scope records as one string.
             if [ "$want_npmrc" = 1 ]; then
-              { IFS= read -r default; IFS= read -r map; } < <(
+              { IFS= read -r default; IFS= read -r map; IFS=' ' read -r default_src poisoned; } < <(
                 npm_age::fold_registry_files npm_age::npmrc_registries .npmrc "${dirs[@]}")
               [ -n "$default" ] && NPM_AGE_DEFAULT_HOST="$default"
               NPM_AGE_SCOPE_MAP="$map"
+              npm_age::registry_src_path .npmrc "$default_src" "${dirs[@]}"
               npm_age::warn_registry_mismatch .npmrc "$NPM_AGE_DEFAULT_HOST" "$dir" "" \
-                "A value containing whitespace cannot be used, \`registry=\${VAR}\` is read literally rather than expanded, and ${rel_clause}; use an absolute URL (\`https://host/\`)."
-              npm_age::warn_unreadable_scopes .npmrc "$NPM_AGE_SCOPE_MAP" "$dir" "" \
-                "A value containing whitespace cannot be used, \`@scope:registry=\${VAR}\` is read literally rather than expanded, and ${rel_clause}; use an absolute URL (\`https://host/\`)."
+                "A value containing whitespace cannot be used, \`registry=\${VAR}\` is read literally rather than expanded, and ${rel_clause}; use an absolute URL (\`https://host/\`)." \
+                "$NPM_AGE_REGISTRY_SRC"
+              npm_age::warn_unreadable_scopes .npmrc "$poisoned" "$dir" "" \
+                "A value containing whitespace cannot be used, \`@scope:registry=\${VAR}\` is read literally rather than expanded, and ${rel_clause}; use an absolute URL (\`https://host/\`)." \
+                "${dirs[@]}"
             fi
 
             if [ "$want_yarnrc" = 1 ]; then
-              { IFS= read -r default; IFS= read -r map; } < <(
+              { IFS= read -r default; IFS= read -r map; IFS=' ' read -r default_src poisoned; } < <(
                 npm_age::fold_registry_files npm_age::yarnrc_registries .yarnrc.yml "${dirs[@]}")
               [ -n "$default" ] && NPM_AGE_YARN_DEFAULT_HOST="$default"
               NPM_AGE_YARN_SCOPE_MAP="$map"
@@ -4776,10 +4859,13 @@ jobs:
               local berry_lock=0
               [ -f "$lockfile" ] && grep -q '^__metadata:' "$lockfile" && berry_lock=1
               if [ -z "$lockfile" ] || [ "$berry_lock" = 1 ]; then
+                npm_age::registry_src_path .yarnrc.yml "$default_src" "${dirs[@]}"
                 npm_age::warn_registry_mismatch .yarnrc.yml "$NPM_AGE_YARN_DEFAULT_HOST" "$dir" "Berry " \
-                  "Flow-style YAML (\`npmScopes: {…}\`) is not read, a value containing whitespace cannot be used, \`\${VAR}\` interpolation is refused because this check cannot see the environment yarn expands it from, and ${rel_clause}; rewrite it in block style with a plain absolute URL."
-                npm_age::warn_unreadable_scopes .yarnrc.yml "$NPM_AGE_YARN_SCOPE_MAP" "$dir" "Berry " \
-                  "A flow-style scope (\`acme: {…}\`) is not read, a value containing whitespace cannot be used, and ${rel_clause}; rewrite it in block style with a plain absolute URL."
+                  "Flow-style YAML (\`npmScopes: {…}\`) is not read, a value containing whitespace cannot be used, \`\${VAR}\` interpolation is refused because this check cannot see the environment yarn expands it from, and ${rel_clause}; rewrite it in block style with a plain absolute URL." \
+                  "$NPM_AGE_REGISTRY_SRC"
+                npm_age::warn_unreadable_scopes .yarnrc.yml "$poisoned" "$dir" "Berry " \
+                  "A flow-style scope (\`acme: {…}\`) is not read, a value containing whitespace cannot be used, and ${rel_clause}; rewrite it in block style with a plain absolute URL." \
+                  "${dirs[@]}"
               fi
               # The other half of that file's story: no .yarnrc.yml default at all,
               # under a registry_url that is not the public one, so the Berry
@@ -5478,6 +5564,13 @@ jobs:
                     continue
                     ;;
                   *)
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 4 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                     # Transient failure after curl --retry. Fail closed — an
                     # outage must not silently let new deps through a security
                     # control.
@@ -5551,13 +5644,6 @@ jobs:
                   off_remedy="registry_url is already set to ${REGISTRY_URL}, so these resolve somewhere else again — check it names the registry this repo actually installs from; if that host serves no packument API this check cannot age them, and 'age-check-bypass' is the remaining way out"
                 fi
                 echo "::error::All ${skipped_count} package(s) in this change were skipped, so none could be age-verified. ${offregistry_count} of them resolve to a registry other than ${NPM_AGE_WANT_HOST}: ${off_remedy}. Failing to avoid a false pass."
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 4 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               elif [ "$skipped_private" -eq "$skipped_count" ] && [ "$failed" = false ]; then
                 all_skipped_reason="no pin in this change could be verified against ${NPM_AGE_WANT_HOST} (internal scope, unpublished, or a registry this check was not pointed at)"
                 echo "::error::All ${skipped_count} package(s) in this change are absent from ${NPM_AGE_WANT_HOST} (internal scope, unpublished, or a registry this check was not pointed at), so none could be age-verified. Failing to avoid a false pass. If this repo installs from a private registry, pass registry_url naming it — the check then reads ages from there instead of dropping the gate. If the pins are genuinely unpublished, the 'age-check-bypass' label is the remaining way out."
