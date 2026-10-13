@@ -2680,6 +2680,10 @@ jobs:
 
             local now_epoch; now_epoch=$(date +%s)
             local failed=false
+            # Set by the branch that records a `misconfigured` row; withholds the
+            # bypass offer from the step summary and the log, as the PR comment
+            # does.
+            local misconfigured=false
             local checked_count=0
 
             # `|| helper`, not a bare capture: under `set -e` a parser whose
@@ -2757,8 +2761,15 @@ jobs:
                 if ! precommit_age::is_valid_tag "$rev"; then
                   echo "::error file=${file}::Hook ${slug}@${rev} — rev failed shape validation (rejected before gh api)."
                   echo "| \`${safe_slug}\` | \`${safe_rev}\` | — | :x: invalid rev shape |" >> "$GITHUB_STEP_SUMMARY"
-                  preflight::record_unverifiable "$safe_slug" "$safe_rev" "rev failed shape validation"
+                  # misconfigured, not unverifiable: the rev is the PR's own text and
+                  # fails the same way on every run, so the comment must offer neither
+                  # a re-run nor the bypass label. The reason restates is_valid_tag —
+                  # keep the two in step. A tag the shape excludes (one with a `/`)
+                  # is still pinnable — by its commit SHA — hence the hint.
+                  preflight::record_misconfigured "$safe_slug" "$safe_rev" \
+                    "rev failed shape validation — fix the rev in .pre-commit-config.yaml (a tag that starts with a letter or digit and uses only letters, digits and . _ + -, or the commit SHA)"
                   failed=true
+                  misconfigured=true
                   continue
                 fi
 
@@ -2801,10 +2812,15 @@ jobs:
             done
 
             if [ "$failed" = true ]; then
-              preflight::step_summary_failed "$MIN_AGE_DAYS" "$checked_count" "0"
               echo ""
               echo "::error::One or more pre-commit hooks failed the age check."
-              echo "To bypass for emergency security updates, add the 'age-check-bypass' label to this PR."
+              if [ "$misconfigured" = true ]; then
+                preflight::step_summary_failed "$MIN_AGE_DAYS" "$checked_count" "0" no-bypass
+                echo "A hook rev cannot be age-checked as written — fix it in this PR; no bypass is offered while it stands."
+              else
+                preflight::step_summary_failed "$MIN_AGE_DAYS" "$checked_count" "0"
+                echo "To bypass for emergency security updates, add the 'age-check-bypass' label to this PR."
+              fi
               exit 1
             fi
 
