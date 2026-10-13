@@ -770,10 +770,14 @@ jobs:
           #
           #   <display_id>\t<display_version>\t<age_days>\t<min_age_days>\t<eligible_date>\t<days_remaining>\t<kind>
           #
-          # `kind` is `too_new` (this helper) or `unverifiable` (sibling helper
-          # `preflight::record_unverifiable`). The downstream renderer splits on
-          # kind so each failure class gets the right operator guidance:
-          # too-new → "wait until the eligible date"; unverifiable → "re-run".
+          # `kind` is `too_new` (this helper), or one of the reason-carrying kinds
+          # written by the sibling helpers below: `unverifiable`
+          # (`preflight::record_unverifiable`), `misconfigured`
+          # (`preflight::record_misconfigured`) or `not_run`
+          # (`preflight::record_not_run`). The downstream renderer splits on kind
+          # so each failure class gets the right operator guidance: too-new →
+          # "wait until the eligible date"; unverifiable → "re-run";
+          # misconfigured → "fix the pin"; not-run → "fix the checkout".
           #
           # Tabs were chosen over JSON because the consumer (a small bash step in
           # the template) parses with `IFS=$'\t' read` — no jq dependency, and
@@ -838,6 +842,21 @@ jobs:
           #                        parseable.
           preflight::record_unverifiable() {
             preflight::_record_reason_row "$1" "$2" "${3:-unknown reason}" unverifiable
+          }
+
+          # A row of kind `misconfigured`: the check looked at this pin and it
+          # cannot be age-checked as the PR wrote it — a FROM with no @sha256
+          # digest, an image reference that fails shape validation. Unlike an
+          # unverifiable row this is deterministic and the PR's own to fix, so the
+          # comment renders these in their own section with no "re-run" copy and
+          # no `age-check-bypass` offer: re-running cannot help, and the label
+          # would clear the check on exactly the PR that needs it kept. Not
+          # `not_run` either — the check did run, and examined the other pins.
+          #
+          # Args as record_unverifiable; the reason must name the fix.
+          preflight::record_misconfigured() {
+            preflight::_record_reason_row "$1" "$2" \
+              "${3:-cannot be age-checked as written — fix the pin in this PR}" misconfigured
           }
 
           # A row of kind `not_run`: the check stopped in preflight, before it
@@ -1146,6 +1165,13 @@ jobs:
           preflight::step_summary_all_passed() {
             local checked_count="$1" min_age_days="$2" skipped_count="${3:-0}"
             {
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/_npm-lockfile-parsers.sh (part 1 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               echo ""
               echo "> Verified ${checked_count} package(s) at ≥ ${min_age_days} days old. :white_check_mark:"
               if [ "$skipped_count" -gt 0 ]; then
@@ -1157,11 +1183,19 @@ jobs:
           # Now accepts optional counts so the footer breakdown matches what
           # callers actually tracked. Positional args are kept backwards-compatible
           # (only min_age_days is required).
+          #
+          # Optional $4 `no-bypass`: the run recorded a `misconfigured` row (see
+          # record_misconfigured), so the footer withholds the label offer exactly
+          # as the PR comment does — the label clears the whole check.
           preflight::step_summary_failed() {
-            local min_age_days="$1" checked_count="${2:-}" skipped_count="${3:-}"
+            local min_age_days="$1" checked_count="${2:-}" skipped_count="${3:-}" bypass="${4:-}"
             {
               echo ""
-              echo "> **One or more dependencies failed the ${min_age_days}-day age check.** Add the \`age-check-bypass\` label to override (verified-CVE bypass only — see runbooks/phase-0-checklist.md)."
+              if [ "$bypass" = "no-bypass" ]; then
+                echo "> **One or more dependencies failed the ${min_age_days}-day age check.** At least one pin cannot be age-checked as written (see its row above) — fix it in this PR; no bypass is offered while it stands."
+              else
+                echo "> **One or more dependencies failed the ${min_age_days}-day age check.** Add the \`age-check-bypass\` label to override (verified-CVE bypass only — see runbooks/phase-0-checklist.md)."
+              fi
               if [ -n "$checked_count" ] || [ -n "$skipped_count" ]; then
                 echo ">"
                 echo "> Breakdown: **${checked_count:-?}** checked, **${skipped_count:-0}** skipped. See the table above for which rows failed (marked :x:)."
@@ -1169,13 +1203,6 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           }
 
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/_npm-lockfile-parsers.sh (part 1 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # Footer for a run where one or more manifests were skipped wholesale by
           # explicit configuration rather than examined. Takes both counts because
           # the honest sentence depends on whether anything else WAS checked:
@@ -2053,6 +2080,13 @@ jobs:
                 # `resolved` hosts.
                 #
                 # Keyed on block_resolved, not on block_host: a Berry block MAY
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # legitimately set block_host, through `::__archiveUrl=`. Testing
                 # the host would tag every CodeArtifact and Nexus entry — the
                 # population this feature is for — so what is refused is the
@@ -2079,13 +2113,6 @@ jobs:
               # the buffered entry and the block host are per-file too, and a
               # half-reset here would colour file N+1s first flush with file Ns
               # host if that ever changed.
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               FNR == 1 { flush(); name = ""; block_host = ""; block_conflict = 0; block_berry = 0; block_resolved = 0; block_badloc = 0; pending_vendored = ""; block_res = "" }
               # Counts any line that is not blank and not a comment. MUST come
               # before the header rule: that rule ends in `next`, which skips every
@@ -2945,6 +2972,13 @@ jobs:
                   # inner branches then ignore — measurably, on a monorepo
                   # lockfile.
                   # `body ~ /^    resolution:/` stays in the condition after the
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   # resolution is captured, so a SECOND one is still noticed and
                   # marks the entry ambiguous rather than being skipped as noise.
                   if (pending_name != "" \
@@ -2970,13 +3004,6 @@ jobs:
                       # guard because there is only ever one `resolution:`.
                       #
                       # Safe: a two-space entry key is taken by the key regex
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                       # before this point and a column-0 line by the top rule, so
                       # nothing else can leak into pending_res.
                       if (body ~ /^[[:space:]]*$/ || ind > res_indent) {
@@ -3778,6 +3805,13 @@ jobs:
           #   a `resolution:` line is confirmed — a block carrying just
           #   `checksum:` is Berry-exempt without its protocol ever being read.
           #   Berry requires `resolution:`, so such a lockfile would not install;
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   this is the "any per-block marker is forgeable in principle"
           #   residual below, not a second hole, but "confirmed" describes the
           #   line, not the exemption.
@@ -3800,13 +3834,6 @@ jobs:
           #   committed yarn configuration disagree about where packages come
           #   from, and npm_age::load_registry_config says so with a `::notice`
           #   naming YARN_NPM_REGISTRY_SERVER as the likely reason. A notice, not
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   a failure — the aging is still against the registry the caller
           #   named — and nothing at all against the public registry_url, where
           #   Berry's default and the input agree. It is a FILE-level fact standing
@@ -4655,6 +4682,13 @@ jobs:
 
             # Which config file governs THIS lockfile. Berry reads .yarnrc.yml and
             # never .npmrc; npm and pnpm read .npmrc and never .yarnrc.yml. Reading
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # the other one is not merely wasted work — its mismatch warning tells
             # an operator that packages "are reported as skipped, not age-checked"
             # when no package of that kind exists, and main() calls this once per
@@ -4679,13 +4713,6 @@ jobs:
             # and each is a false pass on its own: reading only the top-level file
             # misses `apps/web/.npmrc`, and reading only the lockfile's own
             # directory misses a registry configured once at the repo root — which
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # is where pnpm workspaces and yarn monorepos normally put it. Either
             # way the private packages get aged against a public homonym.
             #
@@ -5521,6 +5548,13 @@ jobs:
                 echo "::error::All ${skipped_count} package(s) in this change were skipped, so none could be age-verified. ${offregistry_count} of them resolve to a registry other than ${NPM_AGE_WANT_HOST}: ${off_remedy}. Failing to avoid a false pass."
               elif [ "$skipped_private" -eq "$skipped_count" ] && [ "$failed" = false ]; then
                 all_skipped_reason="no pin in this change could be verified against ${NPM_AGE_WANT_HOST} (internal scope, unpublished, or a registry this check was not pointed at)"
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 4 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 echo "::error::All ${skipped_count} package(s) in this change are absent from ${NPM_AGE_WANT_HOST} (internal scope, unpublished, or a registry this check was not pointed at), so none could be age-verified. Failing to avoid a false pass. If this repo installs from a private registry, pass registry_url naming it — the check then reads ages from there instead of dropping the gate. If the pins are genuinely unpublished, the 'age-check-bypass' label is the remaining way out."
               else
                 all_skipped_reason="no pin in this change could be verified"
@@ -5545,13 +5579,6 @@ jobs:
             fi
 
             # A lockfile the parser could not read is NOT a verified lockfile. The
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 4 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # run still exits 0 (see the Known limitations block for why these are
             # warnings rather than failures), but the footer must not assert a
             # clean bill of health directly beneath a ":warning: NOT age-checked"
@@ -5671,18 +5698,19 @@ jobs:
           # `# @@COMMENT_ON_FAILURE@@` marker by `scripts/embed-lib-into-workflows.py`.
           #
           # Reads the TSV that `preflight::record_failure`,
-          # `preflight::record_unverifiable` and `preflight::record_not_run` wrote
-          # during the main run step (one row per failed pin) and renders a single
-          # sticky comment. Each row carries a `kind` column — `too_new`,
-          # `unverifiable` or `not_run` — so the renderer can split into sections
-          # with the right operator action: too-new pins get an eligible-after
-          # date and "wait then push any commit"; unverifiable pins (registry/API
-          # outages, missing manifests, etc.) get the upstream reason and "re-run
-          # the failed check"; a not-run row (preflight stopped the check before
-          # any pin — an unfetched base branch, a shallow clone) gets its reason,
-          # no re-run copy, and NO bypass offer: the remedy is a checkout setting,
-          # and the label would switch the gate off instead. Updates an existing
-          # sticky in place
+          # `preflight::record_unverifiable`, `preflight::record_misconfigured`
+          # and `preflight::record_not_run` wrote during the main run step (one
+          # row per failed pin) and renders a single sticky comment. Each row
+          # carries a `kind` column — `too_new`, `unverifiable`, `misconfigured`
+          # or `not_run` — so the renderer can split into sections with the right
+          # operator action: too-new pins get an eligible-after date and "wait
+          # then push any commit"; unverifiable pins (registry/API outages,
+          # missing manifests, etc.) get the upstream reason and "re-run the
+          # failed check"; a misconfigured pin (an unpinned FROM, a malformed
+          # image reference) and a not-run row (preflight stopped the check
+          # before any pin — an unfetched base branch, a shallow clone) get their
+          # reason, no re-run copy, and NO bypass offer — see the guard below.
+          # Updates an existing sticky in place
           # (marker is `<!-- ops-routines:age-check-comment:${ECOSYSTEM} -->`);
           # deletes the sticky on a clean run so a stale "X days remaining" doesn't
           # outlive the failure that produced it.
@@ -5747,11 +5775,12 @@ jobs:
             # path collision, syntax error, etc.) doesn't trip `set -e` and
             # silently suppress the comment — the whole point of this feature is
             # to surface failures at PR review time without forcing the reviewer
-            # to dig into logs. Fallback dumps the deduped data into the too_new
-            # bucket so the reviewer at least sees the failed pins, with a
-            # `::warning` flagging the degraded render.
+            # to dig into logs. The fallback splits by kind with grep instead, so
+            # the reviewer still sees the failed pins, with a `::warning` flagging
+            # the degraded render.
             too_new_failures=$(mktemp)
             unverifiable_failures=$(mktemp)
+            misconfigured_failures=$(mktemp)
             not_run_failures=$(mktemp)
             if ! awk -F '\t' '
               NR == FNR {
@@ -5769,36 +5798,59 @@ jobs:
                   if (!(key in too_new_pins)) {
                     print > unverifiable_out
                   }
+                } else if (kind == "misconfigured") {
+                  print > misconfigured_out
                 } else if (kind == "not_run") {
                   print > not_run_out
                 }
               }
             ' too_new_out="${too_new_failures}" \
               unverifiable_out="${unverifiable_failures}" \
+              misconfigured_out="${misconfigured_failures}" \
               not_run_out="${not_run_failures}" \
               "${deduped_failures}" "${deduped_failures}"; then
               echo "::warning::age-check renderer failed to split rows by kind; falling back to a split without cross-kind dedupe — a pin that is both too-new and unverifiable in one run may be listed twice (see the per-pin annotations in this run for the real classification)."
-              # Each kind still gets its own section — the not_run copy is the
-              # remedy (a setting, not a re-run), and the too-new columns would
-              # put an unverifiable reason under "Eligible after" — split by the
-              # kind column with grep, since awk is what just failed. What is lost
-              # is only the cross-kind dedupe above.
+              # Each kind still gets its own section — the not_run and
+              # misconfigured copy is the remedy (a setting or an edit, not a
+              # re-run), and the too-new columns would put an unverifiable reason
+              # under "Eligible after" — split by the kind column with grep, since
+              # awk is what just failed. What is lost is only the cross-kind
+              # dedupe above.
               grep $'\tnot_run$' "${deduped_failures}" > "${not_run_failures}" || true
               grep $'\tunverifiable$' "${deduped_failures}" > "${unverifiable_failures}" || true
-              grep -vE $'\t(not_run|unverifiable)$' "${deduped_failures}" > "${too_new_failures}" || true
+              grep $'\tmisconfigured$' "${deduped_failures}" > "${misconfigured_failures}" || true
+              grep -vE $'\t(not_run|unverifiable|misconfigured)$' "${deduped_failures}" > "${too_new_failures}" || true
             fi
 
             # A sentinel version (`n/a`, `—`) marks a row for a whole file or a
             # whole run, which is not a "Module" or "Package"; head the id column
-            # of BOTH tables neutrally when any such row is present — decided on
-            # the raw rows, so the degraded fallback above (every row into the
-            # too-new table) gets the same header as the split render — and with
-            # grep, not awk, so the fallback that exists for a broken awk still
-            # heads the table right.
+            # of every pin table neutrally when any such row is present — decided
+            # on the raw rows, and with grep, not awk, so the fallback that exists
+            # for a broken awk still heads the table right.
             id_column="${ITEM_COLUMN}"
             if grep -qE $'^[^\t]*\t(n/a|—)\t' "${deduped_failures}"; then
               id_column="Item"
             fi
+
+            # The `| <id> | Reason |` table shared by the two reason-carrying pin
+            # sections. $1 = that kind's rows.
+            # shellcheck disable=SC2016  # literal backticks, as in the block below
+            render_reason_table() {
+              printf '| %s | Reason |\n' "${id_column}"
+              printf '|---|---|\n'
+              while IFS=$'\t' read -r id ver _age _min reason _remaining _kind; do
+                [ -z "${id}" ] && continue
+                # A row for a whole file or a whole run carries a sentinel
+                # version; joining it with the separator renders `go.sum@n/a`,
+                # which reads as a pin that does not exist.
+                case "${ver}" in
+                  n/a|—) printf '| `%s` | %s |\n' "${id}" "${reason}" ;;
+                  *)     printf '| `%s%s%s` | %s |\n' \
+                           "${id}" "${SEPARATOR}" "${ver}" "${reason}" ;;
+                esac
+              done < "$1"
+              printf '\n'
+            }
 
             # shellcheck disable=SC2016
             # The printf format strings below intentionally contain literal
@@ -5809,7 +5861,7 @@ jobs:
               printf '### Dependency Age Check failed — %s\n\n' "${ECOSYSTEM}"
 
               # Preflight exits before any pin is examined, so a not-run row never
-              # shares a comment with the two pin sections below.
+              # shares a comment with the pin sections below.
               if [ -s "${not_run_failures}" ]; then
                 printf '#### The check could not run\n\n'
                 printf 'The check stopped before examining any dependency. The reason names the fix — a checkout or workflow setting, not a registry outage — so running the check again will not help until that setting is changed.\n\n'
@@ -5822,6 +5874,14 @@ jobs:
                 printf '\n'
               fi
 
+              # Ahead of the other pin sections: these always need an edit, and
+              # they are why the bypass offer below is missing.
+              if [ -s "${misconfigured_failures}" ]; then
+                printf '#### Pins that cannot be age-checked as written\n\n'
+                printf 'The item(s) below are written in a form the check cannot age. The reason names the fix — a change to this PR, not a registry outage — so running the check again will not help until the pin is corrected.\n\n'
+                render_reason_table "${misconfigured_failures}"
+              fi
+
               if [ -s "${too_new_failures}" ]; then
                 printf '#### Pins below quarantine\n\n'
                 printf 'New pin(s) below have not yet reached the **%s-day** quarantine. Wait until the eligible date, push any new commit, and the check will pass.\n\n' "${MIN_AGE_DAYS}"
@@ -5829,8 +5889,8 @@ jobs:
                 printf '|---|---:|---|---:|\n'
                 while IFS=$'\t' read -r id ver age _min eligible remaining _kind; do
                   [ -z "${id}" ] && continue
-                  # Sentinel-aware like the unverifiable loop below: the degraded
-                  # fallback above dumps every row here, sentinel versions included.
+                  # Sentinel-aware like render_reason_table above: a row of a kind
+                  # the fallback's greps do not name lands here, sentinel and all.
                   case "${ver}" in
                     n/a|—) printf '| `%s` | %s | %s | %s |\n' \
                              "${id}" "${age}" "${eligible}" "${remaining}" ;;
@@ -5844,32 +5904,25 @@ jobs:
               if [ -s "${unverifiable_failures}" ]; then
                 printf '#### Pins that could not be verified\n\n'
                 printf 'The item(s) below could not be age-checked. The reason names the cause and, where there is one, the fix. For an upstream fetch failure or a git error — usually transient — re-run the failed check from the Actions tab, and open an issue with the reason text if it keeps failing.\n\n'
-                printf '| %s | Reason |\n' "${id_column}"
-                printf '|---|---|\n'
-                while IFS=$'\t' read -r id ver _age _min reason _remaining _kind; do
-                  [ -z "${id}" ] && continue
-                  # A row for a whole file or a whole run carries a sentinel
-                  # version; joining it with the separator renders `go.sum@n/a`,
-                  # which reads as a pin that does not exist.
-                  case "${ver}" in
-                    n/a|—) printf '| `%s` | %s |\n' "${id}" "${reason}" ;;
-                    *)     printf '| `%s%s%s` | %s |\n' \
-                             "${id}" "${SEPARATOR}" "${ver}" "${reason}" ;;
-                  esac
-                done < "${unverifiable_failures}"
-                printf '\n'
+                render_reason_table "${unverifiable_failures}"
               fi
 
-              # No bypass offer under a not-run row: the label genuinely clears the
-              # check, and the checkout would stay broken for the next PR. Keyed on
-              # the raw rows rather than the awk bucket, so the degraded fallback
-              # above (which dumps every row into too_new) cannot restore the offer.
-              if ! grep -q $'\tnot_run$' "${deduped_failures}"; then
+              # No bypass offer under a not-run or misconfigured row: the label
+              # genuinely clears the check, and the checkout would stay broken for
+              # the next PR — or the unpinned image would merge on this one. Keyed
+              # on the raw rows rather than the awk buckets, so the degraded
+              # fallback above cannot restore the offer.
+              if ! grep -qE $'\t(not_run|misconfigured)$' "${deduped_failures}"; then
                 printf '> Need to merge sooner? Add the **`age-check-bypass`** label — verified-CVE emergencies only.\n'
+              elif grep -q $'\tmisconfigured$' "${deduped_failures}"; then
+                # Said out loud, for a reader of the too-new section beside it
+                # who goes looking for the offer.
+                printf '> No bypass is offered while a pin above needs fixing in this PR.\n'
               fi
               printf '\n<sub>Updated by `ops-routines-workflows/age-check-%s` · [run log](%s)</sub>\n' "${ECOSYSTEM}" "${RUN_URL}"
             } > "${body_file}"
-            rm -f "${deduped_failures}" "${too_new_failures}" "${unverifiable_failures}" "${not_run_failures}"
+            rm -f "${deduped_failures}" "${too_new_failures}" "${unverifiable_failures}" \
+              "${misconfigured_failures}" "${not_run_failures}"
 
             if [ -n "${existing_id}" ]; then
               if ! gh api -X PATCH "/repos/${REPO}/issues/comments/${existing_id}" \
