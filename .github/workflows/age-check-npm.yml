@@ -469,6 +469,27 @@ jobs:
           # on stdin, one work-list line per entry on stdout, every diagnostic on
           # stderr, non-zero on input it cannot read.
           #
+          # Message ownership on a parse failure: this helper says WHICH image failed
+          # and that the run refuses an empty work-list — "<file> could not be
+          # parsed", format-agnostic because the helper never knows the format, and
+          # already naming the file ("yarn.lock could not be parsed") — and the
+          # PARSER says WHY, on stderr, immediately above it: jq's own parse error
+          # for package-lock, yarn_pins' END diagnostic for yarn (which of its three
+          # refusals fired, with the counts). A binding may add a check of its own,
+          # before or after calling here, when it can say something the parser
+          # would not: diff_package_lock's "is not valid JSON" object check catches
+          # the empty file jq reads as nothing, and diff_pnpm_lock's shortfall
+          # guard reports the numbers for a lockfileVersion only partly understood
+          # (rc 5) where the extractor itself exits 0. It does not restate this
+          # helper's line, and no format name is spliced into this helper's
+          # message. Every npm binding and pre-commit route through here, so this
+          # is the one place the split is written down. The pairing
+          # is adjacent in the JOB LOG only: this helper's line is a `::error
+          # file=` and so also reaches the annotations panel and the Files-changed
+          # view, while the parser's reason is plain stderr text — an operator who
+          # starts from the annotation has to open the log for the why, exactly as
+          # with jq's error today.
+          #
           # This is the body `precommit_age::changed_pins` and `npm_age::changed_pins`
           # each carried verbatim — probe, temp-file read, two checked parses, a set
           # difference — and it lives here so the two cannot drift on the details
@@ -486,8 +507,9 @@ jobs:
           # passes the PR. They match what both callers' main() already render:
           #   0 - stdout is the work-list, possibly empty
           #   1 - the HEAD image could not be parsed, or the comparison itself failed
-          #   2 - the BASE image exists but could not be read or parsed, or no scratch
-          #       space for it — a checkout or environment problem, not this branch's
+          #   2 - the BASE image exists but could not be read or parsed, no scratch
+          #       space for it, or <base_rev> does not resolve to a commit in this
+          #       checkout — a checkout or environment problem, not this branch's
           # A coding error (unknown parser, empty revision) aborts instead — see below.
           #
           # MUST be called under `$(...)`, as every binding does: the two coding-error
@@ -525,6 +547,40 @@ jobs:
             if [ -z "$base_rev" ]; then
               echo "::error::preflight::new_lines_since_base: empty base revision for ${file}. This is a coding error, not a runtime condition." >&2
               exit 1
+            fi
+
+            # A NON-EMPTY revision this checkout cannot resolve — a truncated SHA, a
+            # ref never fetched or since pruned — would fail the path probe below
+            # exactly the way an absent file does, and the whole head image would be
+            # promoted as "new on this branch": loud (every pin reported new; on a
+            # large lockfile, the job timeout), but blamed on the branch instead of
+            # the checkout — the mis-attribution the read step below exists to
+            # refuse. Unreachable through preflight::base_rev, which only hands out
+            # a merge base it resolved; this is the guard for a caller that did not
+            # go through it. rc 2 rather than an abort: a revision the checkout
+            # lacks is a checkout problem, not a coding error. `^{commit}` is
+            # load-bearing — `rev-parse --verify` accepts any 40-hex string as a
+            # revision WITHOUT looking it up, and only peeling it makes the object
+            # have to exist. `^{commit}` and not `^{tree}`: the contract is a
+            # revision whose history `git merge-base` produced, the base read
+            # below spells the path `<rev>:./<file>` (which a tree-ish would also
+            # satisfy), and accepting a bare tree would readmit the ambiguity this
+            # guard removes — do not "fix" the peel to widen it. A bare
+            # `::error::`, like fail_not_run's checkout failures: `file=` would pin
+            # a red marker on a manifest that had no part in the fault. The text
+            # names the file.
+            #
+            # The revision is sanitized for the log the same way verify_base_ref
+            # sanitizes the ref it echoes. Unreachable through preflight::base_rev,
+            # which yields a hex merge base — but this guard exists FOR the caller
+            # that did not go through it, and a revision carrying a newline would
+            # otherwise close this annotation and open a second workflow command of
+            # the attacker's choosing. Nothing downstream reads the sanitized copy;
+            # it is display only.
+            if ! git rev-parse --verify --quiet "${base_rev}^{commit}" >/dev/null 2>&1; then
+              local safe_rev; safe_rev=$(preflight::safe_for_md "$base_rev" 200)
+              echo "::error::base revision '${safe_rev}' for ${file} does not resolve to a commit in this checkout — a truncated SHA, or a ref this checkout never fetched or has since pruned" >&2
+              return 2
             fi
 
             # Base side FIRST, and unconditionally when an image exists. A head that
@@ -1113,6 +1169,13 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           }
 
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/_npm-lockfile-parsers.sh (part 1 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # Footer for a run where one or more manifests were skipped wholesale by
           # explicit configuration rather than examined. Takes both counts because
           # the honest sentence depends on whether anything else WAS checked:
@@ -1176,13 +1239,6 @@ jobs:
           # with no terminal period, as for fail_not_run, and must name the file,
           # since the footer and the comment cell both stand on their own.
           #
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/_npm-lockfile-parsers.sh (part 1 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # Deliberately not step_summary_failed: that footer hands out the
           # age-check-bypass label, which clears the check — the wrong remedy for
           # a transient git failure, where a re-run is. (The PR comment still
@@ -2023,6 +2079,13 @@ jobs:
               # the buffered entry and the block host are per-file too, and a
               # half-reset here would colour file N+1s first flush with file Ns
               # host if that ever changed.
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               FNR == 1 { flush(); name = ""; block_host = ""; block_conflict = 0; block_berry = 0; block_resolved = 0; block_badloc = 0; pending_vendored = ""; block_res = "" }
               # Counts any line that is not blank and not a comment. MUST come
               # before the header rule: that rule ends in `next`, which skips every
@@ -2088,13 +2151,6 @@ jobs:
                 #
                 # Testing for "not scheme-shaped" was not enough: yarn v1`s GitHub
                 # shorthand, `lodash@lodash/lodash#patched`, has no scheme, so it
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # was accepted and the pin became `lodash@4.17.21` — looked up as
                 # the real lodash and rendered green, for a tarball that came from
                 # codeload.github.com. Forks conventionally keep the upstream
@@ -2364,9 +2420,24 @@ jobs:
               END {
                 # The last block in the file has no following header to end it.
                 flush()
-                if ((specs > 0 && pins == 0) ||
-                    (content > 0 && pins == 0 && structural == 0) ||
-                    (content == 0 && comments == 0)) exit 1
+                # Each refusal names its own reason on stderr. The comparator that
+                # runs this program (preflight::new_lines_since_base, see "Message
+                # ownership" there) says WHICH image could not be parsed and that
+                # the run fails closed; only this program knows WHY, and the counts
+                # are what tell a format change from a truncation. (No apostrophes
+                # here: single-quoted awk program.)
+                if (specs > 0 && pins == 0) {
+                  print "yarn parser: " specs " package header(s) but no readable version line under any of them — a lockfile format this parser does not read?" > "/dev/stderr"
+                  exit 1
+                }
+                if (content > 0 && pins == 0 && structural == 0) {
+                  print "yarn parser: " content " non-comment line(s) carrying no lockfile structure (no resolved, resolution or __metadata key) — truncated or wholesale replaced?" > "/dev/stderr"
+                  exit 1
+                }
+                if (content == 0 && comments == 0) {
+                  print "yarn parser: empty or whitespace-only file (no content lines and no comment lines) — yarn always writes its header comments, so this was emptied or blanked rather than generated, and yarn install would re-resolve every range" > "/dev/stderr"
+                  exit 1
+                }
               }'
           }
 
@@ -2397,10 +2468,12 @@ jobs:
           #
           # Exit codes pass through unchanged: 2 for the base image (read or parse
           # — a checkout problem: a partial clone's lazy blob fetch, a corrupt
-          # object, no scratch space), 1 for a head lockfile that could not be
-          # parsed. main() renders exactly that split. Every diagnostic is on
-          # stderr: stdout is the work-list channel, read back with
-          # `new_deps=$(...)`.
+          # object, no scratch space, a base revision the checkout cannot
+          # resolve), 1 for a head lockfile that could not be parsed. main()
+          # renders exactly that split. Every diagnostic is on stderr: stdout is
+          # the work-list channel, read back with `new_deps=$(...)`. On a parse
+          # failure the helper names WHICH image and the extractor says WHY (jq's
+          # own error; yarn_pins' END diagnostic) — see the helper's header.
           npm_age::changed_pins() {   # <lockfile> <base_rev> <extractor> [base_blob]
             preflight::new_lines_since_base "$@"
           }
@@ -2897,6 +2970,13 @@ jobs:
                       # guard because there is only ever one `resolution:`.
                       #
                       # Safe: a two-space entry key is taken by the key regex
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                       # before this point and a column-0 line by the top rule, so
                       # nothing else can leak into pending_res.
                       if (body ~ /^[[:space:]]*$/ || ind > res_indent) {
@@ -2998,13 +3078,6 @@ jobs:
                                || key ~ /^[^\/]+\.[^\/]+\//)) {
                   # Keys that name a source rather than a package. Three shapes:
                   #   scheme://...    https://host/x.tgz, git+https://host/r.git#sha
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   #   host/path/rev   example.com/pkg/1.0.0, github.com/o/r/<sha>
                   #   scheme:path      file:./x, link:../y, workspace:*, git+...
                   #
@@ -3727,6 +3800,13 @@ jobs:
           #   committed yarn configuration disagree about where packages come
           #   from, and npm_age::load_registry_config says so with a `::notice`
           #   naming YARN_NPM_REGISTRY_SERVER as the likely reason. A notice, not
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   a failure — the aging is still against the registry the caller
           #   named — and nothing at all against the public registry_url, where
           #   Berry's default and the input agree. It is a FILE-level fact standing
@@ -3801,13 +3881,6 @@ jobs:
           #   what is actually gated.
           # - The package-lock.json and yarn.lock work-lists are built by
           #   comparing the base and head images of the lockfile. Scraping added
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   (`+`) diff lines — what both used to do — cannot see a version bump
           #   of a package that already exists, because only the block body
           #   changes while the key/header line stays unchanged context. That made
@@ -4606,6 +4679,13 @@ jobs:
             # and each is a false pass on its own: reading only the top-level file
             # misses `apps/web/.npmrc`, and reading only the lockfile's own
             # directory misses a registry configured once at the repo root — which
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # is where pnpm workspaces and yarn monorepos normally put it. Either
             # way the private packages get aged against a public homonym.
             #
@@ -4686,13 +4766,6 @@ jobs:
               # the notice is about. And the registry.yarnpkg.com it names is
               # Berry's own default — a fact about yarn, not the public-npm
               # constant above, so it is not folded into NPM_AGE_PUBLIC_HOST.
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               # Only the path is sanitised: NPM_AGE_WANT_HOST is the caller's own
               # input, already reduced to a bare host by registry_host, the same
               # treatment the all-skipped remedy gives REGISTRY_URL.
@@ -4862,7 +4935,7 @@ jobs:
             # shellcheck disable=SC2016
             preflight::install_exit_guard npm 'rm -f "${NPM_AGE_UNREADABLE_MARKER:-}" 2>/dev/null || true; preflight::step_summary_notes'
 
-            preflight::require_tools curl jq awk sed grep sort comm
+            preflight::require_tools curl jq git mktemp awk sed grep sort comm
             preflight::require_gnu_date
             preflight::validate_min_age_days
 
@@ -5472,6 +5545,13 @@ jobs:
             fi
 
             # A lockfile the parser could not read is NOT a verified lockfile. The
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 4 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # run still exits 0 (see the Known limitations block for why these are
             # warnings rather than failures), but the footer must not assert a
             # clean bill of health directly beneath a ":warning: NOT age-checked"

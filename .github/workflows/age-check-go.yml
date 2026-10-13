@@ -446,6 +446,27 @@ jobs:
           # on stdin, one work-list line per entry on stdout, every diagnostic on
           # stderr, non-zero on input it cannot read.
           #
+          # Message ownership on a parse failure: this helper says WHICH image failed
+          # and that the run refuses an empty work-list — "<file> could not be
+          # parsed", format-agnostic because the helper never knows the format, and
+          # already naming the file ("yarn.lock could not be parsed") — and the
+          # PARSER says WHY, on stderr, immediately above it: jq's own parse error
+          # for package-lock, yarn_pins' END diagnostic for yarn (which of its three
+          # refusals fired, with the counts). A binding may add a check of its own,
+          # before or after calling here, when it can say something the parser
+          # would not: diff_package_lock's "is not valid JSON" object check catches
+          # the empty file jq reads as nothing, and diff_pnpm_lock's shortfall
+          # guard reports the numbers for a lockfileVersion only partly understood
+          # (rc 5) where the extractor itself exits 0. It does not restate this
+          # helper's line, and no format name is spliced into this helper's
+          # message. Every npm binding and pre-commit route through here, so this
+          # is the one place the split is written down. The pairing
+          # is adjacent in the JOB LOG only: this helper's line is a `::error
+          # file=` and so also reaches the annotations panel and the Files-changed
+          # view, while the parser's reason is plain stderr text — an operator who
+          # starts from the annotation has to open the log for the why, exactly as
+          # with jq's error today.
+          #
           # This is the body `precommit_age::changed_pins` and `npm_age::changed_pins`
           # each carried verbatim — probe, temp-file read, two checked parses, a set
           # difference — and it lives here so the two cannot drift on the details
@@ -463,8 +484,9 @@ jobs:
           # passes the PR. They match what both callers' main() already render:
           #   0 - stdout is the work-list, possibly empty
           #   1 - the HEAD image could not be parsed, or the comparison itself failed
-          #   2 - the BASE image exists but could not be read or parsed, or no scratch
-          #       space for it — a checkout or environment problem, not this branch's
+          #   2 - the BASE image exists but could not be read or parsed, no scratch
+          #       space for it, or <base_rev> does not resolve to a commit in this
+          #       checkout — a checkout or environment problem, not this branch's
           # A coding error (unknown parser, empty revision) aborts instead — see below.
           #
           # MUST be called under `$(...)`, as every binding does: the two coding-error
@@ -502,6 +524,40 @@ jobs:
             if [ -z "$base_rev" ]; then
               echo "::error::preflight::new_lines_since_base: empty base revision for ${file}. This is a coding error, not a runtime condition." >&2
               exit 1
+            fi
+
+            # A NON-EMPTY revision this checkout cannot resolve — a truncated SHA, a
+            # ref never fetched or since pruned — would fail the path probe below
+            # exactly the way an absent file does, and the whole head image would be
+            # promoted as "new on this branch": loud (every pin reported new; on a
+            # large lockfile, the job timeout), but blamed on the branch instead of
+            # the checkout — the mis-attribution the read step below exists to
+            # refuse. Unreachable through preflight::base_rev, which only hands out
+            # a merge base it resolved; this is the guard for a caller that did not
+            # go through it. rc 2 rather than an abort: a revision the checkout
+            # lacks is a checkout problem, not a coding error. `^{commit}` is
+            # load-bearing — `rev-parse --verify` accepts any 40-hex string as a
+            # revision WITHOUT looking it up, and only peeling it makes the object
+            # have to exist. `^{commit}` and not `^{tree}`: the contract is a
+            # revision whose history `git merge-base` produced, the base read
+            # below spells the path `<rev>:./<file>` (which a tree-ish would also
+            # satisfy), and accepting a bare tree would readmit the ambiguity this
+            # guard removes — do not "fix" the peel to widen it. A bare
+            # `::error::`, like fail_not_run's checkout failures: `file=` would pin
+            # a red marker on a manifest that had no part in the fault. The text
+            # names the file.
+            #
+            # The revision is sanitized for the log the same way verify_base_ref
+            # sanitizes the ref it echoes. Unreachable through preflight::base_rev,
+            # which yields a hex merge base — but this guard exists FOR the caller
+            # that did not go through it, and a revision carrying a newline would
+            # otherwise close this annotation and open a second workflow command of
+            # the attacker's choosing. Nothing downstream reads the sanitized copy;
+            # it is display only.
+            if ! git rev-parse --verify --quiet "${base_rev}^{commit}" >/dev/null 2>&1; then
+              local safe_rev; safe_rev=$(preflight::safe_for_md "$base_rev" 200)
+              echo "::error::base revision '${safe_rev}' for ${file} does not resolve to a commit in this checkout — a truncated SHA, or a ref this checkout never fetched or has since pruned" >&2
+              return 2
             fi
 
             # Base side FIRST, and unconditionally when an image exists. A head that
@@ -1090,6 +1146,13 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           }
 
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/age-check-go.sh (part 1 of 2)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # Footer for a run where one or more manifests were skipped wholesale by
           # explicit configuration rather than examined. Takes both counts because
           # the honest sentence depends on whether anything else WAS checked:
@@ -1153,13 +1216,6 @@ jobs:
           # with no terminal period, as for fail_not_run, and must name the file,
           # since the footer and the comment cell both stand on their own.
           #
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/age-check-go.sh (part 1 of 2)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # Deliberately not step_summary_failed: that footer hands out the
           # age-check-bypass label, which clears the check — the wrong remedy for
           # a transient git failure, where a re-run is. (The PR comment still
@@ -2162,6 +2218,13 @@ jobs:
             tag_metadata=$(go_age::first_party_tag_target "$repo" "$expected_tag") || return 1
             IFS=$'\t' read -r tag_kind _tag_object_sha target_sha _tag_verification <<< "$tag_metadata"
             if [ "$target_sha" != "$origin_hash" ]; then
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-go.sh (part 2 of 2)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-go.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               echo "First-party GitHub tag target does not match the proxy origin for ${module}@${version}" >&2
               return 1
             fi
@@ -2219,13 +2282,6 @@ jobs:
             [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || return 1
             go_age::canonical_module_version_major "$version" >/dev/null || return 1
             local tag="${version%+incompatible}" repo_json release_json commit_json
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-go.sh (part 2 of 2)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-go.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             [ -z "$prefix" ] || tag="${prefix}/${tag}"
             repo_json=$(go_age::github_json "/repos/${repo}") || return 1
             printf '%s' "$repo_json" | jq -e --arg repo "$repo" --arg owner "$FIRST_PARTY_MODULE_OWNER" \
