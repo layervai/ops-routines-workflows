@@ -1131,7 +1131,7 @@ jobs:
           # MIN_AGE_DAYS is the security threshold, while these are tuning knobs
           OPS_ROUTINES_AGE_CHECK_LIB
 
-      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/_npm-lockfile-parsers.sh (part 1 of 3)
+      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/_npm-lockfile-parsers.sh (part 1 of 4)
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
@@ -2084,7 +2084,7 @@ jobs:
             awk -v mode="$mode" "$NPM_AGE_AWK_CANON_HOST"'
           OPS_ROUTINES_AGE_CHECK_LIB
 
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 4)
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
@@ -2954,7 +2954,7 @@ jobs:
 
           OPS_ROUTINES_AGE_CHECK_LIB
 
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 4)
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 4)
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
@@ -3171,7 +3171,8 @@ jobs:
                 # once the body has shown the entry is readable, and never excuses
                 # an unreadable one.
                 # Only ever want_host: the v5 strip arm requires the key to be
-                # prefixed with want_host itself. A v5 key qualified with any OTHER
+                # qualified with want_host, in any spelling key_registry_len
+                # reduces to it. A v5 key qualified with any OTHER
                 # host does not reach here — it takes the source-shaped arm and is
                 # counted non-registry, which is fail-closed but is a count rather
                 # than the tag the grammar would prefer.
@@ -3182,6 +3183,100 @@ jobs:
                   if (scope in scope_host) return scope_host[scope]
                 }
                 return default_host
+              }
+
+              # The length of the registry-host segment a v5 key is qualified with
+              # (`<host>/<name>/<version>`), when that host is the configured
+              # registry; 0 when the key is not so qualified. The caller strips
+              # that many characters plus the slash.
+              #
+              # A host derivation of its own, beside npm_age::registry_host, the
+              # package-lock jq and canon_host() — and deliberately NOT a call to
+              # canon_host(), which reads a URL: it takes its steps in its order —
+              # lower-case, default port, yarnpkg fold — less the userinfo strip,
+              # which a key cannot support (below), and with a port strip that has
+              # no scheme to consult. The key
+              # used to be prefix-matched raw against want_host, which has already
+              # been through registry_host — so `registry_url:
+              # https://registry.yarnpkg.com` (want_host folds to npmjs) against
+              # the `registry.yarnpkg.com/...` keys pnpm wrote from that very
+              # registry missed on every entry, as did `Registry.NpmJS.org/` and
+              # `registry.npmjs.org:443/`. A miss is counted non-registry. By
+              # default that is the false red this arm exists to prevent; under
+              # allow_registry_free a lockfile made ONLY of such keys reached rc 4,
+              # a PASS with nothing age-checked. A miss is therefore the dangerous
+              # direction here, and a match is the safe one: a matched entry is
+              # not excused from anything, it is aged, and only after
+              # pending_host has put its body through the same refusals as every
+              # other entry.
+              #
+              # Two things differ from the URL sites, both because a key is not a
+              # URL.
+              #
+              # NO SCHEME, so the port strip cannot be gated on one. Both default
+              # ports are stripped, unconditionally, but only when the host does
+              # not already equal want_host as spelled:
+              #
+              #   exact first, because want_host can legitimately END in a default
+              #     port — registry_host keeps `:80` on an https registry and
+              #     `:443` on an http one, and pnpm (which writes `URL.host`) keeps
+              #     the same one in the key. Stripping first would turn that match
+              #     into a miss.
+              #   both ports, because the URL sites between them already read
+              #     `host`, `https://host:443` and `http://host:80` as one registry
+              #     — the scheme selects which port is redundant, it is not part of
+              #     what is compared. A key cannot say which it meant, so it is
+              #     given the union. What that concedes: `host:80` written for an
+              #     https registry on port 80 matches a want_host of plain `host`.
+              #     Same machine, and the pin is then aged rather than waved
+              #     through; refusing it would send it back to the non-registry
+              #     count, which is the direction that can pass.
+              #
+              # NO AUTHORITY BOUNDARY, so there is NO USERINFO STRIP — the one
+              # step of the four deliberately not carried over. A host segment
+              # containing `@` is compared as it stands, and so never matches:
+              # want_host has been through registry_host and carries none. That
+              # needs no line of code, which is why there is none to find — the
+              # thing NOT to add is a `sub(/^.*@/, "", h)`, and the canary fails
+              # if one appears. The URL sites can strip safely because `://` and
+              # the first `/` fence the authority off first; in a key nothing
+              # does, and `@` already means other things there:
+              #
+              #   `@npm/foo@1.0.0` is a scoped package. Read as empty userinfo
+              #     under a registry whose host is `npm`, it strips to `foo@1.0.0`
+              #     — a different package.
+              #   `github:x@<registry>/evil/1.0.0`, `file:p@<registry>/evil/1.0.0`
+              #     and `foo@<registry>/evil/1.0.0` are a hosted-git shorthand, a
+              #     local path and a name@version. Each is shaped exactly like
+              #     `user:pass@<registry>/...` or `user@<registry>/...`, and read
+              #     that way becomes a bare registry pin for `evil`. A list of
+              #     protocols to exempt was tried and is the wrong tool: it has to
+              #     name every one, in every case, and the bare `foo@` form has no
+              #     protocol to name.
+              #
+              # Nothing real is lost. pnpm writes the qualifier from `URL.host`,
+              # which never carries userinfo, so no lockfile pnpm produced has
+              # such a key; one that does is hand-written, and it stays where it
+              # was before this function existed — the source-shaped arm, counted
+              # non-registry.
+              #
+              # pnpm writes neither upper case nor a redundant default port either
+              # — the alias is the spelling a real lockfile carries. Those two
+              # steps are here anyway because, unlike userinfo, they cannot change
+              # WHICH package a key names, and want_host is canonical in both
+              # respects.
+              #
+              # Fenced by: test_host_canonicalisation_does_not_drift_between_extractors
+              # (its v5-key leg; the marker format is explained on
+              # npm_age::registry_host).
+              function key_registry_len(k,   p, h) {
+                p = index(k, "/")
+                if (p < 2) return 0
+                h = substr(k, 1, p - 1)
+                h = tolower(h)
+                if (h != want_host) sub(/:(443|80)$/, "", h)
+                if (h == "registry.yarnpkg.com") h = "registry.npmjs.org"
+                return (h == want_host) ? p - 1 : 0
               }
 
               # Emits the buffered entry, if any. Called before each new key, on
@@ -3365,11 +3460,13 @@ jobs:
                 # a registry" — true of npmjs, wrong about the repo, and with no
                 # remedy but turning the gate off.
                 #
-                # index(), not a regex: a host is full of dots, and want_host is
-                # caller-supplied.
+                # The host is CANONICALISED before it is compared — see
+                # key_registry_len. want_host has been through
+                # npm_age::registry_host, and the raw prefix match this replaced
+                # missed every equivalent spelling of the same registry.
                 key_host = ""
-                if (!slashed && want_host != "" && index(key, want_host "/") == 1) {
-                  key = substr(key, length(want_host) + 2)
+                if (!slashed && want_host != "" && (key_reg_len = key_registry_len(key)) > 0) {
+                  key = substr(key, key_reg_len + 2)
                   slashed = 1
                   key_host = want_host
                 }
@@ -3745,6 +3842,13 @@ jobs:
             # and a promotion warning whose remedy ("re-running will not help") is
             # exactly wrong for a scratch-space fault. The stream then answers
             # every question the classifier has:
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 4 of 4), lib/age-check-npm.sh (part 1 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # pins present is `ok`; no pins but vendored records is `vendored` —
             # read fine, everything resolves through git/tarball/link, the
             # ordinary case of a repo migrating OFF vendored dependencies, and
@@ -3839,13 +3943,6 @@ jobs:
           #                    resolve to before it is age-checked, and the
           #                    packument URL used to age it. An entry resolving
           #                    anywhere else is skipped as "not on the configured
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #                    registry" — visibly, and without a request — rather
           #                    than looked up on npmjs, which is how a private
           #                    package used to be aged against a public homonym's
@@ -4403,25 +4500,15 @@ jobs:
           # Citation is opt-in through that marker precisely so an ordinary
           # `test_dir` mentioned in any lib comment is not mistaken for one.
           #
-          # Scope, so the next person does not over-trust it: the canary covers the
-          # URL->host derivations only. npm_age::parse_pnpm_lock has ONE MORE
-          # host comparison — the v5 registry-qualified KEY arm — which prefix-
-          # matches a raw lockfile key against this function's already-canonical
-          # output, so a key qualified `registry.yarnpkg.com/`, `Registry.NpmJS.org/`
-          # or `registry.npmjs.org:443/` misses it and the entry is counted
-          # non-registry. By default that is fail-closed — the file returns rc 3
-          # and the run goes red as "resolves nothing from a registry", which is
-          # the very red that arm exists to prevent. It is NOT fail-closed under
-          # `allow_registry_free`: the same miscount reaches rc 4, a pass, so a
-          # repo that set that flag while it genuinely had no registry deps gets a
-          # green check over a v5 lockfile full of real ones.
-          #
-          # The fix, stated here rather than pointed at, so this comment stays
-          # useful wherever it is read: canonicalise the key's host segment before
-          # that prefix match, with the same steps as above minus the
-          # scheme-gating, since a key carries no scheme. It is deliberately not
-          # done in the change that added this note — that one is test-only, and
-          # this moves a supply-chain gate's verdict.
+          # The canary has one more leg, for the one comparison that is not a
+          # URL->host derivation: npm_age::parse_pnpm_lock's v5 registry-qualified
+          # KEY arm, which reduces a lockfile key's host segment to this function's
+          # output before comparing the two. Two of the steps below do not carry
+          # over as written, because a key is not a URL: its port strip is not
+          # scheme-gated, and it does not strip userinfo, so a host segment
+          # containing `@` matches nothing. That is also why it is a fold site of
+          # its own rather than a caller of canon_host(). The comment on
+          # key_registry_len in that parser says why for both.
           npm_age::registry_host() {
             local url="$1" scheme=""
             case "$url" in *://*) scheme="${url%%://*}" ;; esac
@@ -4579,6 +4666,13 @@ jobs:
           # A Berry entry names no host at all — `resolution: "lodash@npm:4.17.21"`
           # is a DESCRIPTOR, not a location — so it is the yarn analogue of pnpm's
           # integrity-only entry: the registry it came from lives in
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # configuration. But in a DIFFERENT file. Berry does not read .npmrc, so
           # pointing npm_age::npmrc_registries at a Berry repo would judge its
           # pins against a registry Berry never used. This reads `.yarnrc.yml`
@@ -4665,13 +4759,6 @@ jobs:
                 line = $0
                 # Blank and comment lines carry no key.
                 if (line ~ /^[[:space:]]*($|#)/) next
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # A TAB anywhere in the leading whitespace is not legal YAML
                 # indentation, so this is not a file yarn would load. SKIPPING the
                 # line — what this once did, and only for a tab at column 1 —
@@ -5461,6 +5548,13 @@ jobs:
             # verification possible".
             local skipped_private=0
             # Subset of skipped_count: pins skipped because they resolve to a
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # registry other than the configured one — identified from the
             # lockfile, so no request is made for them at all. Tracked separately
             # so the all-skipped failure can name registry_url, the remedy that
@@ -5554,13 +5648,6 @@ jobs:
                 # that must not look green.
                 preflight::step_summary_header "npm"
                 npm_age::report_unreadable_format "$LOCKFILE_PATH" \
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 4 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   "configured lockfile_path does not exist in the checkout"
                 echo "::error::configured lockfile_path '${LOCKFILE_PATH}' does not exist and no other lockfile was found — nothing was age-checked"
                 exit 1
