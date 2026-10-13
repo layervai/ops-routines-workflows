@@ -4508,17 +4508,34 @@ jobs:
           # <map> is the space-separated `@scope=host` list; the global IFS holds
           # no space, hence the explicit split.
           npm_age::warn_unreadable_scopes() {
-            local name="$1" map="$2" dir="$3" qualifier="$4" remedy="${5:-}" e safe_dir safe_scope
+            local name="$1" map="$2" dir="$3" qualifier="$4" remedy="${5:-}"
+            local e scope last seen=" " safe_dir="" safe_dir_done=0 safe_scope
             [ -n "$map" ] || return 0
-            safe_dir=$(preflight::safe_for_md "$dir")
             local -a entries=()
             IFS=' ' read -r -a entries <<< "$map"
+            # Padded once: the leading space is what anchors ` ${scope}=` to an
+            # entry boundary below, so `@x@acme=` cannot stand in for `@acme=`.
+            local padded=" ${map} "
             for e in "${entries[@]}"; do
-              case "$e" in
-                *"=?unreadable")
-                  safe_scope=$(preflight::safe_for_md "${e%%=*}")
-                  preflight::annotate_with_note warning "${name} for ${safe_dir} configures a registry for ${safe_scope} that this check could not parse, so ${qualifier}packages in that scope are reported as skipped rather than age-checked.${remedy:+ }${remedy}" ;;
-              esac
+              scope="${e%%=*}"
+              # The map keeps EVERY entry for a scope and its consumers are
+              # last-wins, so a scope is poisoned only when its LAST entry is. A
+              # root `acme: {...}` that a nearer readable block overrides is the
+              # override Berry itself honours (see the fold), and warning about it
+              # would send an operator to fix a file that is not in effect. Each
+              # scope is resolved once, whichever entry is met first.
+              case "$seen" in *" ${scope} "*) continue ;; esac
+              seen="${seen}${scope} "
+              last="${padded##* "${scope}"=}"
+              last="${last%% *}"
+              [ "$last" = "?unreadable" ] || continue
+              # Forked only once something will be printed: a repo with a readable
+              # scope map reaches here on every target and must stay fork-free.
+              if [ "$safe_dir_done" = 0 ]; then
+                safe_dir=$(preflight::safe_for_md "$dir"); safe_dir_done=1
+              fi
+              safe_scope=$(preflight::safe_for_md "$scope")
+              preflight::annotate_with_note warning "${name} for ${safe_dir} configures a registry for ${safe_scope} that this check could not parse, so ${qualifier}packages in that scope are reported as skipped rather than age-checked.${remedy:+ }${remedy}"
             done
           }
 
@@ -4553,6 +4570,11 @@ jobs:
 
           npm_age::load_registry_config() {
             local dir="$1" kind="${2:-}" lockfile="${3:-}" d default map
+            # One clause for the four remedies below, so the next edit to it is
+            # atomic: `registry=//host/` and `npmRegistryServer: //host/` both
+            # parse to no host, and a remedy that names only whitespace and
+            # `${VAR}` describes neither the operator's file nor their problem.
+            local rel_clause="a protocol-relative value (\`//host/\`) has no scheme this check can read a host from"
             NPM_AGE_DEFAULT_HOST="$NPM_AGE_WANT_HOST"
             NPM_AGE_SCOPE_MAP=""
             NPM_AGE_YARN_DEFAULT_HOST="$NPM_AGE_WANT_HOST"
@@ -4615,9 +4637,9 @@ jobs:
               [ -n "$default" ] && NPM_AGE_DEFAULT_HOST="$default"
               NPM_AGE_SCOPE_MAP="$map"
               npm_age::warn_registry_mismatch .npmrc "$NPM_AGE_DEFAULT_HOST" "$dir" "" \
-                "A value containing whitespace cannot be used, and \`registry=\${VAR}\` is read literally rather than expanded."
+                "A value containing whitespace cannot be used, \`registry=\${VAR}\` is read literally rather than expanded, and ${rel_clause}; use an absolute URL (\`https://host/\`)."
               npm_age::warn_unreadable_scopes .npmrc "$NPM_AGE_SCOPE_MAP" "$dir" "" \
-                "A value containing whitespace cannot be used, and \`@scope:registry=\${VAR}\` is read literally rather than expanded."
+                "A value containing whitespace cannot be used, \`@scope:registry=\${VAR}\` is read literally rather than expanded, and ${rel_clause}; use an absolute URL (\`https://host/\`)."
             fi
 
             if [ "$want_yarnrc" = 1 ]; then
@@ -4643,9 +4665,9 @@ jobs:
               [ -f "$lockfile" ] && grep -q '^__metadata:' "$lockfile" && berry_lock=1
               if [ -z "$lockfile" ] || [ "$berry_lock" = 1 ]; then
                 npm_age::warn_registry_mismatch .yarnrc.yml "$NPM_AGE_YARN_DEFAULT_HOST" "$dir" "Berry " \
-                  "Flow-style YAML (\`npmScopes: {…}\`) is not read, a value containing whitespace cannot be used, and \`\${VAR}\` interpolation is refused because this check cannot see the environment yarn expands it from; rewrite it in block style with a plain URL."
+                  "Flow-style YAML (\`npmScopes: {…}\`) is not read, a value containing whitespace cannot be used, \`\${VAR}\` interpolation is refused because this check cannot see the environment yarn expands it from, and ${rel_clause}; rewrite it in block style with a plain absolute URL."
                 npm_age::warn_unreadable_scopes .yarnrc.yml "$NPM_AGE_YARN_SCOPE_MAP" "$dir" "Berry " \
-                  "A flow-style scope (\`acme: {…}\`) is not read, and a value containing whitespace cannot be used; rewrite it in block style with a plain URL."
+                  "A flow-style scope (\`acme: {…}\`) is not read, a value containing whitespace cannot be used, and ${rel_clause}; rewrite it in block style with a plain absolute URL."
               fi
               # The other half of that file's story: no .yarnrc.yml default at all,
               # under a registry_url that is not the public one, so the Berry
@@ -4664,6 +4686,13 @@ jobs:
               # the notice is about. And the registry.yarnpkg.com it names is
               # Berry's own default — a fact about yarn, not the public-npm
               # constant above, so it is not folded into NPM_AGE_PUBLIC_HOST.
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               # Only the path is sanitised: NPM_AGE_WANT_HOST is the caller's own
               # input, already reduced to a bare host by registry_host, the same
               # treatment the all-skipped remedy gives REGISTRY_URL.
@@ -4688,13 +4717,6 @@ jobs:
 
           # Fetches the registry response for $1 and emits the publish time for
           # version $2 on stdout. Exit codes:
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   0 - success (stdout may still be empty if the version isn't in .time)
           #   1 - registry says 404/410 (package private, scope-only, unpublished)
           #   3 - registry says 401/403: reachable, but refusing us. Distinct from
