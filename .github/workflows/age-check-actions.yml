@@ -2289,6 +2289,10 @@ jobs:
 
             local now_epoch; now_epoch=$(date +%s)
             local failed=false
+            # Set by the branches that record a `misconfigured` row; withholds the
+            # bypass offer from the step summary and the log, as the PR comment
+            # does.
+            local misconfigured=false
             local checked_count=0
             local skipped_count=0
 
@@ -2318,21 +2322,40 @@ jobs:
 
               while IFS= read -r ref; do
                 [ -z "$ref" ] && continue
-                # Split into "owner/repo[/subpath]" and "ref"
-                local repo_part="${ref%@*}" ref_part="${ref##*@}"
+                # Split into "owner/repo[/subpath]" and "ref" — after cutting the
+                # trailing comment added_uses leaves on. Split on the whole line, an
+                # `@` in the comment became the ref, and a correctly pinned action
+                # was refused.
+                local spec="${ref%%[[:space:]]*}"
+                local repo_part="${spec%@*}" ref_part="${spec##*@}"
+                # The four rejections below are misconfigured, not unverifiable: each
+                # is the PR's own `uses:` text and fails the same way on every run, so
+                # the comment must offer neither a re-run nor the bypass label. With
+                # no row at all the exit guard wrote a generic unverifiable one, which
+                # offered both.
                 if [ "$repo_part" = "$ref_part" ]; then
+                  local safe_uses; safe_uses=$(preflight::safe_for_md "$spec")
                   echo "::error file=${file}::uses: ${ref} is missing a pinned ref (expected @<sha>)"
-                  echo "| \`${ref}\` | — | — | :x: missing @ref |" >> "$GITHUB_STEP_SUMMARY"
+                  echo "| \`${safe_uses}\` | — | — | :x: missing @ref |" >> "$GITHUB_STEP_SUMMARY"
+                  preflight::record_misconfigured "$safe_uses" "—" \
+                    "the uses: line has no @ref — pin the action by its 40-character commit SHA"
                   failed=true
+                  misconfigured=true
                   continue
                 fi
-                # Strip the optional comment the ref_part may carry after whitespace
-                ref_part="${ref_part%% *}"
 
                 if [[ ! "$ref_part" =~ ^[0-9a-fA-F]{40}$ ]]; then
+                  local safe_slug safe_ref
+                  safe_slug=$(preflight::safe_for_md "$repo_part")
+                  safe_ref=$(preflight::safe_for_md "$ref_part")
                   echo "::error file=${file}::uses: ${ref} must be pinned by 40-char SHA (got '${ref_part}')"
-                  echo "| \`${repo_part}\` | \`${ref_part}\` | — | :x: not a 40-char SHA |" >> "$GITHUB_STEP_SUMMARY"
+                  echo "| \`${safe_slug}\` | \`${safe_ref}\` | — | :x: not a 40-char SHA |" >> "$GITHUB_STEP_SUMMARY"
+                  # `:-—`: a bare `@` leaves no ref, and the comment reads rows with a
+                  # tab IFS, where an empty cell shifts every column after it.
+                  preflight::record_misconfigured "$safe_slug" "${safe_ref:-—}" \
+                    "the ref is not a commit SHA — pin the action by its 40-character commit SHA (a tag or branch can be moved)"
                   failed=true
+                  misconfigured=true
                   continue
                 fi
 
@@ -2343,7 +2366,11 @@ jobs:
                   local safe_slug; safe_slug=$(preflight::safe_for_md "$repo_part")
                   echo "::error file=${file}::uses: ${safe_slug} — does not match owner/repo[/subpath] shape"
                   echo "| \`${safe_slug}\` | — | — | :x: invalid slug |" >> "$GITHUB_STEP_SUMMARY"
+                  # ref_part passed the 40-hex test above, so the slice is safe as is.
+                  preflight::record_misconfigured "$safe_slug" "${ref_part:0:8}" \
+                    "the action path is not of the form owner/repo or owner/repo/subpath — fix the uses: line in the workflow"
                   failed=true
+                  misconfigured=true
                   continue
                 fi
 
@@ -2355,7 +2382,10 @@ jobs:
                   local safe_slug; safe_slug=$(preflight::safe_for_md "$repo_part")
                   echo "::error file=${file}::cannot parse owner/repo from '${safe_slug}'"
                   echo "| \`${safe_slug}\` | — | — | :x: parse error |" >> "$GITHUB_STEP_SUMMARY"
+                  preflight::record_misconfigured "$safe_slug" "${ref_part:0:8}" \
+                    "no owner and repository can be read from the action path — fix the uses: line in the workflow to owner/repo"
                   failed=true
+                  misconfigured=true
                   continue
                 fi
 
@@ -2453,10 +2483,15 @@ jobs:
             fi
 
             if [ "$failed" = true ]; then
-              preflight::step_summary_failed "$MIN_AGE_DAYS" "$checked_count" "$skipped_count"
               echo ""
               echo "::error::One or more GitHub Actions failed the age check."
-              echo "To bypass for emergency security updates, add the 'age-check-bypass' label to this PR."
+              if [ "$misconfigured" = true ]; then
+                preflight::step_summary_failed "$MIN_AGE_DAYS" "$checked_count" "$skipped_count" no-bypass
+                echo "A uses: line cannot be age-checked as written — fix it in this PR; no bypass is offered while it stands."
+              else
+                preflight::step_summary_failed "$MIN_AGE_DAYS" "$checked_count" "$skipped_count"
+                echo "To bypass for emergency security updates, add the 'age-check-bypass' label to this PR."
+              fi
               exit 1
             fi
 
