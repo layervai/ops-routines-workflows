@@ -1802,6 +1802,81 @@ jobs:
                else "offregistry\t" + $pin end)
               end'
 
+          # canon_host(u): the host a URL names, reduced the way
+          # npm_age::registry_host reduces the configured one, so the two compare
+          # by string equality. ONE definition for both awk extractors —
+          # npm_age::yarn_pins and npm_age::parse_pnpm_lock each prefix it to
+          # their program as "$NPM_AGE_AWK_CANON_HOST"'...', which the shell joins
+          # into the single program argument awk sees.
+          #
+          # The bash and jq derivations cannot call this and stay hand-written;
+          # test_host_canonicalisation_does_not_drift_between_extractors holds all
+          # three to one table. See the comment on npm_age::registry_host.
+          #
+          # It canonicalises and decides nothing else. Whether a string with no
+          # scheme names a location at all is the CALLER's question, and the two
+          # answer it differently on purpose: yarn's url_host() returns "" for
+          # one and never calls this, parse_pnpm_lock passes whatever the tarball
+          # key holds. Do not fold that gate in here — it would change which
+          # entries are tagged. has_scheme() is here so the gate and the strip
+          # read ONE pattern for what a scheme is and cannot disagree about it.
+          #
+          # Single quotes are deliberate — this is awk, not shell — and the body
+          # has no apostrophes for the same reason the two programs it joins have
+          # none: one would end the literal. POSIX awk only; CI runs it on mawk.
+          # shellcheck disable=SC2016
+          NPM_AGE_AWK_CANON_HOST='
+              # Sets RLENGTH to the length of the `scheme://` prefix, which
+              # canon_host() uses to strip it.
+              function has_scheme(u) { return match(u, /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//) }
+              function canon_host(u,   scheme) {
+                scheme = u
+                if (sub(/:\/\/.*$/, "", scheme)) scheme = tolower(scheme); else scheme = ""
+                if (has_scheme(u)) u = substr(u, RLENGTH + 1)
+                # The authority ends at the FIRST of `/`, `?` or `#` (RFC 3986),
+                # not at `/` alone. Cutting only at `/` let a URL with no path but
+                # a query or fragment carrying `@` reach the userinfo strip below,
+                # where the LAST `@` wins: `https://attacker.example?x=@npmjs` read
+                # as npmjs while the fetch went to attacker.example — the very
+                # impersonation the strip exists to defeat, one delimiter over.
+                # `\\` as well: WHATWG URL parsing — Node, and so every fetcher
+                # here — ends the authority of an https URL at a backslash, so
+                # `attacker.example\@registry.npmjs.org` is fetched from
+                # attacker.example while the last-`@` strip below would read npmjs.
+                sub(/[\/?#\\].*$/, "", u)
+                # Percent-encoding in the USERINFO is legal and inert — RFC 3986
+                # makes it mandatory for some characters, and `svc%40corp:tok@host`
+                # is the canonical way to write an email-style username, which is
+                # exactly what a credentialed private-registry lockfile carries.
+                # Refusing any `%` in the authority, as this once did, turned every
+                # such repo red. What CAN move the cut is an encoded delimiter that
+                # the fetcher decodes, and that only happens on the yarn
+                # `__archiveUrl` path, where pct_decode() has already applied the
+                # single pass yarn makes before this function sees the value. On
+                # every undecoded path a `%` in a host is simply not a host that
+                # matches anything.
+                #
+                # Userinfo, taking the LAST `@`: `user:pass@host` must compare as
+                # `host`, or a credentialed URL (which a private-registry lockfile
+                # can carry) is both a wrong-red and a credential echoed into the
+                # annotation, where safe_for_md escapes markdown but does not
+                # redact. It is the impersonation guard too —
+                # `https://registry.npmjs.org@attacker.example/...` reads as npmjs
+                # to a naive parse while the fetch goes to attacker.example. Only
+                # after the authority was cut off above, so an `@` in the path
+                # (every scoped package has one) is never read as the boundary.
+                sub(/^.*@/, "", u)
+                u = tolower(u)
+                # A default port is the same registry written two ways. The scheme
+                # only SELECTS which port is redundant; it is not compared.
+                if (scheme == "https") sub(/:443$/, "", u)
+                if (scheme == "http")  sub(/:80$/, "", u)
+                # Not a separate registry: see the comment on npm_age::registry_host.
+                if (u == "registry.yarnpkg.com") u = "registry.npmjs.org"
+                return u
+              }
+          '
+
           npm_age::pkglock_pins() {
             # jq's stderr is deliberately NOT suppressed: when this fails the
             # caller turns it into a red build, and the operator needs jq's reason
@@ -1838,7 +1913,7 @@ jobs:
             NPM_AGE_WANT_HOST="$NPM_AGE_WANT_HOST" \
             NPM_AGE_YARN_DEFAULT_HOST="$NPM_AGE_YARN_DEFAULT_HOST" \
             NPM_AGE_YARN_SCOPE_MAP="$NPM_AGE_YARN_SCOPE_MAP" \
-            awk '
+            awk "$NPM_AGE_AWK_CANON_HOST"'
               # A selector naming a path in this repo`s own tree rather than an
               # artifact fetched from somewhere. Source reviewed in the same PR is
               # not vendoring; a tarball behind such a path is, which makes this a
@@ -1869,7 +1944,7 @@ jobs:
                 }
               }
               # Normalised host of an absolute URL, or "" when it names none —
-              # which is the test for whether a SCHEME was stripped, i.e. whether
+              # which is the test for whether a SCHEME is present, i.e. whether
               # the value named a location at all, NOT whether that scheme was
               # https. Gating on https looks like the `startswith("https://")` in
               # NPM_AGE_JQ_ENTRIES but does not behave like it: that one is a
@@ -1879,60 +1954,20 @@ jobs:
               # resolved over plain `http://` from an internal host is the homonym
               # false pass one scheme over.
               #
-              # All four normalisations npm_age::registry_host applies, in its
-              # order, and in ONE place so the v1 `resolved` rule and the Berry
-              # `__archiveUrl` rule cannot drift apart. Every host these are
-              # compared against goes through that function, so a derivation that
-              # skips one reports the same registry written two ways as two
-              # registries — a wrong-RED on a repo squarely on its configured
-              # registry.
+              # The normalising itself is canon_host(), defined once in
+              # NPM_AGE_AWK_CANON_HOST and shared with npm_age::parse_pnpm_lock:
+              # every step npm_age::registry_host applies, in its order. Both the
+              # v1 `resolved` rule and the Berry `__archiveUrl` rule come through
+              # here, so the gate and the normalising are each in one place for
+              # them. Everything after the host is discarded, so the `#<sha>`
+              # fragment yarn appends is irrelevant.
               #
-              # Userinfo first, taking the LAST `@`: `user:pass@host` must compare
-              # as `host`, or a credentialed URL (which a private-registry
-              # lockfile can carry) is both a wrong-red and a credential echoed
-              # into the annotation, where safe_for_md escapes markdown but does
-              # not redact. It is the impersonation guard too —
-              # `https://registry.npmjs.org@attacker.example/...` reads as npmjs
-              # to a naive parse while yarn fetches from attacker.example.
-              #
-              # Everything after the host is discarded, so the `#<sha>` fragment
-              # yarn appends is irrelevant. A default port is the same registry
-              # written two ways; see registry_host for why yarnpkg.com is not a
-              # separate registry.
               # Callers strip any trailing \r before calling — they must, because
               # their own quote-stripping depends on it — so CRLF is handled in
               # one layer rather than two that can disagree.
-              function url_host(u,   scheme) {
-                scheme = u
-                if (sub(/:\/\/.*$/, "", scheme)) scheme = tolower(scheme); else scheme = ""
-                if (!sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", u)) return ""
-                # The authority ends at the FIRST of `/`, `?` or `#` (RFC 3986),
-                # not at `/` alone. Cutting only at `/` let a URL with no path but
-                # a query or fragment carrying `@` reach the userinfo strip below,
-                # where the LAST `@` wins: `https://attacker.example?x=@npmjs` read
-                # as npmjs while the fetch went to attacker.example — the very
-                # impersonation the strip exists to defeat, one delimiter over.
-                # `\\` as well: WHATWG URL parsing — Node, and so every fetcher
-                # here — ends the authority of an https URL at a backslash, so
-                # `attacker.example\@registry.npmjs.org` is fetched from
-                # attacker.example while the last-`@` strip below would read npmjs.
-                sub(/[\/?#\\].*$/, "", u)
-                # Percent-encoding in the USERINFO is legal and inert — RFC 3986
-                # makes it mandatory for some characters, and `svc%40corp:tok@host`
-                # is the canonical way to write an email-style username, which is
-                # exactly what a credentialed private-registry lockfile carries.
-                # Refusing any `%` in the authority, as this once did, turned every
-                # such repo red. What CAN move the cut is an encoded delimiter that
-                # the fetcher decodes, and that only happens on the `__archiveUrl`
-                # path, where pct_decode() has already applied the single pass yarn makes
-                # before this function sees the value. On every undecoded path a
-                # `%` in a host is simply not a host that matches anything.
-                sub(/^.*@/, "", u)
-                u = tolower(u)
-                if (scheme == "https") sub(/:443$/, "", u)
-                if (scheme == "http")  sub(/:80$/, "", u)
-                if (u == "registry.yarnpkg.com") u = "registry.npmjs.org"
-                return u
+              function url_host(u) {
+                if (!has_scheme(u)) return ""
+                return canon_host(u)
               }
               # Records a host against the BLOCK. yarn writes one `resolved` per
               # block and one `__archiveUrl` per resolution; TWO naming different
@@ -1973,12 +2008,12 @@ jobs:
                 gsub(/%40/, "@", s)
                 # `%5C` decodes to a backslash, which the fetcher treats as `/`
                 # in an https URL. Decoded straight to `/` so the authority cut
-                # in url_host() lands where the fetcher puts it.
+                # in canon_host() lands where the fetcher puts it.
                 gsub(/%5[Cc]/, "/", s)
                 # `?` and `#` too — exactly ONE decoding pass, which is what yarn
                 # applies to this value before fetching. An encoded delimiter
                 # (`%3F%40npmjs`) otherwise hides the end of the authority from
-                # url_host(), and the last-`@` strip hands the host to the
+                # canon_host(), and the last-`@` strip hands the host to the
                 # attacker. One pass only: a double-encoded `%253F` reaches the
                 # fetcher as a literal `%3F`, which is inert in userinfo and
                 # invalid in a host, so decoding it here would be MORE eager than
@@ -2052,6 +2087,13 @@ jobs:
                 # configured registry would assert something the lockfile never
                 # said. The ways that happens are not exotic — a key spelling the
                 # rule below does not match (yarn v1 accepts `resolved`,
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # `"resolved"`, `resolved:` and `"resolved":` for the same key,
                 # and decodes escapes in keys, so no literal match is complete), a
                 # git conflict marker splitting the block at column 0, or an
@@ -2080,13 +2122,6 @@ jobs:
                 # instead would tag an honest per-package override, and the attack
                 # it is imagined to stop does not work: redirecting `__archiveUrl`
                 # at the public registry makes yarn fetch the PUBLIC package, not
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # the freshly published private one, so the attacker loses the
                 # very artifact they wanted shipped (and the block`s `checksum:`
                 # would reject it besides). See Known limitations.
@@ -2416,8 +2451,8 @@ jobs:
                 sub(/^[[:space:]]*"?resolved"?[[:space:]]*:?[[:space:]]*/, "", url)
                 gsub(/^"|"$/, "", url)
                 # Host derivation, the https-vs-any-scheme decision and the four
-                # normalisations all live in url_host() — one copy, shared with
-                # the Berry `__archiveUrl` rule. See its comment.
+                # normalisations are reached through url_host() — one path, shared
+                # with the Berry `__archiveUrl` rule. See its comment.
                 # Recorded even when the value names no host, because the
                 # forgery-in-a-Berry-block test above is about the LINE being
                 # present, not about what it resolved to.
@@ -2726,7 +2761,7 @@ jobs:
             NPM_AGE_WANT_HOST="$NPM_AGE_WANT_HOST" \
             NPM_AGE_DEFAULT_HOST="$NPM_AGE_DEFAULT_HOST" \
             NPM_AGE_SCOPE_MAP="$NPM_AGE_SCOPE_MAP" \
-            awk -v mode="$mode" '
+            awk -v mode="$mode" "$NPM_AGE_AWK_CANON_HOST"'
               BEGIN {
                 want_host = ENVIRON["NPM_AGE_WANT_HOST"]
                 default_host = ENVIRON["NPM_AGE_DEFAULT_HOST"]
@@ -2782,7 +2817,7 @@ jobs:
               # actually read — falls back to what .npmrc configured for its scope
               # (or, failing that, the default registry). An empty return means
               # "cannot tell", which the caller turns into the tag.
-              function pending_host(   url, scope, p, scheme) {
+              function pending_host(   url, scope, p) {
                 # Ambiguous entries are never called on-registry. Two direct-child
                 # resolution lines, or two tarballs inside one, and this parser
                 # cannot know which pnpm would install from — and first-wins and
@@ -2805,30 +2840,10 @@ jobs:
                   sub(/[,}].*$/, "", url)
                   gsub(/^[[:space:]]+|[[:space:]]+$/, "", url)
                   url = unquote(url)
-                  scheme = url
-                  if (sub(/:\/\/.*$/, "", scheme)) scheme = tolower(scheme); else scheme = ""
-                  sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", url)
-                  # Authority ends at the first of `/`, `?` or `#` — see url_host()
-                  # in npm_age::yarn_pins. Percent-encoding in the userinfo that the
-                  # strip below removes is legal and inert; a `%` left in a host
-                  # matches no configured registry and is tagged by mismatch.
-                  # And at `\\`, for the reason given there.
-                  sub(/[\/?#\\].*$/, "", url)
-                  # Userinfo, as npm_age::registry_host does: `user:pass@host` must
-                  # compare as `host`, or a credentialed URL is both a wrong-red
-                  # and a string that gets echoed into the log.
-                  sub(/^.*@/, "", url)
-                  # Lower-cased and alias-folded to match npm_age::registry_host,
-                  # which normalises every host these are compared against. See
-                  # the comment there for why yarnpkg.com is not a separate
-                  # registry.
-                  url = tolower(url)
-                  # Default ports, as npm_age::registry_host does — the same
-                  # registry written two ways must not read as two.
-                  if (scheme == "https") sub(/:443$/, "", url)
-                  if (scheme == "http")  sub(/:80$/, "", url)
-                  if (url == "registry.yarnpkg.com") url = "registry.npmjs.org"
-                  return url
+                  # Called UNCONDITIONALLY, scheme or none: whatever the tarball
+                  # key holds is where pnpm fetches from. See the note on
+                  # NPM_AGE_AWK_CANON_HOST for why yarn gates the same call.
+                  return canon_host(url)
                 }
 
                 # POSITIVE EVIDENCE, or the tag. Until now "I saw no tarball" and
@@ -2960,6 +2975,13 @@ jobs:
                   #
                   # res_seen and the indent overlap on purpose. pnpm writes
                   # `resolution:` as the FIRST body line, so under a key that has
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   # one, res_seen alone already ignores anything deeper that
                   # follows; the indent is what stops a nested line from being
                   # counted under a key that has NO resolution of its own — which
@@ -2971,13 +2993,6 @@ jobs:
                   # Deliberately STRICTER than the `resolution:` grep the zero-pin
                   # path runs. That one is a fail-closed sentinel and wants to
                   # over-detect; this one triggers a failure by itself and wants
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                   # to under-detect. Each errs toward safety in its own direction.
                   if (!res_seen && $0 ~ /^    resolution:/) { resolutions++; res_seen = 1 }
 
@@ -3796,6 +3811,13 @@ jobs:
           #   With no .yarnrc.yml that value IS the configured registry, so Berry
           #   entries stay untagged and adopting this still cannot flip a Berry
           #   repo green -> red.
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   `__archiveUrl` BEATS .yarnrc.yml where the two disagree, which is the
           #   one place in this file that resolves conflicting evidence instead of
           #   refusing it. Deliberate: `__archiveUrl` is not a claim about the
@@ -3806,13 +3828,6 @@ jobs:
           #   does not work — redirecting `__archiveUrl` at the public registry
           #   fetches the PUBLIC package, not the freshly published private one.
           #   That argument is HOST-level only, as is every comparison here: the
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   URL's path is not checked against the entry's name and version, so
           #   an `__archiveUrl` on the configured host naming a different tarball
           #   is aged as the entry it sits under. Not new — v1 `resolved` has
@@ -4082,8 +4097,8 @@ jobs:
           # reading `registry=https://Registry.NpmJS.org` would otherwise be
           # declared a different registry from the configured one and push every
           # integrity-only entry down the off-registry path — a red check on a
-          # repo that is squarely on npmjs. Every other derivation — the pnpm awk,
-          # the package-lock jq and the yarn awk — lower-cases to match.
+          # repo that is squarely on npmjs. Every other derivation — the
+          # package-lock jq and the two awk extractors — lower-cases to match.
           # registry.yarnpkg.com is folded to registry.npmjs.org. It is not a
           # different registry — it is an alias in front of the public npm
           # registry, serving the same packages under the same names, and yarn v1
@@ -4092,13 +4107,16 @@ jobs:
           # into package-lock.json) has every pin tagged off-registry and fails
           # the all-skipped guard — a red check for pins that are squarely on
           # npmjs. The fold has to be applied to the ENTRY host too, not just
-          # here: the pnpm awk, the package-lock jq and the yarn awk each repeat
-          # it, because their host never passes through this function. All three
-          # are repeat sites — change the fold and change them together, and the
-          # same holds for the three normalisations above it. That is enforced
-          # rather than asked for by a drift canary that drives this function and
-          # the three entry-side copies over one shared host set, and goes red if
-          # any one of them drops any one step.
+          # here, because an entry host never passes through this function. It
+          # is written out in two more places: the package-lock jq
+          # (NPM_AGE_JQ_ENTRIES) and canon_host(), the one awk function in
+          # NPM_AGE_AWK_CANON_HOST that the yarn and the pnpm extractor both call.
+          # Bash, jq and awk cannot share code, so those are repeat sites — change
+          # the fold and change all three together, and the same holds for the
+          # three normalisations above it. That is enforced rather than asked for
+          # by a drift canary that drives this function and the three entry-side
+          # extractors over one shared host set, and goes red if any one of them
+          # drops any one step.
           #
           # Fenced by: test_host_canonicalisation_does_not_drift_between_extractors
           #
@@ -4109,7 +4127,7 @@ jobs:
           # `test_dir` mentioned in any lib comment is not mistaken for one.
           #
           # Scope, so the next person does not over-trust it: the canary covers the
-          # four URL->host derivations only. npm_age::parse_pnpm_lock has a FIFTH
+          # URL->host derivations only. npm_age::parse_pnpm_lock has ONE MORE
           # host comparison — the v5 registry-qualified KEY arm — which prefix-
           # matches a raw lockfile key against this function's already-canonical
           # output, so a key qualified `registry.yarnpkg.com/`, `Registry.NpmJS.org/`
@@ -4674,6 +4692,13 @@ jobs:
           }
 
           # A scope whose registry could not be read. The default-host warning
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # above never sees these — the poison sits in the scope map — so without
           # this every `@acme` pin is tagged and, if those are the only new
           # dependencies, the all-skipped guard fails the PR with nothing in the
@@ -4688,13 +4713,6 @@ jobs:
           # scope once, and only when the entry in effect for it is unreadable.
           # The global IFS holds no space, hence the explicit split.
           #
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # One warning per scope, as before, each naming the FILE the value is
           # in: <dir> is only where the lockfile is, and the value may sit in any
           # config file between it and the working directory.
@@ -5546,6 +5564,13 @@ jobs:
 
                 local ts
                 local fetch_rc=0
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 4 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 ts=$(npm_age::published_at "$pkg" "$ver") || fetch_rc=$?
 
                 case "$fetch_rc" in
@@ -5563,13 +5588,6 @@ jobs:
                     # at). Skip with warning; no way to verify age from metadata
                     # this run can read.
                     echo "::warning file=$(preflight::safe_for_md "$file")::${pkg}@${safe_ver} — not found on ${NPM_AGE_WANT_HOST} (private or unpublished; skipped)"
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 4 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                     echo "| \`${pkg}\` | ${safe_ver} | — | :warning: skipped (404 — private or unpublished) |" >> "$GITHUB_STEP_SUMMARY"
                     skipped_count=$((skipped_count + 1))
                     skipped_private=$((skipped_private + 1))
