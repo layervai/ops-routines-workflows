@@ -4727,13 +4727,18 @@ jobs:
             case "$dir" in
               /*|*..*) dir="." ;;
             esac
+            # `${dirs[@]+"${dirs[@]}"}`, not a bare "${dirs[@]}": the array is
+            # empty on the first pass of the loop, and stays empty when the
+            # lockfile sits in the working directory. Under `set -u` bash before
+            # 4.4 calls that expansion an unbound variable, and macOS /bin/bash is
+            # 3.2. tests/bash32_portability_test.sh runs this function there.
             local -a dirs=()
             d="$dir"
             while [ "$d" != "." ] && [ "$d" != "/" ]; do
-              dirs=("$d" "${dirs[@]}")
+              dirs=("$d" ${dirs[@]+"${dirs[@]}"})
               d=$(dirname "$d")
             done
-            dirs=("." "${dirs[@]}")
+            dirs=("." ${dirs[@]+"${dirs[@]}"})
 
             # `IFS=` on each read so neither value is trimmed: the global IFS holds
             # \n and \t, and the map's own separator is a space, which read would
@@ -5546,8 +5551,6 @@ jobs:
                   off_remedy="registry_url is already set to ${REGISTRY_URL}, so these resolve somewhere else again — check it names the registry this repo actually installs from; if that host serves no packument API this check cannot age them, and 'age-check-bypass' is the remaining way out"
                 fi
                 echo "::error::All ${skipped_count} package(s) in this change were skipped, so none could be age-verified. ${offregistry_count} of them resolve to a registry other than ${NPM_AGE_WANT_HOST}: ${off_remedy}. Failing to avoid a false pass."
-              elif [ "$skipped_private" -eq "$skipped_count" ] && [ "$failed" = false ]; then
-                all_skipped_reason="no pin in this change could be verified against ${NPM_AGE_WANT_HOST} (internal scope, unpublished, or a registry this check was not pointed at)"
           OPS_ROUTINES_AGE_CHECK_LIB
 
       - name: Write the age-check library — lib/age-check-npm.sh (part 4 of 4)
@@ -5555,6 +5558,8 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
           cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+              elif [ "$skipped_private" -eq "$skipped_count" ] && [ "$failed" = false ]; then
+                all_skipped_reason="no pin in this change could be verified against ${NPM_AGE_WANT_HOST} (internal scope, unpublished, or a registry this check was not pointed at)"
                 echo "::error::All ${skipped_count} package(s) in this change are absent from ${NPM_AGE_WANT_HOST} (internal scope, unpublished, or a registry this check was not pointed at), so none could be age-verified. Failing to avoid a false pass. If this repo installs from a private registry, pass registry_url naming it — the check then reads ages from there instead of dropping the gate. If the pins are genuinely unpublished, the 'age-check-bypass' label is the remaining way out."
               else
                 all_skipped_reason="no pin in this change could be verified"

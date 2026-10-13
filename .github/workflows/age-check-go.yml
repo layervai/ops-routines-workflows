@@ -2128,8 +2128,10 @@ jobs:
             fi
             # Public provenance is independently anchored by proxy.golang.org. The token
             # only raises GitHub's API rate limit; it grants no cross-repository trust.
+            # `auth` is empty without a token, and a bare "${auth[@]}" on an empty
+            # array is an unbound-variable error under `set -u` before bash 4.4.
             curl -fsS -m 10 --retry 2 --retry-delay 1 --retry-max-time 25 --retry-connrefused \
-              "${auth[@]}" \
+              ${auth[@]+"${auth[@]}"} \
               -H "Accept: application/vnd.github+json" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "${GITHUB_API_URL:-https://api.github.com}${path}"
@@ -2213,10 +2215,6 @@ jobs:
             IFS=$'\t' read -r repo expected_tag <<< "$coordinates"
 
             local info_json proxy_version origin_vcs origin_url origin_hash origin_ref
-            info_json=$(go_age::proxy_file "$module" "$version" info) || {
-              echo "First-party release is not available from proxy.golang.org: ${module}@${version}" >&2
-              return 1
-            }
           OPS_ROUTINES_AGE_CHECK_LIB
 
       - name: Write the age-check library — lib/age-check-go.sh (part 2 of 2)
@@ -2224,6 +2222,10 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
           cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-go.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+            info_json=$(go_age::proxy_file "$module" "$version" info) || {
+              echo "First-party release is not available from proxy.golang.org: ${module}@${version}" >&2
+              return 1
+            }
             IFS=$'\t' read -r proxy_version origin_vcs origin_url origin_hash origin_ref <<< "$(printf '%s' "$info_json" \
               | jq -er '[.Version, .Origin.VCS, .Origin.URL, .Origin.Hash, .Origin.Ref] | map(. // "") | @tsv')" || {
                 echo "First-party proxy metadata is missing exact origin fields: ${module}@${version}" >&2
