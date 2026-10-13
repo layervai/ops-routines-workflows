@@ -90,7 +90,9 @@ jobs:
           #   the same revision its three-dot `git diff` compares against
           # - One comparator for every parser that reads a base image
           #   (`preflight::new_lines_since_base`): probe, read, parse both images,
-          #   difference — so the ecosystems cannot drift on those details
+          #   difference — so the ecosystems cannot drift on those details. A
+          #   caller that parsed the head already hands those lines in, and can
+          #   take the base's back, rather than have either image parsed twice
           # - Step-summary helpers so the Actions UI never shows an empty panel
           #   on early-exit paths
           # - Shared age comparison + ISO-8601 parsing to keep those callers
@@ -405,8 +407,32 @@ jobs:
           # same way this function does before reading it. The caller owns cleanup —
           # and, if it reuses one path across manifests, truncation between them:
           # nothing here empties a file it did not write to.
+          #
+          # Optional 5th argument <base_lines_out>: a caller-owned path. When given,
+          # the lines <parser_fn> yielded for the base image are written THERE, so a
+          # caller that classifies the base side (pnpm) reads them back instead of
+          # parsing <base_blob> a second time. Same ownership rules as <base_blob>,
+          # and likewise untouched when the base has no image; an image that parsed
+          # to nothing leaves it zero bytes. A write that fails is rc 2: a short
+          # file would hand the caller a base set it cannot tell from a real one.
+          #
+          # Optional 6th argument <head_lines_in>: a caller-owned path holding the
+          # lines <parser_fn> ALREADY yielded for the head image of <file>. When
+          # given, they are read from it and the parser is not run on the head — for
+          # a caller that had to parse the head first for a triage of its own (pnpm
+          # again). The caller vouches that they are that parser's output for that
+          # file, complete, and that the file is in the working tree: this function
+          # cannot check the first two and, given lines, does not look for the file,
+          # so lines handed in for a DELETED file would be promoted where the
+          # parser path reports nothing. An unreadable path is
+          # rc 1, the head-side code. The base side is read and parsed regardless.
+          #
+          # An empty string is "not given" for all three, so a caller MUST check the
+          # mktemp it gets a path from: an empty <base_lines_out> writes nothing for
+          # it to read back.
           preflight::new_lines_since_base() {
             local file="$1" base_rev="$2" parser_fn="$3" base_blob="${4:-}"
+            local base_lines_out="${5:-}" head_lines_in="${6:-}"
 
             # Two coding errors, and both `exit` rather than return: a misspelled
             # parser name would otherwise fail per-image below and be rendered by
@@ -511,6 +537,13 @@ jobs:
                 echo "::error file=${file}::${file} at the merge base (${base_rev}) could not be parsed; cannot determine which entries this branch introduces" >&2
                 return 2
               fi
+              # Guarded like the emit at the bottom: an image that parsed to nothing
+              # is zero bytes, not a blank line a line-counting caller would read as
+              # one record.
+              if [ -n "$base_lines_out" ]; then
+                { [ -z "$base_lines" ] || printf '%s\n' "$base_lines"; } > "$base_lines_out" \
+                  || { echo "::error file=${file}::could not write the parsed base image of ${file} to scratch space; cannot determine which entries this branch introduces" >&2; return 2; }
+              fi
             fi
             # An ABSENT base image is not an error — it is what a file this branch
             # adds looks like, and an empty base set promotes the whole head image,
@@ -519,8 +552,15 @@ jobs:
             # The head is read from the WORKING TREE, deliberately: main() selects
             # targets by working-tree presence, and the working tree is what the job
             # would actually install. A file this branch DELETES introduces nothing.
+            # A caller that already ran the parser on it hands the lines in instead.
             local head_lines=""
-            if [ -f "$file" ]; then
+            if [ -n "$head_lines_in" ]; then
+              # `-r` first, and a builtin read: under `set -e`, bash 5.2 was seen to
+              # exit the shell on a `$(< file)` whose file is missing instead of
+              # handing its status to the `||` — and npm declares no `cat`.
+              { [ -r "$head_lines_in" ] && head_lines=$(< "$head_lines_in"); } \
+                || { echo "::error file=${file}::could not read back the parsed entries of ${file}; refusing to report an empty work-list" >&2; return 1; }
+            elif [ -f "$file" ]; then
               head_lines=$("$parser_fn" < "$file") \
                 || { echo "::error file=${file}::${file} could not be parsed; refusing to report an empty work-list" >&2; return 1; }
             fi
@@ -947,6 +987,13 @@ jobs:
           #
           # Unlike validate_min_age_days this FALLS BACK rather than aborting:
           # MIN_AGE_DAYS is the security threshold, while these are tuning knobs
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/age-check-actions.sh (part 1 of 2)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # (work-list caps, budgets), and a fat-fingered value must not take a
           # supply-chain check offline. The warning goes to stderr because callers
           # read the value from stdout.
@@ -1008,13 +1055,6 @@ jobs:
             printf '%s' "$out"
           }
 
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/age-check-actions.sh (part 1 of 2)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # ----- Step-summary helpers --------------------------------------------------
 
           # `GITHUB_STEP_SUMMARY` is provided by GitHub Actions; default to
@@ -1899,6 +1939,13 @@ jobs:
 
             # `--filter=blob:none` skips file contents; a server without partial-clone
             # support ignores it with a warning rather than failing. `--depth=1` keeps
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-actions.sh (part 2 of 2)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-actions.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # it to the single pinned commit. `timeout` bounds a hung TLS session so one
             # unreachable host cannot burn the whole job's budget: a measured
             # single-commit fetch is ~0.6s even for a large action repo, so 30s leaves
@@ -1942,13 +1989,6 @@ jobs:
               *"unknown option"*"filter"*)
                 filter_rejected=true ;;
             esac
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-actions.sh (part 2 of 2)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-actions.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             if [ "$rc" -ne 0 ] && [ "$filter_rejected" = true ]; then
               actions_age::log_detail "anonymous git" "$fetch_err"
               echo "  retrying the anonymous fetch without --filter (server or client lacks partial clone)" >&2
