@@ -1827,6 +1827,34 @@ jobs:
                else "offregistry\t" + $pin end)
               end'
 
+          # unquote(s): s without one layer of MATCHING quotes, double or single;
+          # anything else is returned untouched. ONE definition for the two awk
+          # programs that read YAML scalars — npm_age::parse_pnpm_lock here and
+          # npm_age::yarnrc_registries in age-check-npm.sh, which sources this
+          # file at its bottom: after that function is defined, before anything
+          # calls it. Each prefixes it the way NPM_AGE_AWK_CANON_HOST is prefixed.
+          #
+          # Matching is the point: npm_age::npmrc_registries strips UNMATCHED
+          # quotes with a `gsub(/^"|"$/…)` of its own, which an ini value can
+          # afford and a YAML one cannot. Do not point that one here.
+          #
+          # A variable of its own rather than a third function in
+          # NPM_AGE_AWK_CANON_HOST: .yarnrc.yml parsing derives no hosts, and
+          # test_registry_fold_sites_are_the_ones_the_canary_drives counts the
+          # programs that prefix that variable as the ones that do.
+          #
+          # \047 is a single quote, spelled octal because an apostrophe would end
+          # this literal. POSIX awk only; CI runs it on mawk.
+          # shellcheck disable=SC2016
+          NPM_AGE_AWK_UNQUOTE='
+              function unquote(s,   q) {
+                q = substr(s, 1, 1)
+                if ((q == "\"" || q == "\047") && substr(s, length(s), 1) == q)
+                  s = substr(s, 2, length(s) - 2)
+                return s
+              }
+          '
+
           # canon_host(u): the host a URL names, reduced the way
           # npm_age::registry_host reduces the configured one, so the two compare
           # by string equality. ONE definition for both awk extractors —
@@ -2062,6 +2090,13 @@ jobs:
               # them. Everything after the host is discarded, so the `#<sha>`
               # fragment yarn appends is irrelevant.
               #
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               # Callers strip any trailing \r before calling — they must, because
               # their own quote-stripping depends on it — so CRLF is handled in
               # one layer rather than two that can disagree.
@@ -2085,13 +2120,6 @@ jobs:
                 # empty, so the readable second one landed with no conflict, and
                 # the entry was untagged under one ordering and tagged under the
                 # other. That is the exact asymmetry the two-readable-hosts rule
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # rejects ("picking first or last would each be a false pass under
                 # the opposite ordering"), and the `__archiveUrl` path already
                 # refuses an unreadable value unconditionally — so block_badloc
@@ -2928,6 +2956,13 @@ jobs:
           # `resolutions` counter below). There is no off-registry count, because
           # such an entry is PRINTED in entries mode, which makes the zero-pin
           # path that reads "counts" unreachable for it; the vendored count is
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # kept because that path DOES need it — a vendored record is not a pin,
           # so a fully vendored lockfile still has no pins to gate. The caller
           # reads "counts" on the zero-pin path, to tell a format it could not
@@ -2951,13 +2986,6 @@ jobs:
               *) echo "::error::npm_age::parse_pnpm_lock: unknown mode '${mode}'" >&2; return 2 ;;
             esac
             # All three are set once at load time in age-check-npm.sh and narrowed
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # per target by npm_age::load_registry_config. default_host equalling
             # want_host is the honest reading of "no .npmrc evidence": with nothing
             # saying the lockfile was written against some OTHER registry, an
@@ -2969,7 +2997,7 @@ jobs:
             NPM_AGE_WANT_HOST="$NPM_AGE_WANT_HOST" \
             NPM_AGE_DEFAULT_HOST="$NPM_AGE_DEFAULT_HOST" \
             NPM_AGE_SCOPE_MAP="$NPM_AGE_SCOPE_MAP" \
-            awk -v mode="$mode" "$NPM_AGE_AWK_CANON_HOST"'
+            awk -v mode="$mode" "$NPM_AGE_AWK_CANON_HOST""$NPM_AGE_AWK_UNQUOTE"'
               BEGIN {
                 want_host = ENVIRON["NPM_AGE_WANT_HOST"]
                 default_host = ENVIRON["NPM_AGE_DEFAULT_HOST"]
@@ -2980,15 +3008,8 @@ jobs:
                 }
               }
 
-              # pnpm quotes values containing YAML-special characters. \047 is a
-              # single quote, spelled octal so this program stays inside one pair
-              # of shell single quotes.
-              function unquote(s,   q) {
-                q = substr(s, 1, 1)
-                if ((q == "\"" || q == "\047") && substr(s, length(s), 1) == q)
-                  s = substr(s, 2, length(s) - 2)
-                return s
-              }
+              # unquote() is NPM_AGE_AWK_UNQUOTE, prefixed above: pnpm quotes
+              # values containing YAML-special characters.
 
               # Position of the (skip+1)-th `tarball:` that is actually a MAP KEY —
               # preceded by "{", "," or whitespace and followed by whitespace — or
@@ -3824,6 +3845,13 @@ jobs:
           #   still not handled is an alias whose target is not a registry release
           #   — `pkg@npm:other@github:user/repo` — which the protocol allowlist
           #   drops rather than mis-attributing. Packages nested under a non-root
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   `node_modules` (a transitive dep pinned to a different version than
           #   the hoisted one) ARE handled: the package name is the path segment
           #   after the LAST `node_modules/`.
@@ -3839,13 +3867,6 @@ jobs:
           #   change touching only private pins reaches the all-skipped guard and
           #   fails. That failure is correct (nothing could be verified) but it is
           #   newly common, so the guard names the cause — and, since the registry
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   is now read from the resolution, points at `registry_url` rather than
           #   at a bypass. A wholly-private lockfile CAN be gated now, by naming
           #   that registry; what cannot be gated is one whose registry this runner
@@ -4562,18 +4583,10 @@ jobs:
             # npm_age::npmrc_registries: both come from the hand-authoring
             # environments this file explicitly expects, and a BOM left in place
             # makes a first-line `npmRegistryServer` match nothing at all.
-            sed -e $'1s/^\xef\xbb\xbf//' -e 's/\r$//' "$file" | awk '
-              # Strips one layer of matching quotes. \047 is a single quote,
-              # spelled octal so this program stays inside one pair of shell
-              # single quotes. Twin of the unquote() in npm_age::parse_pnpm_lock —
-              # NOT of npm_age::npmrc_registries, whose `gsub(/^"|"$/…)` strips
-              # UNMATCHED quotes, which YAML values cannot afford.
-              function unquote(s,   q) {
-                q = substr(s, 1, 1)
-                if ((q == "\"" || q == "\047") && substr(s, length(s), 1) == q)
-                  s = substr(s, 2, length(s) - 2)
-                return s
-              }
+            sed -e $'1s/^\xef\xbb\xbf//' -e 's/\r$//' "$file" | awk "$NPM_AGE_AWK_UNQUOTE"'
+              # unquote() is NPM_AGE_AWK_UNQUOTE from _npm-lockfile-parsers.sh,
+              # shared with npm_age::parse_pnpm_lock. That file is sourced at the
+              # bottom of this one, which is before anything calls this function.
               # A registry key WAS present; this decides whether its value can be
               # used. One definition for both emit points below, so the default
               # and the per-scope rule cannot drift apart.
@@ -4663,6 +4676,13 @@ jobs:
                 # anchor needs, so a COMMENT-ONLY value (`npmScopes:  # our
                 # scopes`, or `  acme:  # private`) survived as a non-empty value,
                 # was read as a flow mapping, and poisoned the default or that
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # scope with ?unreadable — a red run on honest hand-written config,
                 # which is the failure the strip exists to prevent one line up.
                 sub(/[[:space:]]+#.*$/, "", val)
@@ -4676,13 +4696,6 @@ jobs:
                 # Column 0 opens a section and ends any scope in progress. Only
                 # whether it is the `npmScopes` map is remembered — the same shape
                 # as in_packages in npm_age::parse_pnpm_lock — which is what keeps
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # an npmRegistryServer nested under some OTHER top-level map
                 # (`npmRegistries`, keyed by URL and holding auth) from being read
                 # as the default.
@@ -5554,6 +5567,13 @@ jobs:
                 registry_free_count=$((registry_free_count + 1))
                 echo "Nothing from a registry in ${file}; skipped via allow_registry_free"
                 # stdout on this path carries the vendored records that ARRIVED
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 4 of 4)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # (diff_pnpm_lock says why it still computes them), so the pass is
                 # not a blind one.
                 npm_age::report_vendored_arrivals "$safe_file" "$new_deps"
@@ -5567,13 +5587,6 @@ jobs:
               # summary ROW (record_unverifiable writes only the TSV), the failures
               # TSV (comment-on-failure is gated on it being non-empty), and the
               # summary FOOTER. The PR comment is the only one an operator sees
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 4 of 4)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               # without opening the log, so it has to name the right cause — a
               # base image that cannot be read is not a head-lockfile parse
               # failure, and telling that operator their lockfile is unreadable
