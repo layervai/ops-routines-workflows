@@ -74,7 +74,12 @@ on:
 
           pnpm only. package-lock.json and yarn.lock drop non-registry
           entries at parse time and report no new dependencies, so a
-          fully-vendored repo on those already passes. Setting this
+          fully-vendored repo on those already passes. Note the yarn
+          distinction: a git/tarball/`file:` entry is REJECTED AT THE
+          HEADER and never becomes a pin, whereas a registry-shaped entry
+          whose `resolved` names some other host is TAGGED and reported
+          as skipped — so a yarn repo on a private registry is not
+          "vendored" and needs `registry_url`, not this. Setting this
           changes nothing for them.
 
           Whether or not this is set, a pnpm entry NEWLY vendored on the
@@ -110,8 +115,14 @@ on:
           `resolution: {tarball: ...}`, or on the default/scoped
           registry in .npmrc for an integrity-only entry; package-lock
           and yarn v1 entries on the host of their `resolved` URL.
-          Berry (yarn v2+) writes a `resolution:` descriptor and no URL,
-          so it names no host and is NOT filtered.
+          Berry (yarn v2+) writes a `resolution:` descriptor rather than
+          a URL, so its registry comes from .yarnrc.yml
+          (`npmRegistryServer`, `npmScopes.<scope>.npmRegistryServer`) —
+          Berry does not read .npmrc. A `::__archiveUrl=` in the
+          resolution names a host outright and takes precedence. A Berry
+          repo with NO .yarnrc.yml is aged against this URL unchanged,
+          so setting registry_url alone does not gate it: that repo needs
+          both halves.
 
           This also gives a pnpm v5 repo on a private default registry a
           real gate. Those lockfiles qualify every key with the registry
@@ -1151,7 +1162,7 @@ jobs:
           #
           OPS_ROUTINES_AGE_CHECK_LIB
 
-      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/_npm-lockfile-parsers.sh (part 1 of 2)
+      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/_npm-lockfile-parsers.sh (part 1 of 3)
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
@@ -1346,11 +1357,12 @@ jobs:
           #              also leads with a kind column.
           #
           #              yarn_pins classifies yarn v1 from the entry's
-          #              `resolved` URL. BERRY entries name no host — they
-          #              carry a `resolution:` descriptor, not a location — so
-          #              they are emitted untagged and a Berry lockfile on a
-          #              private registry is still aged against the configured
-          #              registry. See Known limitations in age-check-npm.sh.
+          #              `resolved` URL. BERRY entries carry a `resolution:`
+          #              descriptor, not a location, so they name no host except
+          #              in the `::__archiveUrl=` form; otherwise their registry
+          #              comes from .yarnrc.yml. See Known limitations in
+          #              age-check-npm.sh for what that does and does not close —
+          #              it is the single copy of that reasoning, deliberately.
           #
           #   COMPARATOR npm_age::changed_pins — the npm NAME for
           #              preflight::new_lines_since_base, and nothing more: it
@@ -1484,7 +1496,7 @@ jobs:
                 then $e.value.name
                 else $path_name
                 end) + "@" + $e.value.version) as $pin
-            | (($seg[2] // "") | ascii_downcase | sub("^.*@"; "") | sub(":443$"; "")) as $h
+            | (($seg[2] // "") | sub("[?#\\\\].*$"; "") | ascii_downcase | sub("^.*@"; "") | sub(":443$"; "")) as $h
             | (if $h == "registry.yarnpkg.com" then "registry.npmjs.org" else $h end) as $host_c
             | if $host_c == $host then $pin
               else "offregistry\t" + $pin end'
@@ -1514,17 +1526,189 @@ jobs:
           # would reach the all-skipped guard with checked_count 0 and fail the
           # PR outright.
           npm_age::yarn_pins() {
-            awk -v want_host="$NPM_AGE_WANT_HOST" '
+            # The three configuration values reach awk through ENVIRON, not `-v`.
+            # POSIX makes a `-v` value undergo string-literal escape processing,
+            # so `\040` in a committed .yarnrc.yml value — which usable() passes,
+            # since a backslash is not whitespace — became a real space INSIDE
+            # awk, the space-separated scope map split there, and `@acme` bound
+            # to the token before it: `registry.npmjs.org\040x` read as npmjs.
+            # ENVIRON is byte-for-byte, so the invariant the shell side asserts
+            # about its own serialisation actually holds where it is consumed.
+            NPM_AGE_WANT_HOST="$NPM_AGE_WANT_HOST" \
+            NPM_AGE_YARN_DEFAULT_HOST="$NPM_AGE_YARN_DEFAULT_HOST" \
+            NPM_AGE_YARN_SCOPE_MAP="$NPM_AGE_YARN_SCOPE_MAP" \
+            awk '
+              # Deserialises NPM_AGE_YARN_SCOPE_MAP, the space-separated
+              # `@scope=host` list load_registry_config folds .yarnrc.yml into.
+              # Mirrors the BEGIN in npm_age::parse_pnpm_lock, which decodes the
+              # npm-side map the same way.
+              BEGIN {
+                want_host = ENVIRON["NPM_AGE_WANT_HOST"]
+                yarn_default_host = ENVIRON["NPM_AGE_YARN_DEFAULT_HOST"]
+                n = split(ENVIRON["NPM_AGE_YARN_SCOPE_MAP"], sm, " ")
+                for (i = 1; i <= n; i++) {
+                  eq = index(sm[i], "=")
+                  if (eq > 1) yarn_scope_host[substr(sm[i], 1, eq - 1)] = substr(sm[i], eq + 1)
+                }
+              }
+              # Normalised host of an absolute URL, or "" when it names none —
+              # which is the test for whether a SCHEME was stripped, i.e. whether
+              # the value named a location at all, NOT whether that scheme was
+              # https. Gating on https looks like the `startswith("https://")` in
+              # NPM_AGE_JQ_ENTRIES but does not behave like it: that one is a
+              # `select`, so a non-https entry is DROPPED and never checked,
+              # whereas returning "" here leaves the entry UNTAGGED, i.e. aged
+              # against a registry the evidence says it did not come from. A pin
+              # resolved over plain `http://` from an internal host is the homonym
+              # false pass one scheme over.
+              #
+              # All four normalisations npm_age::registry_host applies, in its
+              # order, and in ONE place so the v1 `resolved` rule and the Berry
+              # `__archiveUrl` rule cannot drift apart. Every host these are
+              # compared against goes through that function, so a derivation that
+              # skips one reports the same registry written two ways as two
+              # registries — a wrong-RED on a repo squarely on its configured
+              # registry.
+              #
+              # Userinfo first, taking the LAST `@`: `user:pass@host` must compare
+              # as `host`, or a credentialed URL (which a private-registry
+              # lockfile can carry) is both a wrong-red and a credential echoed
+              # into the annotation, where safe_for_md escapes markdown but does
+              # not redact. It is the impersonation guard too —
+              # `https://registry.npmjs.org@attacker.example/...` reads as npmjs
+              # to a naive parse while yarn fetches from attacker.example.
+              #
+              # Everything after the host is discarded, so the `#<sha>` fragment
+              # yarn appends is irrelevant. A default port is the same registry
+              # written two ways; see registry_host for why yarnpkg.com is not a
+              # separate registry.
+              # Callers strip any trailing \r before calling — they must, because
+              # their own quote-stripping depends on it — so CRLF is handled in
+              # one layer rather than two that can disagree.
+              function url_host(u,   scheme) {
+                scheme = u
+                if (sub(/:\/\/.*$/, "", scheme)) scheme = tolower(scheme); else scheme = ""
+                if (!sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", u)) return ""
+                # The authority ends at the FIRST of `/`, `?` or `#` (RFC 3986),
+                # not at `/` alone. Cutting only at `/` let a URL with no path but
+                # a query or fragment carrying `@` reach the userinfo strip below,
+                # where the LAST `@` wins: `https://attacker.example?x=@npmjs` read
+                # as npmjs while the fetch went to attacker.example — the very
+                # impersonation the strip exists to defeat, one delimiter over.
+                # `\\` as well: WHATWG URL parsing — Node, and so every fetcher
+                # here — ends the authority of an https URL at a backslash, so
+                # `attacker.example\@registry.npmjs.org` is fetched from
+                # attacker.example while the last-`@` strip below would read npmjs.
+                sub(/[\/?#\\].*$/, "", u)
+                # Percent-encoding in the USERINFO is legal and inert — RFC 3986
+                # makes it mandatory for some characters, and `svc%40corp:tok@host`
+                # is the canonical way to write an email-style username, which is
+                # exactly what a credentialed private-registry lockfile carries.
+                # Refusing any `%` in the authority, as this once did, turned every
+                # such repo red. What CAN move the cut is an encoded delimiter that
+                # the fetcher decodes, and that only happens on the `__archiveUrl`
+                # path, where pct_decode() has already applied the single pass yarn makes
+                # before this function sees the value. On every undecoded path a
+                # `%` in a host is simply not a host that matches anything.
+                sub(/^.*@/, "", u)
+                u = tolower(u)
+                if (scheme == "https") sub(/:443$/, "", u)
+                if (scheme == "http")  sub(/:80$/, "", u)
+                if (u == "registry.yarnpkg.com") u = "registry.npmjs.org"
+                return u
+              }
+              # Records a host against the BLOCK. yarn writes one `resolved` per
+              # block and one `__archiveUrl` per resolution; TWO naming different
+              # hosts is not a lockfile yarn produced, and whichever it would
+              # install from this parser cannot know — so the entry is tagged
+              # rather than aged against either. Fail closed on ambiguity: picking
+              # first or last would each be a false pass under the opposite
+              # ordering.
+              function note_host(u) { record_host(url_host(u)) }
+              function record_host(hh) {
+                # An unreadable location disagrees with a readable one in EITHER
+                # order. Testing only `block_host != ""` at the moment the
+                # unreadable value arrived caught `https://host` then `https://`
+                # but not the swap — an unreadable FIRST value left block_host
+                # empty, so the readable second one landed with no conflict, and
+                # the entry was untagged under one ordering and tagged under the
+                # other. That is the exact asymmetry the two-readable-hosts rule
+                # rejects ("picking first or last would each be a false pass under
+                # the opposite ordering"), and the `__archiveUrl` path already
+                # refuses an unreadable value unconditionally — so block_badloc
+                # makes the two derivations state the same rule.
+                if (hh == "") {
+                  if (block_host != "") block_conflict = 1
+                  block_badloc = 1
+                  return
+                }
+                if (block_badloc) block_conflict = 1
+                if (block_host != "" && hh != block_host) block_conflict = 1
+                block_host = hh
+              }
+              # Enough percent-decoding to read an authority out of the encoded
+              # `__archiveUrl` below: only the three characters that can appear in
+              # one. Anything left encoded stays literal, which makes the host not
+              # match and so fails closed rather than open.
+              function pct_decode(s) {
+                gsub(/%3[Aa]/, ":", s)
+                gsub(/%2[Ff]/, "/", s)
+                gsub(/%40/, "@", s)
+                # `%5C` decodes to a backslash, which the fetcher treats as `/`
+                # in an https URL. Decoded straight to `/` so the authority cut
+                # in url_host() lands where the fetcher puts it.
+                gsub(/%5[Cc]/, "/", s)
+                # `?` and `#` too — exactly ONE decoding pass, which is what yarn
+                # applies to this value before fetching. An encoded delimiter
+                # (`%3F%40npmjs`) otherwise hides the end of the authority from
+                # url_host(), and the last-`@` strip hands the host to the
+                # attacker. One pass only: a double-encoded `%253F` reaches the
+                # fetcher as a literal `%3F`, which is inert in userinfo and
+                # invalid in a host, so decoding it here would be MORE eager than
+                # the fetcher and misplace the cut the other way.
+                gsub(/%3[Ff]/, "?", s)
+                gsub(/%23/, "#", s)
+                return s
+              }
+              # Where a BERRY block came from. A Berry entry names no host — its
+              # `resolution:` is a descriptor, not a location — so this is
+              # configuration, read from .yarnrc.yml and arriving as
+              # yarn_default_host / yarn_scope_map, exactly as .npmrc arrives for
+              # an integrity-only pnpm entry. Berry does not read .npmrc, so the
+              # npm pair would be the wrong file to consult here.
+              #
+              # With no .yarnrc.yml, yarn_default_host IS want_host, so a Berry
+              # entry compares equal and stays untagged — the behaviour this
+              # parser had before it could read that file at all. Tagging on the
+              # ABSENCE of configuration would flip every default Berry repo
+              # green -> red, which is a rollout decision and not one this parser
+              # gets to make. It also means a fork PR can reach untagged by
+              # DELETING .yarnrc.yml, which is visible in review and the same door
+              # .npmrc already leaves open for pnpm.
+              #
+              # The scope is read from pending_name, which holds the alias TARGET:
+              # `string-width-cjs@npm:string-width@^4.2.0` buffers `string-width`.
+              # That is the package whose registry is in question, so an `@acme`
+              # override is looked up under the target rather than under the alias
+              # the repo happens to install it as.
+              function berry_host(   scope) {
+                if (substr(pending_name, 1, 1) == "@") {
+                  scope = pending_name
+                  sub(/\/.*$/, "", scope)
+                  if (scope in yarn_scope_host) return yarn_scope_host[scope]
+                }
+                return yarn_default_host
+              }
               # Emits the buffered entry, if any. A yarn block states its version
               # one line ABOVE the `resolved` URL that says where it came from, so
               # an entry cannot be printed on sight: it is held until that URL has
               # been read. Called before each new header and at EOF — the two ways
               # a block can end. Mirrors the flush() in npm_age::parse_pnpm_lock,
               # which buffers for exactly the same reason.
-              function flush() {
+              function flush(   h) {
                 if (pending_name == "") return
                 # block_conflict forces the tag regardless of host — see the
-                # `resolved` rule.
+                # `resolved` and `resolution:` rules.
                 #
                 # The default is TAGGED, not untagged, and that inversion is the
                 # load-bearing part. A yarn v1 block always carries a readable
@@ -1545,9 +1729,55 @@ jobs:
                 # indent. A file-level flag would be forgeable by dropping one
                 # `resolution:` line anywhere into a v1 lockfile, which yarn v1
                 # ignores and would have re-exempted every entry in it.
-                if (block_conflict ||
-                    (block_host == "" && !block_berry) ||
-                    (block_host != "" && block_host != want_host))
+                # A `resolved` URL is the more specific evidence and wins; only a
+                # Berry block, which can never carry one, falls back to what
+                # .yarnrc.yml configured. The hostless NON-Berry arm is untouched
+                # by that: such a block still fails closed, exactly as above.
+                #
+                # `__archiveUrl` therefore BEATS .yarnrc.yml, including when the
+                # two disagree, and that is deliberate rather than an oversight.
+                # Everywhere else here disagreeing evidence is refused, so the
+                # exception needs its reason: `__archiveUrl` is not a claim ABOUT
+                # the fetch, it IS the fetch — yarn downloads from that URL. An
+                # entry that names npmjs while .yarnrc.yml says the scope is
+                # private really is installed from npmjs, so aging it against
+                # npmjs describes the artifact that lands. Refusing the pair
+                # instead would tag an honest per-package override, and the attack
+                # it is imagined to stop does not work: redirecting `__archiveUrl`
+                # at the public registry makes yarn fetch the PUBLIC package, not
+                # the freshly published private one, so the attacker loses the
+                # very artifact they wanted shipped (and the block`s `checksum:`
+                # would reject it besides). See Known limitations.
+                # `resolved` is a key BERRY never writes — that asymmetry is why
+                # it can be trusted as authority for v1. Inside a Berry block it is
+                # therefore a forgery, and the mirror of the rule already applied
+                # to Berry markers: a marker the OTHER format also writes is not a
+                # format signal, it is a bypass. Without this, one added
+                # `resolved "https://registry.npmjs.org/..."` line sets block_host,
+                # flush() never consults berry_host(), and the .yarnrc.yml verdict
+                # is overridden — a private package aged against its public
+                # homonym, which is the false pass this whole path closes. Berry
+                # ignores unknown keys, so the line does not even break the
+                # install. Refused rather than resolved, like two disagreeing
+                # `resolved` hosts.
+                #
+                # Keyed on block_resolved, not on block_host: a Berry block MAY
+                # legitimately set block_host, through `::__archiveUrl=`. Testing
+                # the host would tag every CodeArtifact and Nexus entry — the
+                # population this feature is for — so what is refused is the
+                # `resolved` LINE, not the presence of a host.
+                if (block_berry && block_resolved) block_conflict = 1
+                h = block_host
+                if (h == "" && block_berry) h = berry_host()
+                # `h == ""` alone, not `h == "" && !block_berry`: the line above
+                # gives every Berry block a non-empty h (berry_host() returns a
+                # scope-map value or yarn_default_host, and load_registry_config
+                # makes both non-empty by construction), so the extra term is
+                # always true here. NOT collapsed further to `h != want_host`,
+                # though — that would change the hostless arm when want_host is
+                # itself empty, which a direct parser caller can reach, and change
+                # it in the fail-OPEN direction.
+                if (block_conflict || h == "" || h != want_host)
                   print "offregistry\t" pending_name "@" pending_ver
                 else
                   print pending_name "@" pending_ver
@@ -1558,7 +1788,7 @@ jobs:
               # the buffered entry and the block host are per-file too, and a
               # half-reset here would colour file N+1s first flush with file Ns
               # host if that ever changed.
-              FNR == 1 { flush(); name = ""; block_host = ""; block_conflict = 0; block_berry = 0 }
+              FNR == 1 { flush(); name = ""; block_host = ""; block_conflict = 0; block_berry = 0; block_resolved = 0; block_badloc = 0 }
               # Counts any line that is not blank and not a comment. MUST come
               # before the header rule: that rule ends in `next`, which skips every
               # remaining rule for the line, so a counter placed after it would
@@ -1574,7 +1804,7 @@ jobs:
               # structural evidence at all and trip the "truncated or wholesale
               # replaced" arm of the END guard. (No apostrophes in this block: it
               # is inside a single-quoted awk program.)
-              /^[[:space:]]*(__metadata|resolution:|"?resolved"?[[:space:]:]|languageName:|linkType:)/ { structural++ }
+              /^[[:space:]]*(__metadata|"?resolution"?[[:space:]]*:|"?resolved"?[[:space:]:]|languageName:|linkType:)/ { structural++ }
               /^[^[:space:]#]/ {
                 # A new header ends the previous block, so anything buffered from
                 # it can be emitted now: its `resolved` line, if it had one, has
@@ -1584,7 +1814,7 @@ jobs:
                 # descriptor), whose `resolved` line must not colour the entry
                 # buffered before it.
                 flush()
-                block_host = ""; block_conflict = 0; block_berry = 0
+                block_host = ""; block_conflict = 0; block_berry = 0; block_resolved = 0; block_badloc = 0
                 line = $0
                 sub(/:[[:space:]]*$/, "", line)
                 split(line, parts, ",")
@@ -1673,6 +1903,110 @@ jobs:
                 if (name != "" && ver != "") { pending_name = name; pending_ver = ver; pins++ }
                 name = ""
               }
+              # Berry shape. These four keys are the only trigger for the exemption, and
+              # every one is a key yarn v1 NEVER writes — which is the whole
+              # requirement, because block_berry is the off-switch for the
+              # fail-closed default above. A marker v1 also writes is not a format
+              # signal, it is a bypass: `version:` was tried here and had to be
+              # withdrawn, since v1 accepts the colon form too (the extractor
+              # carries `:?` for it, and the reformat test drives it as a v1
+              # shape), so `  version: "1.2.3"` plus any `resolved` spelling the
+              # rule below misses switched the default off and shipped the pin
+              # untagged.
+              #
+              # Read at the direct-child indent only, so a nested `dependencies:`
+              # line cannot exempt a block — fenced by
+              # test_yarn_nested_berry_marker_does_not_forge_the_exemption, since
+              # this anchor is load-bearing in exactly the way the `resolved` one
+              # below is.
+              #
+              # v1 ignores unknown keys, so ANY per-block marker is forgeable in
+              # principle; narrowing to keys v1 never writes makes the forgery an
+              # obviously alien line rather than one the block plausibly needs.
+              /^  "?(resolution|checksum|languageName|linkType)"?[[:space:]]*:/ { block_berry = 1 }
+              # The descriptor itself, CONFIRMED rather than assumed to agree with
+              # the block header. The marker rule above only asks "is this block
+              # Berry-shaped"; it does not read what the block says it installed.
+              # That gap matters now that a Berry block gets a POSITIVE verdict
+              # from .yarnrc.yml instead of merely being exempt: header and
+              # resolution are two separate strings and yarn installs from the
+              # RESOLUTION, so a crafted `"lodash@npm:^4.17.21":` whose body reads
+              # `resolution: "lodash@https://evil.example/x.tgz"` is npm-shaped
+              # everywhere the header allowlist looks, Berry-shaped to the marker
+              # above, and a tarball fetch where yarn looks. Tagged, on the same
+              # fail-closed-on-disagreement rule as a block naming two different
+              # `resolved` hosts.
+              #
+              # Value read at the direct-child indent only, and quoted-key form
+              # accepted, to match the marker rule it refines.
+              /^  "?resolution"?[[:space:]]*:/ {
+                res = $0
+                sub(/\r$/, "", res)
+                sub(/^[[:space:]]*"?resolution"?[[:space:]]*:[[:space:]]*/, "", res)
+                gsub(/^"|"$/, "", res)
+                gsub(/^\047|\047$/, "", res)
+                # An empty value is a block-style map, which Berry does not write.
+                # Nothing was read, so no claim is made either way and the block
+                # keeps whatever the marker rule decided — rather than being
+                # tagged on a guess about a shape this did not parse.
+                if (res != "") {
+                  # After the LAST `@` is the protocol half, so a scoped
+                  # `@babel/core@npm:7.24.0` reads the same as a bare
+                  # `lodash@npm:4.17.21`. The test is for a literal `npm:`
+                  # because Berry percent-encodes that separator inside a patch
+                  # payload (`typescript@patch:typescript@npm%3A5.3.3#...`), where
+                  # the last `@` lands mid-payload and `npm%3A` must NOT count.
+                  # Berry hardcodes the tarball URL as `::__archiveUrl=<encoded>`
+                  # when the registry does not use the conventional
+                  # `/<name>/-/<name>-<ver>.tgz` path. AWS CodeArtifact, Nexus and
+                  # multi-registry setups all produce it — i.e. exactly the
+                  # private-registry population this gate exists for. It names the
+                  # host OUTRIGHT, which is stronger evidence than .yarnrc.yml, so
+                  # it is recorded as the block host and wins in berry_host().
+                  # Without it such an entry reads as a plain `npm:` resolution,
+                  # falls back to the configured registry and is aged against a
+                  # public homonym: the false pass this whole path closes, reached
+                  # through the one resolution form that does carry a location.
+                  #
+                  # Split off BEFORE the protocol test below, because decoding can
+                  # introduce an `@` (a `%40` in userinfo) and the test takes the
+                  # LAST one.
+                  #
+                  # TWO axes, and both matter. Berry writes bindings as a single
+                  # querystring after one `::`, joined by `&`, and parses it
+                  # order-insensitively — so `__archiveUrl` need not come first.
+                  # Matching only the head of a `::` segment let
+                  # `::a=1&__archiveUrl=<evil>` hide the host completely: nothing
+                  # was recorded, the entry fell back to the configured registry
+                  # and was aged against a public homonym. That is the exact false
+                  # pass this rule exists to close, reached by prepending one
+                  # throwaway parameter. Scanning every `&` param also makes "two
+                  # disagreeing ones conflict" true — before, the first quietly
+                  # won and a second, foreign, `__archiveUrl` was never seen.
+                  akv_n = split(res, akv, "::")
+                  for (aki = 2; aki <= akv_n; aki++) {
+                    apn = split(akv[aki], apv, "&")
+                    for (api = 1; api <= apn; api++) {
+                      if (apv[api] !~ /^__archiveUrl=/) continue
+                      arch = apv[api]
+                      sub(/^__archiveUrl=/, "", arch)
+                      arch = pct_decode(arch)
+                      # An `__archiveUrl` that named a location this could not read
+                      # is NOT the same as no `__archiveUrl` at all: falling through
+                      # to berry_host() would age the entry against a registry the
+                      # lockfile has just said it did not come from. Refuse instead.
+                      # Computed once and RECORDED as a value, so the refusal and
+                      # the record cannot diverge.
+                      arch_host = url_host(arch)
+                      if (arch_host == "") block_conflict = 1
+                      else record_host(arch_host)
+                    }
+                  }
+                  res = akv[1]
+                  sub(/^.*@/, "", res)
+                  if (res !~ /^npm:/) block_conflict = 1
+                }
+              }
               # `resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz#..."`
               # — the tarball yarn v1 actually fetched, and the only thing in the
               # block that names the registry that served it (see the header note
@@ -1692,24 +2026,7 @@ jobs:
               #
               # Recorded against the BLOCK, not the buffered entry, so the order
               # of `version` and `resolved` inside a block does not matter.
-              # Berry shape. These four keys are the exemption`s only trigger, and
-              # every one is a key yarn v1 NEVER writes — which is the whole
-              # requirement, because block_berry is the off-switch for the
-              # fail-closed default above. A marker v1 also writes is not a format
-              # signal, it is a bypass: `version:` was tried here and had to be
-              # withdrawn, since v1 accepts the colon form too (the extractor
-              # carries `:?` for it, and the reformat test drives it as a v1
-              # shape), so `  version: "1.2.3"` plus any `resolved` spelling the
-              # rule below misses switched the default off and shipped the pin
-              # untagged.
               #
-              # Read at the direct-child indent only, so a nested `dependencies:`
-              # line cannot exempt a block.
-              #
-              # v1 ignores unknown keys, so ANY per-block marker is forgeable in
-              # principle; narrowing to keys v1 never writes makes the forgery an
-              # obviously alien line rather than one the block plausibly needs.
-              /^  "?(resolution|checksum|languageName|linkType)"?[[:space:]]*:/ { block_berry = 1 }
               # Every plain spelling yarn v1 accepts for this one key: bare or
               # quoted, with or without a colon. All four set the same field and
               # all four were verified to make yarn fetch the URL, so matching
@@ -1720,51 +2037,14 @@ jobs:
                 sub(/\r$/, "", url)
                 sub(/^[[:space:]]*"?resolved"?[[:space:]]*:?[[:space:]]*/, "", url)
                 gsub(/^"|"$/, "", url)
-                # The test is whether a SCHEME was stripped — i.e. whether this
-                # line named a location at all — NOT whether that scheme was
-                # https. Gating on https looks like the `startswith("https://")`
-                # in NPM_AGE_JQ_ENTRIES but does not behave like it: that one is a
-                # `select`, so a non-https entry is DROPPED and never checked,
-                # whereas leaving block_host unset here emits the entry UNTAGGED,
-                # which means aging it against a registry the evidence says it did
-                # not come from. A pin resolved over plain `http://` from an
-                # internal host is the homonym false pass one scheme over.
-                #
-                # Everything after the host is discarded, so the `#<sha>` fragment
-                # yarn appends is irrelevant. Lower-cased and folded exactly as
-                # npm_age::registry_host and the other two extractors do, so all
-                # three compare hosts the same way — see the comment on
-                # registry_host for why yarnpkg.com is not a separate registry.
-                scheme = url
-                if (sub(/:\/\/.*$/, "", scheme)) scheme = tolower(scheme); else scheme = ""
-                if (sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", url)) {
-                  sub(/\/.*$/, "", url)
-                  # All four normalisations npm_age::registry_host applies, in its
-                  # order. Every host these are compared against goes through that
-                  # function, so a derivation here that skips one reports the same
-                  # registry written two ways as two registries — a wrong-RED on a
-                  # repo squarely on its configured registry.
-                  #
-                  # Userinfo first, taking the LAST `@`: `user:pass@host` must
-                  # compare as `host`, or a credentialed `resolved` (which a
-                  # private-registry lockfile can carry) is both a wrong-red and a
-                  # credential echoed into the annotation, where safe_for_md
-                  # escapes markdown but does not redact.
-                  sub(/^.*@/, "", url)
-                  url = tolower(url)
-                  # A default port is the same registry written two ways.
-                  if (scheme == "https") sub(/:443$/, "", url)
-                  if (scheme == "http")  sub(/:80$/, "", url)
-                  if (url == "registry.yarnpkg.com") url = "registry.npmjs.org"
-                  # yarn writes one `resolved` per block. TWO naming different
-                  # hosts is not a lockfile yarn produced, and whichever one it
-                  # would install from, this parser cannot know — so the entry is
-                  # tagged rather than aged against either. Fail closed on
-                  # ambiguity: picking first or last would each be a false pass
-                  # under the opposite ordering.
-                  if (block_host != "" && url != block_host) block_conflict = 1
-                  block_host = url
-                }
+                # Host derivation, the https-vs-any-scheme decision and the four
+                # normalisations all live in url_host() — one copy, shared with
+                # the Berry `__archiveUrl` rule. See its comment.
+                # Recorded even when the value names no host, because the
+                # forgery-in-a-Berry-block test above is about the LINE being
+                # present, not about what it resolved to.
+                block_resolved = 1
+                note_host(url)
               }
               # awk exits 0 on anything, so without this the fail-closed branch in
               # changed_pins is unreachable for yarn: an unreadable image would
@@ -1774,6 +2054,13 @@ jobs:
               # be read — a comments-only or dependency-free lockfile has no specs
               # and stays a legitimate empty result.
               # Two fail-closed cases, both "the file said something we could not
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               # read", which must never present as an empty work-list:
               #   specs>0, pins==0  — real `pkg@range:` headers but no readable
               #                       body version (a format change).
@@ -2044,19 +2331,18 @@ jobs:
             # want_host is the honest reading of "no .npmrc evidence": with nothing
             # saying the lockfile was written against some OTHER registry, an
             # integrity-only entry came from the configured one.
-            awk -v mode="$mode" \
-                -v want_host="$NPM_AGE_WANT_HOST" \
-                -v default_host="$NPM_AGE_DEFAULT_HOST" \
-                -v scope_map="$NPM_AGE_SCOPE_MAP" '
+            # Configuration through ENVIRON, not `-v`: see npm_age::yarn_pins for
+            # why — a `-v` value is escape-processed, so a committed `\040` split
+            # the space-separated scope map inside awk and bound a scope to the
+            # token before it. `mode` is a literal this file controls and stays.
+            NPM_AGE_WANT_HOST="$NPM_AGE_WANT_HOST" \
+            NPM_AGE_DEFAULT_HOST="$NPM_AGE_DEFAULT_HOST" \
+            NPM_AGE_SCOPE_MAP="$NPM_AGE_SCOPE_MAP" \
+            awk -v mode="$mode" '
               BEGIN {
-                n = split(scope_map, sm, " ")
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 2 of 2), lib/age-check-npm.sh (part 1 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+                want_host = ENVIRON["NPM_AGE_WANT_HOST"]
+                default_host = ENVIRON["NPM_AGE_DEFAULT_HOST"]
+                n = split(ENVIRON["NPM_AGE_SCOPE_MAP"], sm, " ")
                 for (i = 1; i <= n; i++) {
                   eq = index(sm[i], "=")
                   if (eq > 1) scope_host[substr(sm[i], 1, eq - 1)] = substr(sm[i], eq + 1)
@@ -2134,7 +2420,12 @@ jobs:
                   scheme = url
                   if (sub(/:\/\/.*$/, "", scheme)) scheme = tolower(scheme); else scheme = ""
                   sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", url)
-                  sub(/\/.*$/, "", url)
+                  # Authority ends at the first of `/`, `?` or `#` — see url_host()
+                  # in npm_age::yarn_pins. Percent-encoding in the userinfo that the
+                  # strip below removes is legal and inert; a `%` left in a host
+                  # matches no configured registry and is tagged by mismatch.
+                  # And at `\\`, for the reason given there.
+                  sub(/[\/?#\\].*$/, "", url)
                   # Userinfo, as npm_age::registry_host does: `user:pass@host` must
                   # compare as `host`, or a credentialed URL is both a wrong-red
                   # and a string that gets echoed into the log.
@@ -2674,6 +2965,13 @@ jobs:
               fi
               # No resolution entries at all: a genuinely dependency-free lockfile.
               # Nothing to gate, and nothing wrong.
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_npm-lockfile-parsers.sh (part 3 of 3), lib/age-check-npm.sh (part 1 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_npm-lockfile-parsers.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               echo "::warning file=${lockfile}::${lockfile} declares no resolved dependencies — nothing to age-check for this file" >&2
               return 0
             fi
@@ -2938,13 +3236,6 @@ jobs:
           #   the hoisted one) ARE handled: the package name is the path segment
           #   after the LAST `node_modules/`.
           # - Mixed public/private lockfiles: if a lockfile has 1 public package
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           #   and 99 private packages, only the 1 public package is age-checked.
           #   The all-skipped-count guard below catches the fully-private case,
           #   but a partially-public lockfile can pass as long as its public
@@ -3034,6 +3325,29 @@ jobs:
           #   read literally, matches no host, and so reports its entries
           #   off-registry rather than aging them against the wrong place:
           #   fail-closed and visible, but such a repo has to pass registry_url.
+          #   .yarnrc.yml is read line-structurally, not with a YAML parser, so a
+          #   FLOW-style `npmScopes: {acme: {...}}` (valid YAML that yarn reads)
+          #   is reported unreadable rather than dropped — dropped, the scope
+          #   override vanishes and its packages fall back to the default
+          #   registry, which is fail-OPEN and invisible. An inline `# comment` on
+          #   a registry line IS handled, because that file is hand-written far
+          #   more often than a lockfile is. A value Berry would INTERPOLATE
+          #   (`${VAR}`, `${VAR:-fallback}`) is likewise unreadable: it names an
+          #   environment variable, and read literally the fallback form reduces
+          #   to the fallback's host — usually public npm — which is fail-OPEN.
+          #   Percent-encoding in a URL's USERINFO is legal and left alone
+          #   (`svc%40corp:tok@host` is how a credentialed private registry is
+          #   written); only an encoded authority DELIMITER can mislead the host
+          #   cut, and that only on the `__archiveUrl` path, which is decoded
+          #   exactly once — as yarn does — before the cut.
+          #   Unreadable values follow the tools' own precedence: a value that
+          #   cannot be used for ONE named key (`?unreadable`) is overridden by a
+          #   nearer file exactly as a readable one would be, so a stray root
+          #   `registry=//host/` under a good `apps/web/.npmrc` is not a red run.
+          #   The one exception is an inline `npmScopes: {...}`
+          #   (`?unreadable-scopes`), which poisons the DEFAULT as a proxy for
+          #   scopes that cannot be enumerated — a nearer readable default does
+          #   not make them visible, so that one survives the chain.
           #   Every .npmrc from the working directory down to the lockfile is read,
           #   nearest winning; npm also merges a per-user and a global one, which a
           #   CI checkout does not have.
@@ -3049,21 +3363,83 @@ jobs:
           #   file for yarn BERRY, which reads `npmRegistryServer` /
           #   `npmScopes.<scope>.npmRegistryServer` from .yarnrc.yml — pointing
           #   npm_age::npmrc_registries at a Berry repo would judge its pins
-          #   against a registry Berry never used. Live now that the yarn
-          #   extractor does filter (below): it is the trap waiting for whoever
-          #   extends that filtering to Berry.
-          # - yarn.lock is filtered for v1 ONLY. npm_age::yarn_pins reads each
-          #   block's `resolved "<url>"`, folds the host the same way
-          #   npm_age::registry_host does, and tags anything else — so a yarn v1
-          #   repo on a private registry gets a real gate by naming it in
-          #   registry_url. BERRY (yarn v2+) IS NOT FILTERED: it writes
+          #   against a registry Berry never used. So Berry has its OWN reader,
+          #   npm_age::yarnrc_registries, folded into a SEPARATE pair
+          #   (NPM_AGE_YARN_DEFAULT_HOST / NPM_AGE_YARN_SCOPE_MAP) that only the
+          #   yarn extractor reads. Both files are walked over the same directory
+          #   chain, in two loops rather than one: a directory may hold either,
+          #   both or neither, and a `continue` for a missing .npmrc must not skip
+          #   a .yarnrc.yml beside it. The CI-only caveat above applies unchanged
+          #   to Berry — YARN_NPM_REGISTRY_SERVER in the environment is evidence
+          #   this check cannot see either.
+          # - yarn.lock is filtered for BOTH v1 and Berry, on different evidence,
+          #   because the two formats state different things. npm_age::yarn_pins
+          #   reads each v1 block's `resolved "<url>"` and folds the host the same
+          #   way npm_age::registry_host does. BERRY (yarn v2+) writes
           #   `resolution:` and `checksum` and no `resolved` URL, and a
-          #   `resolution:` is a descriptor (`lodash@npm:4.17.21`), not a
-          #   location, so it names no host to compare and its blocks are emitted
-          #   untagged. A Berry repo on a private registry therefore still has the
-          #   homonym false pass above and should not rely on this check; closing
-          #   it needs the .yarnrc.yml reader described in the bullet above, not
-          #   npm_age::npmrc_registries. Two details of the v1 path worth knowing:
+          #   `resolution:` is a DESCRIPTOR (`lodash@npm:4.17.21`), not a
+          #   location — it names no host, with ONE exception below. So a Berry
+          #   block is the yarn analogue of a pnpm integrity-only entry: its
+          #   registry comes from .yarnrc.yml (see the bullet above), reached
+          #   through berry_host().
+          #   THE EXCEPTION IS `::__archiveUrl=<encoded>`, which Berry hardcodes
+          #   into the resolution when the registry does not use the conventional
+          #   `/<name>/-/<name>-<ver>.tgz` tarball path — AWS CodeArtifact, Nexus
+          #   and multi-registry setups all produce it, i.e. exactly this
+          #   feature's target population. It names the host outright, so it is
+          #   recorded as the block host and BEATS .yarnrc.yml. Read as a plain
+          #   `npm:` resolution instead, such an entry would fall back to the
+          #   configured registry and be aged against a public homonym — the false
+          #   pass this path closes, reached through the one resolution form that
+          #   does carry a location. It is percent-encoded, so the userinfo
+          #   impersonation `registry.npmjs.org%40attacker.example` only appears
+          #   after decoding; both it and the v1 `resolved` rule now derive hosts
+          #   through one url_host(), so that strip cannot be applied to one and
+          #   missed by the other.
+          #   With no .yarnrc.yml that value IS the configured registry, so Berry
+          #   entries stay untagged and adopting this still cannot flip a Berry
+          #   repo green -> red.
+          #   `__archiveUrl` BEATS .yarnrc.yml where the two disagree, which is the
+          #   one place in this file that resolves conflicting evidence instead of
+          #   refusing it. Deliberate: `__archiveUrl` is not a claim about the
+          #   fetch, it IS the fetch, so an entry naming npmjs while .yarnrc.yml
+          #   calls the scope private really is installed from npmjs and aging it
+          #   there describes the artifact that lands. Refusing the pair would tag
+          #   honest per-package overrides, and the attack it would notionally stop
+          #   does not work — redirecting `__archiveUrl` at the public registry
+          #   fetches the PUBLIC package, not the freshly published private one.
+          #   That argument is HOST-level only, as is every comparison here: the
+          #   URL's path is not checked against the entry's name and version, so
+          #   an `__archiveUrl` on the configured host naming a different tarball
+          #   is aged as the entry it sits under. Not new — v1 `resolved` has
+          #   always been matched on host alone — and not something the checksum
+          #   or this precedence closes.
+          #   A `resolution:` line is also CONFIRMED, not merely counted as a
+          #   Berry marker: header and resolution are separate strings and yarn
+          #   installs from the RESOLUTION, so an npm-shaped header over a
+          #   `patch:`/`workspace:`/tarball resolution is tagged instead of aged.
+          #   That matters more now than it did as a pure exemption, because a
+          #   Berry block now receives a POSITIVE verdict rather than a pass.
+          #   Note the scope of that word: block_berry is set by any of
+          #   `resolution:`, `checksum:`, `languageName:` or `linkType:`, but only
+          #   a `resolution:` line is confirmed — a block carrying just
+          #   `checksum:` is Berry-exempt without its protocol ever being read.
+          #   Berry requires `resolution:`, so such a lockfile would not install;
+          #   this is the "any per-block marker is forgeable in principle"
+          #   residual below, not a second hole, but "confirmed" describes the
+          #   line, not the exemption.
+          #   WHAT THIS DOES NOT CLOSE: tagging needs POSITIVE evidence, so a
+          #   Berry repo with no .yarnrc.yml — or one naming no
+          #   `npmRegistryServer` — still has its entries aged against
+          #   registry_url and keeps the homonym false pass if it installs
+          #   elsewhere. Deliberate: Berry defaults to registry.yarnpkg.com (a
+          #   public-npm alias, folded in npm_age::registry_host), and tagging on
+          #   the ABSENCE of configuration is a rollout decision, not a parser
+          #   one. It also means a fork PR can reach untagged by DELETING
+          #   .yarnrc.yml — visible in review, and the same door .npmrc already
+          #   leaves open for pnpm. Berry's `npmPublishRegistry` is deliberately
+          #   not read: it is where packages are pushed, not fetched.
+          #   Two details of the v1 path worth knowing:
           #   a `resolved` is read only at EXACTLY two spaces, the block's direct
           #   child, because `resolved` is a legal package name and a tarball URL
           #   a legal range — so a `dependencies:` entry four spaces down is a
@@ -3096,8 +3472,9 @@ jobs:
           #   hosts is tagged rather than aged against either, since whichever
           #   yarn would install from is unknowable here and picking first or last
           #   is a false pass under the opposite ordering.
-          #   A BERRY entry, naming no host, is emitted untagged, so adopting this
-          #   cannot flip a Berry repo from green to red. That exemption does NOT
+          #   A BERRY entry, naming no host, is judged on .yarnrc.yml — and on
+          #   nothing at all it is emitted untagged, so adopting this cannot flip
+          #   a Berry repo from green to red. That exemption does NOT
           #   extend to a v1 block whose `resolved` named no host — a relative or
           #   non-URL value — which is tagged like any other unreadable origin; a
           #   v1 lockfile written entirely that way therefore fails the
@@ -3288,7 +3665,23 @@ jobs:
             local url="$1" scheme=""
             case "$url" in *://*) scheme="${url%%://*}" ;; esac
             url="${url#*://}"
-            url="${url%%/*}"
+            # The authority ends at the FIRST of `/`, `?` or `#`, not at `/`
+            # alone — a committed `registry=https://attacker.example?x=@npmjs/`
+            # otherwise reached the last-`@` userinfo strip below and read as
+            # npmjs. Percent-encoding in that userinfo is legal and inert
+            # (`svc%40corp:tok@host` is how Artifactory and Azure Artifacts docs
+            # write an email-style username); refusing any `%` here, as this once
+            # did, turned every such credentialed config into a red run.
+            url="${url%%[/?#]*}"
+            # A BACKSLASH in what is left is refused, not cut at. WHATWG URL
+            # parsing ends an https authority at `\`, so
+            # `attacker.example\@registry.npmjs.org` is attacker.example to the
+            # fetcher and would be npmjs to the strip below. The lockfile
+            # extractors cut there, because the prefix is where the fetch goes;
+            # here the value is hand-written configuration, no real host carries
+            # one, and cutting would turn `registry.npmjs.org\040x` into a
+            # confident npmjs. Empty folds to `?unreadable` in the caller.
+            case "$url" in *\\*) printf ''; return 0 ;; esac
             # Userinfo, before anything else looks at this. is_valid_registry_url
             # rejects it in the INPUT precisely so credentials cannot be echoed
             # into logs and summaries, but a value parsed out of a committed
@@ -3335,6 +3728,15 @@ jobs:
           # npm_age::load_registry_config is unguarded and this file runs under
           # `set -u`.
           NPM_AGE_SCOPE_MAP=""
+          # The yarn BERRY pair, read from .yarnrc.yml rather than .npmrc. Kept
+          # separate rather than folded into the two above because the two files
+          # can disagree and each governs a different tool: a directory can hold a
+          # pnpm lockfile governed by .npmrc and a Berry lockfile governed by
+          # .yarnrc.yml. Both default to the configured registry, which is what
+          # makes "no .yarnrc.yml" mean "no evidence" and leaves Berry entries
+          # untagged.
+          NPM_AGE_YARN_DEFAULT_HOST="$NPM_AGE_WANT_HOST"
+          NPM_AGE_YARN_SCOPE_MAP=""
 
           # ----- .npmrc: which registry an integrity-only entry came from -------------
 
@@ -3359,10 +3761,14 @@ jobs:
           npm_age::npmrc_registries() {
             local file="$1"
             [ -f "$file" ] || return 0
-            # `sed` first so a CRLF checkout does not leave "\r" glued to the host.
+            # `sed` first so a CRLF checkout does not leave "\r" glued to the host,
+            # and so a UTF-8 BOM does not stay glued to the FIRST key — `registry`
+            # on line 1 would otherwise read as "\xef\xbb\xbfregistry", match
+            # nothing, and be silently ignored, which is the fail-open direction.
+            # Both artifacts travel with the same hand-authoring environments.
             # Blank and comment lines (npm accepts both ";" and "#") are dropped by
             # the anchored match rather than by a separate pass.
-            sed 's/\r$//' "$file" | awk '
+            sed -e $'1s/^\xef\xbb\xbf//' -e 's/\r$//' "$file" | awk '
               {
                 line = $0
                 sub(/^[[:space:]]+/, "", line)
@@ -3373,6 +3779,13 @@ jobs:
                 val = substr(line, eq + 1)
                 gsub(/[[:space:]]/, "", key)
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 2 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 # \047 is a single quote, spelled octal so this program stays
                 # inside one pair of shell single quotes.
                 gsub(/^"|"$/, "", val)
@@ -3400,6 +3813,253 @@ jobs:
               }'
           }
 
+          # ----- .yarnrc.yml: the same question, for yarn BERRY -----------------------
+          #
+          # A Berry entry names no host at all — `resolution: "lodash@npm:4.17.21"`
+          # is a DESCRIPTOR, not a location — so it is the yarn analogue of pnpm's
+          # integrity-only entry: the registry it came from lives in
+          # configuration. But in a DIFFERENT file. Berry does not read .npmrc, so
+          # pointing npm_age::npmrc_registries at a Berry repo would judge its
+          # pins against a registry Berry never used. This reads `.yarnrc.yml`
+          # instead and emits the same `<scope-or-default> <url>` pairs, for the
+          # same caller to fold.
+          #
+          # Three details of Berry's schema differ from npm's, and each is a wrong
+          # answer if missed:
+          #
+          #   `npmScopes` keys carry NO leading `@` (`npmScopes: {acme: {...}}`,
+          #   where .npmrc writes `@acme:registry=`). Emitted as written they
+          #   build a map keyed `acme`, which the `@acme` of a package name never
+          #   matches, and every scoped override is silently ignored — the failure
+          #   mode that looks exactly like working code. A leading `@` is stripped
+          #   and re-added so both spellings land on one key.
+          #
+          #   `npmPublishRegistry` is where packages are PUSHED, not fetched, and
+          #   Berry lets the two differ. Reading it would age installed packages
+          #   against a registry nothing was installed from. It is not matched
+          #   here, deliberately — the omission is the feature.
+          #
+          #   Berry's DEFAULT is https://registry.yarnpkg.com, not npmjs. That is
+          #   not a second registry (see npm_age::registry_host for the fold), but
+          #   a repo naming it explicitly must compare equal to a default
+          #   registry_url, so the value goes back through registry_host like
+          #   every other one rather than being compared raw.
+          #
+          # Auth (`npmAuthToken`, `npmAuthIdent`) matches no key read here, so no
+          # secret reaches stdout — the same property npm_age::npmrc_registries
+          # has, reached the same way.
+          #
+          # The `?unreadable` sentinel is npm_age::npmrc_registries' rule applied
+          # to this file for the same reason: a registry key WAS present but its
+          # value cannot be used, and dropping it silently would leave the default
+          # at the configured host — every entry judged on-registry, fail-OPEN.
+          #
+          # YAML is read structurally rather than with a parser: a key at column 0
+          # opens a section, and only inside `npmScopes` is a nested
+          # `npmRegistryServer` attributed to a scope. That keeps a
+          # `npmRegistryServer` under some OTHER top-level map — `npmRegistries`,
+          # which is keyed by URL and holds auth — from being read as the default.
+          # Indent WIDTH is not fixed, only required to be deeper than the scope
+          # key it belongs to: .yarnrc.yml is hand-written far more often than a
+          # lockfile is.
+          npm_age::yarnrc_registries() {
+            local file="$1"
+            [ -f "$file" ] || return 0
+            # CRLF and a leading UTF-8 BOM, for the reason given on
+            # npm_age::npmrc_registries: both come from the hand-authoring
+            # environments this file explicitly expects, and a BOM left in place
+            # makes a first-line `npmRegistryServer` match nothing at all.
+            sed -e $'1s/^\xef\xbb\xbf//' -e 's/\r$//' "$file" | awk '
+              # Strips one layer of matching quotes. \047 is a single quote,
+              # spelled octal so this program stays inside one pair of shell
+              # single quotes. Twin of the unquote() in npm_age::parse_pnpm_lock —
+              # NOT of npm_age::npmrc_registries, whose `gsub(/^"|"$/…)` strips
+              # UNMATCHED quotes, which YAML values cannot afford.
+              function unquote(s,   q) {
+                q = substr(s, 1, 1)
+                if ((q == "\"" || q == "\047") && substr(s, length(s), 1) == q)
+                  s = substr(s, 2, length(s) - 2)
+                return s
+              }
+              # A registry key WAS present; this decides whether its value can be
+              # used. One definition for both emit points below, so the default
+              # and the per-scope rule cannot drift apart.
+              #
+              # Whitespace is the half that is fail-OPEN rather than untidy:
+              # NPM_AGE_YARN_SCOPE_MAP is a space-separated `@scope=host` list, so
+              # a value carrying a space splits inside the map and binds the scope
+              # to its FIRST token — `"https://registry.npmjs.org evil.example"`
+              # would resolve @acme to npmjs and age every @acme package against
+              # its public homonym. Emptiness is the half npm_age::npmrc_registries
+              # also guards; a shell-side fallback in load_registry_config catches
+              # it too, and it is kept here so both readers state the same rule.
+              #
+              # `${` is the third: Berry EXPANDS `${VAR}` and `${VAR:-fallback}` in
+              # .yarnrc.yml, so the value names an environment variable this check
+              # cannot see, not a registry. Read literally, the fallback form is
+              # the dangerous one — `${PRIVATE_REGISTRY:-https://registry.npmjs.org/}`
+              # splits at `://` and cuts at the first `/`, leaving exactly
+              # `registry.npmjs.org`, so a repo whose CI sets the variable to a
+              # private registry was aged against public homonyms: fail-OPEN,
+              # through a file that says in so many words that its value comes
+              # from the environment. Refused wherever it appears in the value
+              # rather than only as a prefix, since yarn expands it mid-string too.
+              function usable(v) {
+                if (v == "" || v ~ /[[:space:]]/ || index(v, "${") > 0) return "?unreadable"
+                return v
+              }
+              {
+                line = $0
+                # Blank and comment lines carry no key.
+                if (line ~ /^[[:space:]]*($|#)/) next
+                # A TAB anywhere in the leading whitespace is not legal YAML
+                # indentation, so this is not a file yarn would load. SKIPPING the
+                # line — what this once did, and only for a tab at column 1 —
+                # silently dropped a tab-indented scope block, so its override
+                # vanished and those pins fell through to the default: fail-OPEN,
+                # the one direction this reader must not take. A spaces-then-tab
+                # line was worse still: the tab vanished in the key trim and the
+                # setting was read as a new SCOPE. Same exit as the other
+                # invalid-YAML shapes: inside npmScopes the map is unenumerable
+                # and takes the sticky sentinel; at top level the default is.
+                if (line ~ /^[[:space:]]*\t/) {
+                  if (in_scopes) print "default", "?unreadable-scopes"
+                  else print "default", "?unreadable"
+                  in_scopes = 0; cur_scope = ""; scope_indent = -1
+                  next
+                }
+
+                ind = 0
+                while (substr(line, ind + 1, 1) == " ") ind++
+                rest = substr(line, ind + 1)
+
+                # Split at the FIRST colon: the value of npmRegistryServer is a
+                # URL carrying one of its own, which a last-colon split would take
+                # as the separator.
+                c = index(rest, ":")
+                if (c == 0) {
+                  # Only while INSIDE npmScopes: a stray token elsewhere cannot
+                  # misattribute a scope, which is the failure this rule exists
+                  # for — and a valid multi-line flow collection (`plugins: [`
+                  # ... `]`) closes with exactly such a line, which poisoned the
+                  # scope map and sent the operator to fix `npmScopes` when the
+                  # line belonged to `plugins`. YAML document markers and
+                  # `%YAML`-style directives are the colon-less column-0 lines a
+                  # valid file can carry inside that section too; everything
+                  # else at column 0 without a
+                  # colon means this is not the block mapping the reader can walk
+                  # (a bare scalar cannot share a document with a mapping). Yarn
+                  # would refuse such a file. Keeping the section state and
+                  # reading on produced a WRONG verdict — scope lines after a
+                  # stray token were still attributed as scopes — so instead the
+                  # scope map is declared unreadable, which is the fail-closed
+                  # "no verdict" the rest of this file gives.
+                  if (ind == 0 && in_scopes && rest !~ /^(---|\.\.\.)([[:space:]]|$)/ && rest !~ /^%/) {
+                    print "default", "?unreadable-scopes"
+                    in_scopes = 0; cur_scope = ""; scope_indent = -1
+                  }
+                  next
+                }
+                key = substr(rest, 1, c - 1)
+                val = substr(rest, c + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+                # A YAML inline comment, stripped BEFORE the trim. In YAML a `#`
+                # only opens one when it follows whitespace or starts the line, so
+                # this is narrow and leaves `https://host#frag` alone. Order is
+                # load-bearing: trimming first removes the very whitespace the
+                # anchor needs, so a COMMENT-ONLY value (`npmScopes:  # our
+                # scopes`, or `  acme:  # private`) survived as a non-empty value,
+                # was read as a flow mapping, and poisoned the default or that
+                # scope with ?unreadable — a red run on honest hand-written config,
+                # which is the failure the strip exists to prevent one line up.
+                sub(/[[:space:]]+#.*$/, "", val)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+                key = unquote(key)
+                val = unquote(val)
+                # Re-trim: a quoted value can hold padding the first trim could
+                # not see, and the space-separated scope map cannot carry it.
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+
+                # Column 0 opens a section and ends any scope in progress. Only
+                # whether it is the `npmScopes` map is remembered — the same shape
+                # as in_packages in npm_age::parse_pnpm_lock — which is what keeps
+                # an npmRegistryServer nested under some OTHER top-level map
+                # (`npmRegistries`, keyed by URL and holding auth) from being read
+                # as the default.
+                if (ind == 0) {
+                  in_scopes = (key == "npmScopes")
+                  cur_scope = ""; scope_indent = -1
+                  if (key == "npmRegistryServer") print "default", usable(val)
+                  # `npmScopes: {acme: {...}}` written inline. Valid YAML that yarn
+                  # reads and this line-structured reader cannot walk into, and the
+                  # scopes cannot even be enumerated from it — so there is no
+                  # narrower thing to distrust than the whole file. Dropped
+                  # silently, every scope override in it would vanish and its
+                  # packages would fall back to the default registry: fail-OPEN,
+                  # and invisible, which is the failure this reader exists to
+                  # prevent. A DISTINCT sentinel from `?unreadable`, because the
+                  # fold treats the two differently: this one is a proxy for
+                  # scopes it cannot see, and a readable default in a nearer file
+                  # does not make those scopes visible, so it must stick; a plain
+                  # `?unreadable` names one key, which a nearer file legitimately
+                  # overrides — see npm_age::fold_registry_files.
+                  else if (in_scopes && val != "") print "default", "?unreadable-scopes"
+                  next
+                }
+
+                if (!in_scopes) next
+
+                # The FIRST indented line inside npmScopes fixes the scope level;
+                # anything deeper holds that scope`s settings. (No apostrophes in
+                # this program — it is single-quoted.)
+                if (scope_indent < 0) scope_indent = ind
+
+                # A line SHALLOWER than the scope level but not at column 0 is
+                # invalid YAML (a mapping`s keys share one indent), so yarn would
+                # refuse the file. Left alone it fell through both branches with
+                # cur_scope still pointing at the PREVIOUS scope, and the next
+                # setting line was attributed to it — `@acme` handed another
+                # scope`s registry, in the fail-open direction. The scope map is
+                # declared unreadable instead: sticky, because the scopes can no
+                # longer be enumerated from this file at all.
+                if (ind < scope_indent) {
+                  print "default", "?unreadable-scopes"
+                  in_scopes = 0; cur_scope = ""; scope_indent = -1
+                  next
+                }
+
+                if (ind == scope_indent) {
+                  cur_scope = key; sub(/^@/, "", cur_scope)
+                  # A scope name carrying whitespace cannot be represented in the
+                  # space-separated map at all: the shell-side `read` splits it, and
+                  # the tail of the NAME becomes the head of the HOST. A committed
+                  # `"acme x":` naming npmjs, after a real `acme:` naming a private
+                  # registry, therefore serialised as a SECOND `@acme=` entry that
+                  # won last — every @acme pin aged against its public homonym,
+                  # through a key yarn matches to no package. usable() guards the
+                  # value; nothing guarded the key. The scope map is unenumerable
+                  # from here, so it takes the sticky scopes sentinel.
+                  if (cur_scope ~ /[[:space:]]/) {
+                    print "default", "?unreadable-scopes"
+                    in_scopes = 0; cur_scope = ""; scope_indent = -1
+                    next
+                  }
+                  # `acme: {npmRegistryServer: ...}` — a scope whose settings are
+                  # an inline flow mapping. Same reasoning as the inline npmScopes
+                  # above, but the scope IS known here, so distrust just that one:
+                  # dropping it would fall back to the default registry and age
+                  # every @acme package against its public homonym.
+                  if (val != "") { print "@" cur_scope, "?unreadable"; cur_scope = "" }
+                  next
+                }
+
+                # No `scope_indent >= 0` test: it is set unconditionally above, and
+                # column 0 resets it with cur_scope together.
+                if (cur_scope != "" && ind > scope_indent && key == "npmRegistryServer")
+                  print "@" cur_scope, usable(val)
+              }'
+          }
+
           # Narrows NPM_AGE_DEFAULT_HOST / NPM_AGE_SCOPE_MAP to the .npmrc
           # governing <dir>, or leaves them at the configured registry when there
           # is none.
@@ -3413,23 +4073,175 @@ jobs:
           # to "same as the configured registry", and age those private packages
           # against a public homonym: the exact false pass this all exists to
           # close, reached through the one configuration that looks handled.
+          # Folds one registry config file, read from each of <dirs...> in turn,
+          # into `<default-host><TAB><scope-map>` on stdout. An EMPTY default means
+          # the file named none, which the caller reads as "leave it at the
+          # configured registry" — distinct from "?unreadable", which means a
+          # registry WAS named and could not be used.
+          #
+          # stdout rather than variables set in place: this repo targets bash 3.2,
+          # which has no namerefs (same constraint, same solution, as
+          # preflight::age_row_and_tally). .npmrc and .yarnrc.yml need the
+          # IDENTICAL fold into different variables, and a copy each is a fold
+          # that has to be kept in step in the one file that cannot afford
+          # fail-open.
+          npm_age::fold_registry_files() {
+            local reader="$1" name="$2"; shift 2
+            local d scope host default="" map=""
+            for d in "$@"; do
+              [ -f "${d}/${name}" ] || continue
+              # Explicit IFS: the script sets IFS=$'\n\t' globally, so a bare `read`
+              # would not split this pair on its space.
+              while IFS=' ' read -r scope host; do
+                case "$host" in
+                  # A sentinel is already terminal — and only the two this file
+                  # emits count, so file content beginning with `?` still goes
+                  # through the normaliser and lands on `?unreadable` with the
+                  # actionable warning, rather than being echoed back as a
+                  # registry nobody set. It happens to pass through
+                  # npm_age::registry_host unchanged today, but that function's
+                  # contract is "normalise a registry URL", not "preserve an
+                  # arbitrary string" — and if it ever returned empty for one, the
+                  # fallback below would flatten `?unreadable-scopes` into plain
+                  # `?unreadable` before the stickiness test could see it, losing
+                  # the one distinction that keeps unenumerable scopes fail-closed.
+                  '?unreadable'|'?unreadable-scopes') ;;
+                  *)
+                    host=$(npm_age::registry_host "$host")
+                    # A value that parses to no host at all (`registry=//host/`,
+                    # which npm accepts) must not leave the default at the
+                    # configured registry. "?unreadable" matches no real host, so
+                    # its entries are tagged and the mismatch warning names the
+                    # file.
+                    [ -n "$host" ] || host="?unreadable" ;;
+                esac
+                # Two sentinels, folded differently, and the difference is the
+                # tools' own precedence. `?unreadable` names ONE key whose value
+                # could not be used; npm and Berry both let a nearer file override
+                # that key, so nearest-wins applies to it exactly as to a readable
+                # value — a root `registry=//host/` under an `apps/web/.npmrc`
+                # naming npmjs is a repo npm resolves without ambiguity, and
+                # making the poison stick there turned it red on upgrade.
+                # `?unreadable-scopes` is different in kind: the yarnrc reader
+                # emits it on the DEFAULT as a proxy for scope overrides it could
+                # not enumerate, and a nearer file's readable default does not make
+                # those scopes visible, so it must survive — an inline
+                # `npmScopes: {...}` followed (in the same file or a nearer one) by
+                # a plain `npmRegistryServer` would otherwise lose the signal and
+                # age those packages against public homonyms, fail-OPEN.
+                if [ "$scope" = "default" ]; then
+                  [ "$default" = "?unreadable-scopes" ] || default="$host"
+                else
+                  # Later files override an earlier entry for the same scope
+                  # because the awk map assignment is last-wins; appending is
+                  # enough, no removal needed. That holds for a poisoned scope too:
+                  # `acme: {...}` at the root under a readable `acme:` block nearer
+                  # the lockfile is exactly the override Berry itself honours.
+                  map="${map}${map:+ }${scope}=${host}"
+                fi
+              done < <("$reader" "${d}/${name}")
+            done
+            # TWO lines, not one tab-separated pair: `read` strips LEADING IFS
+            # whitespace, and a tab is whitespace, so a `\t<map>` pair with an
+            # empty default silently shifts the map into the default field — which
+            # sets NPM_AGE_DEFAULT_HOST to `@acme=host`, matches no entry, and
+            # tags every package in a repo that only ever configured one scope.
+            printf '%s\n%s\n' "$default" "$map"
+          }
+
+          # A scope whose registry could not be read. The default-host warning
+          # above never sees these — the poison sits in the scope map — so without
+          # this every `@acme` pin is tagged and, if those are the only new
+          # dependencies, the all-skipped guard fails the PR with nothing in the
+          # log naming the file or the flow-style mapping as the cause. The
+          # identical mistake one line up (`npmScopes: {...}` at column 0) gets a
+          # precise message; this gives the scope form the same courtesy.
+          # <map> is the space-separated `@scope=host` list; the global IFS holds
+          # no space, hence the explicit split.
+          npm_age::warn_unreadable_scopes() {
+            local name="$1" map="$2" dir="$3" qualifier="$4" remedy="${5:-}" e safe_dir safe_scope
+            [ -n "$map" ] || return 0
+            safe_dir=$(preflight::safe_for_md "$dir")
+            local -a entries=()
+            IFS=' ' read -r -a entries <<< "$map"
+            for e in "${entries[@]}"; do
+              case "$e" in
+                *"=?unreadable")
+                  safe_scope=$(preflight::safe_for_md "${e%%=*}")
+                  echo "::warning::${name} for ${safe_dir} configures a registry for ${safe_scope} that this check could not parse, so ${qualifier}packages in that scope are reported as skipped rather than age-checked.${remedy:+ }${remedy}" ;;
+              esac
+            done
+          }
+
+          # One wording for both files, so the remedy sentence cannot drift into
+          # two versions. <qualifier> narrows the noun for a file that governs only
+          # part of the ecosystem ("Berry ").
+          npm_age::warn_registry_mismatch() {
+            local name="$1" host="$2" dir="$3" qualifier="$4" remedy="${5:-}"
+            [ "$host" != "$NPM_AGE_WANT_HOST" ] || return 0
+            local safe_dir; safe_dir=$(preflight::safe_for_md "$dir")
+            # `?unreadable` is a sentinel, not a host, and rendering it as one
+            # sends an operator hunting for a default registry they never set —
+            # especially for the inline-npmScopes case, where the poison is
+            # applied to the default although the cause was a scope map. Name the
+            # real problem instead.
+            case "$host" in
+              "?unreadable-scopes")
+                echo "::warning::${name} for ${safe_dir} has an npmScopes map this check cannot read — written inline (\`npmScopes: {...}\`), or with a line the block structure does not admit — so it cannot tell which scopes are overridden and reports every ${qualifier}package as skipped rather than age-checked. Rewrite npmScopes in block style with one consistent indent."
+                return 0 ;;
+              "?unreadable")
+                # The generic half is true of both files; only the remedy differs,
+                # so it is a parameter rather than a second copy of the sentence.
+                # Telling an .npmrc operator to rewrite their YAML in block style is
+                # the kind of confidently wrong instruction that costs more than
+                # saying nothing.
+                echo "::warning::${name} for ${safe_dir} configures a registry this check could not parse, so ${qualifier}packages are reported as skipped rather than age-checked.${remedy:+ }${remedy}"
+                return 0 ;;
+            esac
+            local safe_host; safe_host=$(preflight::safe_for_md "$host")
+            echo "::warning::${name} for ${safe_dir} sets a default registry (${safe_host}) other than the configured registry_url (${NPM_AGE_WANT_HOST}); ${qualifier}packages resolving through it are reported as skipped, not age-checked. Set registry_url to age them."
+          }
+
           npm_age::load_registry_config() {
-            local dir="$1" scope host d
+            local dir="$1" kind="${2:-}" lockfile="${3:-}" d default map
             NPM_AGE_DEFAULT_HOST="$NPM_AGE_WANT_HOST"
             NPM_AGE_SCOPE_MAP=""
+            NPM_AGE_YARN_DEFAULT_HOST="$NPM_AGE_WANT_HOST"
+            NPM_AGE_YARN_SCOPE_MAP=""
 
-            # Every .npmrc from the working directory down to the lockfile, applied
-            # root-first so the NEAREST one wins. Both directions matter and each
-            # is a false pass on its own: reading only the top-level file misses
-            # `apps/web/.npmrc`, and reading only the lockfile's own directory
-            # misses a registry configured once at the repo root — which is where
-            # pnpm workspaces normally put it. Either way the private packages get
-            # aged against a public homonym.
+            # Which config file governs THIS lockfile. Berry reads .yarnrc.yml and
+            # never .npmrc; npm and pnpm read .npmrc and never .yarnrc.yml. Reading
+            # the other one is not merely wasted work — its mismatch warning tells
+            # an operator that packages "are reported as skipped, not age-checked"
+            # when no package of that kind exists, and main() calls this once per
+            # target, so one stray file prints the same false warning up to three
+            # times in a run. An empty kind means the caller did not say, which
+            # reads both: the parser unit tests call this directly.
+            local want_npmrc=1 want_yarnrc=1
+            case "$kind" in
+              yarn)              want_npmrc=0 ;;
+              package-lock|pnpm) want_yarnrc=0 ;;
+              # "" is a direct caller (the unit tests) that did not say, and reads
+              # both. Anything else is a format added without updating this case —
+              # reading both is the safe fallback (no verdict is skipped), and the
+              # only cost is the false warning the gate exists to remove, so make
+              # the next person notice rather than inherit it silently.
+              "")                ;;
+              *) echo "::warning::npm_age::load_registry_config: unknown lockfile kind '${kind}'; reading both .npmrc and .yarnrc.yml" ;;
+            esac
+
+            # Every config file from the working directory down to the lockfile,
+            # applied root-first so the NEAREST one wins. Both directions matter
+            # and each is a false pass on its own: reading only the top-level file
+            # misses `apps/web/.npmrc`, and reading only the lockfile's own
+            # directory misses a registry configured once at the repo root — which
+            # is where pnpm workspaces and yarn monorepos normally put it. Either
+            # way the private packages get aged against a public homonym.
             #
             # Relative paths only, so this never walks above the working directory
             # — enforced here rather than assumed of the caller, because an
             # absolute or `..`-bearing lockfile_path would otherwise have this
-            # reading .npmrc files from outside the checkout entirely.
+            # reading config files from outside the checkout entirely.
             # Also catches a directory whose NAME merely contains ".." (apps/v1..2),
             # which is broader than traversal alone — harmless, since the fallback
             # is the working directory, and not worth a more delicate pattern on a
@@ -3445,33 +4257,40 @@ jobs:
             done
             dirs=("." "${dirs[@]}")
 
-            for d in "${dirs[@]}"; do
-              [ -f "${d}/.npmrc" ] || continue
-              # Explicit IFS: the script sets IFS=$'\n\t' globally, so a bare `read`
-              # would not split this pair on its space.
-              while IFS=' ' read -r scope host; do
-                host=$(npm_age::registry_host "$host")
-                # Same reasoning as the sentinel above: a value that parses to no
-                # host at all (`registry=//host/`, which npm accepts) must not
-                # leave the default at the configured registry. "?unreadable"
-                # matches no real host, so its entries are tagged and the mismatch
-                # warning below names the file.
-                [ -n "$host" ] || host="?unreadable"
-                if [ "$scope" = "default" ]; then
-                  NPM_AGE_DEFAULT_HOST="$host"
-                else
-                  # Later files override an earlier entry for the same scope
-                  # because the awk map assignment is last-wins; appending is
-                  # enough, no removal needed.
-                  NPM_AGE_SCOPE_MAP="${NPM_AGE_SCOPE_MAP}${NPM_AGE_SCOPE_MAP:+ }${scope}=${host}"
-                fi
-              done < <(npm_age::npmrc_registries "${d}/.npmrc")
-            done
+            # `IFS=` on each read so neither value is trimmed: the global IFS holds
+            # \n and \t, and the map's own separator is a space, which read would
+            # otherwise have to be told to leave alone.
+            if [ "$want_npmrc" = 1 ]; then
+              { IFS= read -r default; IFS= read -r map; } < <(
+                npm_age::fold_registry_files npm_age::npmrc_registries .npmrc "${dirs[@]}")
+              [ -n "$default" ] && NPM_AGE_DEFAULT_HOST="$default"
+              NPM_AGE_SCOPE_MAP="$map"
+              npm_age::warn_registry_mismatch .npmrc "$NPM_AGE_DEFAULT_HOST" "$dir" "" \
+                "A value containing whitespace cannot be used, and \`registry=\${VAR}\` is read literally rather than expanded."
+              npm_age::warn_unreadable_scopes .npmrc "$NPM_AGE_SCOPE_MAP" "$dir" "" \
+                "A value containing whitespace cannot be used, and \`@scope:registry=\${VAR}\` is read literally rather than expanded."
+            fi
 
-            if [ "$NPM_AGE_DEFAULT_HOST" != "$NPM_AGE_WANT_HOST" ]; then
-              local safe_default; safe_default=$(preflight::safe_for_md "$NPM_AGE_DEFAULT_HOST")
-              local safe_dir; safe_dir=$(preflight::safe_for_md "$dir")
-              echo "::warning::.npmrc for ${safe_dir} sets a default registry (${safe_default}) other than the configured registry_url (${NPM_AGE_WANT_HOST}); packages resolving through it are reported as skipped, not age-checked. Set registry_url to age them."
+            if [ "$want_yarnrc" = 1 ]; then
+              { IFS= read -r default; IFS= read -r map; } < <(
+                npm_age::fold_registry_files npm_age::yarnrc_registries .yarnrc.yml "${dirs[@]}")
+              [ -n "$default" ] && NPM_AGE_YARN_DEFAULT_HOST="$default"
+              NPM_AGE_YARN_SCOPE_MAP="$map"
+              # `kind` cannot tell yarn v1 from Berry — both are "yarn" — and only
+              # BERRY reads .yarnrc.yml. Reading it for a v1 lockfile is harmless
+              # (berry_host() only fires for a Berry-shaped block, and v1 has
+              # none), but WARNING about it is the same false operator signal the
+              # kind gate above exists to remove, one format over: a v1 repo with a
+              # .yarnrc.yml lying around — common mid-migration, or kept for
+              # nodeLinker/yarnPath alone — would be told its Berry packages are
+              # being skipped when it has none. `__metadata:` is the marker yarn v1
+              # never writes, the same evidence the extractor keys Berry on.
+              if [ -z "$lockfile" ] || { [ -f "$lockfile" ] && grep -q '^__metadata:' "$lockfile"; }; then
+                npm_age::warn_registry_mismatch .yarnrc.yml "$NPM_AGE_YARN_DEFAULT_HOST" "$dir" "Berry " \
+                  "Flow-style YAML (\`npmScopes: {…}\`) is not read, a value containing whitespace cannot be used, and \`\${VAR}\` interpolation is refused because this check cannot see the environment yarn expands it from; rewrite it in block style with a plain URL."
+                npm_age::warn_unreadable_scopes .yarnrc.yml "$NPM_AGE_YARN_SCOPE_MAP" "$dir" "Berry " \
+                  "A flow-style scope (\`acme: {…}\`) is not read, and a value containing whitespace cannot be used; rewrite it in block style with a plain URL."
+              fi
             fi
           }
 
@@ -3832,13 +4651,6 @@ jobs:
             # After the header, so the row joins the table rather than orphaning
             # above it. Other lockfiles WERE found, so the run continues — but the
             # configured path is still wrong and must not pass silently.
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             if [ "$lockfile_path_missing" -eq 1 ]; then
               npm_age::report_unreadable_format "$LOCKFILE_PATH" \
                 "configured lockfile_path does not exist in the checkout"
@@ -3854,11 +4666,13 @@ jobs:
               processed+=("$file")
               echo "::group::Checking $(preflight::safe_for_md "$file")"
 
-              # Registry config for THIS lockfile, from the .npmrc beside it.
+              # Registry config for THIS lockfile, from the config beside it.
               # `dirname` of a cwd-level lockfile is ".", which is the same file
               # the previous shape read — so the common case is unchanged and the
-              # subdirectory case stops silently using the wrong one.
-              npm_age::load_registry_config "$(dirname "$file")"
+              # subdirectory case stops silently using the wrong one. `kind` picks
+              # which config file governs it: .npmrc for npm/pnpm, .yarnrc.yml for
+              # yarn, never both.
+              npm_age::load_registry_config "$(dirname "$file")" "$kind" "$file"
 
               local new_deps="" diff_rc=0
               case "$kind" in
@@ -3886,6 +4700,13 @@ jobs:
                 # (diff_pnpm_lock says why it still computes them), so the pass is
                 # not a blind one.
                 npm_age::report_vendored_arrivals "$safe_file" "$new_deps"
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-npm.sh (part 3 of 3)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-npm.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
                 echo "::endgroup::"
                 continue
               fi
