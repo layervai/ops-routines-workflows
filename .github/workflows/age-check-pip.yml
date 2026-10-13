@@ -113,7 +113,8 @@ jobs:
           #   preflight::verify_base_ref "origin/${BASE_REF}"  # MUST come before any
           #                                              # subsequent `git diff` — see
           #                                              # the function comment for
-          #                                              # the silent-pass reason. Also
+          #                                              # the silent-pass reason.
+          #                                              # Requires git itself. Also
           #                                              # resolves the merge base once;
           #                                              # read it via preflight::base_rev
           #                                              # for every `<rev>:<path>` read.
@@ -231,12 +232,26 @@ jobs:
           # added and, if young, fails a PR that never touched it. Every
           # ecosystem's main() hands its parsers this revision rather than the
           # ref, so no call site re-derives what "the base" means.
+          #
+          # Requires git ITSELF rather than trusting each binding's
+          # preflight::require_tools list to name it: every ecosystem comes through
+          # here, and without git the first probe below exits 127, which reads as
+          # "the ref does not resolve" — the operator would be told to fetch the
+          # base branch on a runner that has no git to fetch it with. Same
+          # fail_not_run exit as the binding's own require_tools call, so the
+          # missing-tool row and footer are the ones that call would have written.
+          # The per-ecosystem lists KEEP `git` where they have it: that first call
+          # names every missing tool in one row, while this one can only add git
+          # after the others have been installed, and a binding that runs its own
+          # `git diff` should say so in its own list. This call is the backstop
+          # for a list that forgot.
           preflight::verify_base_ref() {
             local base_ref="$1"
             if [ -z "$base_ref" ]; then
               echo "::error::preflight::verify_base_ref called with empty argument"
               exit 1
             fi
+            preflight::require_tools git
             # Sanitized once, here, for every surface the two failures below reach
             # — the log line, the PR-comment row and the summary footer all render
             # markdown, and a legally-named ref can carry `_`, `#` or a backtick.
@@ -347,15 +362,15 @@ jobs:
           # would not: diff_package_lock's "is not valid JSON" object check catches
           # the empty file jq reads as nothing, and diff_pnpm_lock's shortfall
           # guard reports the numbers for a lockfileVersion only partly understood
-          # (rc 5) where the extractor itself exits 0. It does not restate this
-          # helper's line, and no format name is spliced into this helper's
-          # message. Every npm binding and pre-commit route through here, so this
-          # is the one place the split is written down. The pairing
-          # is adjacent in the JOB LOG only: this helper's line is a `::error
-          # file=` and so also reaches the annotations panel and the Files-changed
-          # view, while the parser's reason is plain stderr text — an operator who
-          # starts from the annotation has to open the log for the why, exactly as
-          # with jq's error today.
+          # (rc 5) where the extractor itself exits 0. Such a check does not
+          # restate this helper's line, and no format name is spliced into this
+          # helper's message. Every npm binding and pre-commit route through here,
+          # so this is the one place the split is written down. The pairing is
+          # adjacent in the JOB LOG only: this helper's line is a `::error file=`
+          # and so also reaches the annotations panel and the Files-changed view,
+          # while the parser's reason is plain stderr text — an operator who starts
+          # from the annotation has to open the log for the why, exactly as with
+          # jq's error today.
           #
           # This is the body `precommit_age::changed_pins` and `npm_age::changed_pins`
           # each carried verbatim — probe, temp-file read, two checked parses, a set
@@ -382,9 +397,12 @@ jobs:
           # MUST be called under `$(...)`, as every binding does: the two coding-error
           # guards `exit`, and a bare `if new_lines_since_base ...; then` would take the
           # script down mid-run instead of reaching the caller's fail-closed branch.
-          # Tools: git, sort, comm — and mktemp unless a path is supplied. Each
-          # caller declares them in its own preflight::require_tools list; a new
-          # binding owes that list an edit too.
+          # Tools: sort, comm — and mktemp unless a path is supplied. Each caller
+          # declares them in its own preflight::require_tools list; a new binding
+          # owes that list an edit too. git is used here as well, but a binding
+          # that passes in preflight::base_rev does not owe it:
+          # preflight::verify_base_ref requires git, and base_rev yields nothing
+          # until that has run. A caller that bypasses base_rev owes git itself.
           #
           # Optional 4th argument <base_blob>: a caller-owned path. When given, the
           # base image is written THERE and left for the caller, instead of into a
@@ -437,13 +455,12 @@ jobs:
             # a red marker on a manifest that had no part in the fault. The text
             # names the file.
             #
-            # The revision is sanitized for the log the same way verify_base_ref
-            # sanitizes the ref it echoes. Unreachable through preflight::base_rev,
-            # which yields a hex merge base — but this guard exists FOR the caller
-            # that did not go through it, and a revision carrying a newline would
-            # otherwise close this annotation and open a second workflow command of
-            # the attacker's choosing. Nothing downstream reads the sanitized copy;
-            # it is display only.
+            # The revision is sanitized because this guard exists for callers that
+            # bypass base_rev, the same way verify_base_ref sanitizes the ref it
+            # echoes: a revision carrying a newline would otherwise close this
+            # annotation and open a second workflow command of the attacker's
+            # choosing. Nothing downstream reads the sanitized copy; it is display
+            # only.
             if ! git rev-parse --verify --quiet "${base_rev}^{commit}" >/dev/null 2>&1; then
               local safe_rev; safe_rev=$(preflight::safe_for_md "$base_rev" 200)
               echo "::error::base revision '${safe_rev}' for ${file} does not resolve to a commit in this checkout — a truncated SHA, or a ref this checkout never fetched or has since pruned" >&2
@@ -1000,6 +1017,13 @@ jobs:
             printf '%s' "$out"
           }
 
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/age-check-pip.sh
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
           # ----- Step-summary helpers --------------------------------------------------
 
           # `GITHUB_STEP_SUMMARY` is provided by GitHub Actions; default to
@@ -1032,13 +1056,6 @@ jobs:
           preflight::step_summary_all_passed() {
             local checked_count="$1" min_age_days="$2" skipped_count="${3:-0}"
             {
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/_preflight.sh (part 2 of 2), lib/age-check-pip.sh
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/_preflight.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
               echo ""
               echo "> Verified ${checked_count} package(s) at ≥ ${min_age_days} days old. :white_check_mark:"
               if [ "$skipped_count" -gt 0 ]; then
