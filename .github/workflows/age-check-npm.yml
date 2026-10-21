@@ -4377,9 +4377,9 @@ jobs:
           # max_pins" would name an input their pinned reusable does not expose.
           NPM_AGE_MAX_PINS_FROM_ENV=0
           # `+set`, not `-n`: the question is whether the caller PASSED the input,
-          # not whether the value is usable. `max_pins: ${{ vars.NPM_MAX_PINS }}`
-          # against an unset variable presents MAX_PINS as present-but-empty — with
-          # `-n` that reads as "not passed", and the budget refusal then tells a
+          # not whether the value is usable. Taking `max_pins` from an unset
+          # NPM_MAX_PINS repository variable presents MAX_PINS as present-but-empty.
+          # With `-n` that reads as "not passed", and the budget refusal then tells a
           # consumer who is on a current reusable to go update their pinned
           # reusable, which is the one thing that cannot help them.
           [ -n "${MAX_PINS+set}" ] && NPM_AGE_MAX_PINS_FROM_ENV=1
@@ -5467,8 +5467,8 @@ jobs:
             echo "Age-checking against ${REGISTRY_URL}"
 
             # `type: number` on the workflow input guarantees little once a caller
-            # writes `max_pins: ${{ vars.NPM_MAX_PINS }}`. A non-integer would make
-            # the `[ "$pin_count" -gt "$MAX_PINS" ]` test below fail with "integer
+            # takes `max_pins` from the NPM_MAX_PINS repository variable. A non-integer
+            # would make the `[ "$pin_count" -gt "$MAX_PINS" ]` test below fail with "integer
             # expression expected" — a bare command under `set -e`, so main would
             # abort mid-loop after ::group:: but before ::endgroup::, the summary
             # footer or any TSV row. Fall back rather than hard-fail: this is an
