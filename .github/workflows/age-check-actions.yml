@@ -35,7 +35,7 @@ on:
         default: false
 
     secrets:
-      cross_repo_token:
+      AGE_CHECK_ACTIONS_READ_TOKEN:
         description: Optional read-only token for action refs in other private or internal repositories
         required: false
 
@@ -1653,7 +1653,7 @@ jobs:
             }
             # Bounded like tier 2. `gh` has internal timeouts, but leaving one tier
             # unbounded while the other is capped is an asymmetry with no rationale.
-            out=$(GH_TOKEN="${ACTIONS_AGE_CROSS_REPO_TOKEN:-${GH_TOKEN:-}}" \
+            out=$(GH_TOKEN="${AGE_CHECK_ACTIONS_READ_TOKEN:-${GH_TOKEN:-}}" \
               timeout 30 gh api "/repos/${owner}/${repo}/commits/${sha}" \
               --jq '.commit.committer.date // empty' 2>"$err_file") || rc=$?
             err=$(cat "$err_file")
@@ -2563,7 +2563,7 @@ jobs:
           # without redoing classification. Unset → no-op.
           AGE_CHECK_FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
           GH_TOKEN: ${{ github.token }}
-          ACTIONS_AGE_CROSS_REPO_TOKEN: ${{ secrets.cross_repo_token }}
+          AGE_CHECK_ACTIONS_READ_TOKEN: ${{ secrets.AGE_CHECK_ACTIONS_READ_TOKEN }}
         run: |
           # Written verbatim from lib/ by the `Write the age-check library` step(s)
           # above, into the same directory, so this resolves the shared libs the

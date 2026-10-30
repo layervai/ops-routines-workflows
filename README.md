@@ -34,7 +34,7 @@ Callers must declare job-level `permissions`, with `contents: read` for age chec
 inherit those permissions, so a read-only caller can run without a startup
 failure.
 
-The Actions checker accepts an optional `cross_repo_token` secret with read
+The Actions checker accepts an optional `AGE_CHECK_ACTIONS_READ_TOKEN` secret with read
 access to referenced private or internal repositories. Commit-date lookups use that
 token; provenance checks and optional PR comments still use the caller's `GITHUB_TOKEN`.
 
