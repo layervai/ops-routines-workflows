@@ -29,20 +29,19 @@ The bash is commodity defensive infrastructure: `git diff` changed manifest file
 
 ## Caller permissions and private action references
 
-Set `contents: read` on the caller job for age checks. Add
+Callers must declare job-level `permissions`, with `contents: read` for age checks. Add
 `pull-requests: write` only when enabling `comment_on_failure`. The reusables
 inherit those permissions, so a read-only caller can run without a startup
 failure.
 
 The Actions checker accepts an optional `cross_repo_token` secret with read
-access to referenced private or internal repositories. Age lookups use that
-token; optional PR comments still use the caller's `GITHUB_TOKEN`.
+access to referenced private or internal repositories. Commit-date lookups use that
+token; provenance checks and optional PR comments still use the caller's `GITHUB_TOKEN`.
 
 Actions, Docker, and Go also accept the matching `age-check-bypass-actions`,
 `age-check-bypass-docker`, or `age-check-bypass-go` label. Apply an approved
 bypass in the reusable, keeping the caller job present so required checks
 report a result. The normal emergency-bypass policy still applies.
-
 
 ## Consumer setup
 
