@@ -169,8 +169,7 @@ on:
         required: false
         default: false
 
-permissions:
-  contents: read
+# Token permissions come from the caller job. Read-only checks must not request PR write access.
 
 concurrency:
   group: age-check-npm-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.working_directory }}
@@ -188,13 +187,6 @@ jobs:
     # mint and checkout, so a 1-minute job leaves nothing to scan with
     # and would refuse any PR touching two dependencies.
     timeout-minutes: ${{ inputs.timeout_minutes >= 2 && inputs.timeout_minutes || 5 }}
-    permissions:
-      contents: read
-      # Only used when `comment_on_failure: true`. Caller's job-level
-      # `permissions:` block caps this; if the caller restricts to
-      # `contents: read` (or runs as Dependabot without an explicit
-      # grant), the post-step soft-fails to a `::notice`.
-      pull-requests: write
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') }}
     steps:
       - name: Checkout consumer repo

@@ -74,8 +74,7 @@ on:
         required: false
         default: false
 
-permissions:
-  contents: read
+# Token permissions come from the caller job. Read-only checks must not request PR write access.
 
 concurrency:
   group: age-check-precommit-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -98,13 +97,6 @@ jobs:
     # overruns is cancelled before the deadline can convert it into an
     # annotated failure, which is the whole point of having one.
     timeout-minutes: 15
-    permissions:
-      contents: read
-      # Only used when `comment_on_failure: true`. Caller's job-level
-      # `permissions:` block caps this; if the caller restricts to
-      # `contents: read` (or runs as Dependabot without an explicit
-      # grant), the post-step soft-fails to a `::notice`.
-      pull-requests: write
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') }}
     steps:
       - name: Checkout consumer repo

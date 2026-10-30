@@ -1,0 +1,11 @@
+name: Proof read-only docker caller
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+permissions:
+  contents: read
+jobs:
+  age-check:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/age-check-docker.yml

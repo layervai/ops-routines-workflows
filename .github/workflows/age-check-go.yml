@@ -84,8 +84,7 @@ on:
         description: "App private key used only when private_modules is non-empty."
         required: false
 
-permissions:
-  contents: read
+# Token permissions come from the caller job. Read-only checks must not request PR write access.
 
 concurrency:
   group: age-check-go-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -95,14 +94,7 @@ jobs:
   check-go-age:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      contents: read
-      # Only used when `comment_on_failure: true`. Caller's job-level
-      # `permissions:` block caps this; if the caller restricts to
-      # `contents: read` (or runs as Dependabot without an explicit
-      # grant), the post-step soft-fails to a `::notice`.
-      pull-requests: write
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') }}
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') && !contains(github.event.pull_request.labels.*.name, 'age-check-bypass-go') }}
     steps:
       - name: Require private-module configuration
         if: ${{ inputs.private_modules != '' }}
