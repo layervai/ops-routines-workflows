@@ -41,7 +41,11 @@ token; provenance checks and optional PR comments still use the caller's `GITHUB
 Actions, Docker, and Go also accept the matching `age-check-bypass-actions`,
 `age-check-bypass-docker`, or `age-check-bypass-go` label. Apply an approved
 bypass in the reusable, keeping the caller job present so required checks
-report a result. The normal emergency-bypass policy still applies.
+report a result. Scoped and global labels require verified-CVE approval. The checker does not
+verify the label actor. If a consumer guards only the global label name, add
+the three scoped names to that guard before enabling scoped bypasses. The
+automatic CVE verifier still applies only the global label; npm, pip, and
+pre-commit recognize only that label.
 
 ## Consumer setup
 

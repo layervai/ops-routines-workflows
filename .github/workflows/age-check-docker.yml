@@ -38,7 +38,8 @@ on:
         required: false
         default: false
 
-# Token permissions come from the caller job. Read-only checks must not request PR write access.
+# The caller job must cap token permissions; this reusable inherits that cap.
+# Do not require PR write access here: read-only callers would fail to start.
 
 concurrency:
   group: age-check-docker-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -54,6 +55,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Go (for crane install)
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6

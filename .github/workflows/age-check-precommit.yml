@@ -74,7 +74,8 @@ on:
         required: false
         default: false
 
-# Token permissions come from the caller job. Read-only checks must not request PR write access.
+# The caller job must cap token permissions; this reusable inherits that cap.
+# Do not require PR write access here: read-only callers would fail to start.
 
 concurrency:
   group: age-check-precommit-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -103,6 +104,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Write the age-check library — lib/_preflight.sh (part 1 of 2)
         run: |

@@ -2,7 +2,8 @@
 # REUSABLE: GitHub Actions Pin Age Check (supply-chain guard, PUBLIC mirror)
 # ----------------------------------------------------------------------------
 # Self-contained: the bash lib is embedded below. No cross-repo checkout,
-# no secrets required, no GitHub App involved. Public consumer repos
+# no secrets required (an optional read token dates private refs), no GitHub App.
+# Public consumer repos
 # point at this file (at the equivalent `layervai/ops-routines-workflows`
 # mirror) because GitHub blocks public → internal reusable-workflow calls.
 #
@@ -36,10 +37,11 @@ on:
 
     secrets:
       AGE_CHECK_ACTIONS_READ_TOKEN:
-        description: Optional read-only token for action refs in other private or internal repositories
+        description: Optional read-only token for every action repository being dated, including public refs; invalid or underscoped tokens fail closed
         required: false
 
-# Token permissions come from the caller job. Read-only checks must not request PR write access.
+# The caller job must cap token permissions; this reusable inherits that cap.
+# Do not require PR write access here: read-only callers would fail to start.
 
 concurrency:
   group: age-check-actions-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -56,6 +58,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Write the age-check library — lib/_preflight.sh (part 1 of 2)
         run: |
