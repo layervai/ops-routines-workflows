@@ -169,8 +169,8 @@ on:
         required: false
         default: false
 
-permissions:
-  contents: read
+# The caller job must cap token permissions; this reusable inherits that cap.
+# Do not require PR write access here: read-only callers would fail to start.
 
 concurrency:
   group: age-check-npm-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.working_directory }}
@@ -188,19 +188,13 @@ jobs:
     # mint and checkout, so a 1-minute job leaves nothing to scan with
     # and would refuse any PR touching two dependencies.
     timeout-minutes: ${{ inputs.timeout_minutes >= 2 && inputs.timeout_minutes || 5 }}
-    permissions:
-      contents: read
-      # Only used when `comment_on_failure: true`. Caller's job-level
-      # `permissions:` block caps this; if the caller restricts to
-      # `contents: read` (or runs as Dependabot without an explicit
-      # grant), the post-step soft-fails to a `::notice`.
-      pull-requests: write
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') }}
     steps:
       - name: Checkout consumer repo
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Write the age-check library — lib/_preflight.sh (part 1 of 2)
         run: |

@@ -2,7 +2,8 @@
 # REUSABLE: GitHub Actions Pin Age Check (supply-chain guard, PUBLIC mirror)
 # ----------------------------------------------------------------------------
 # Self-contained: the bash lib is embedded below. No cross-repo checkout,
-# no secrets required, no GitHub App involved. Public consumer repos
+# no secrets required (an optional read token dates private refs), no GitHub App.
+# Public consumer repos
 # point at this file (at the equivalent `layervai/ops-routines-workflows`
 # mirror) because GitHub blocks public → internal reusable-workflow calls.
 #
@@ -34,8 +35,13 @@ on:
         required: false
         default: false
 
-permissions:
-  contents: read
+    secrets:
+      AGE_CHECK_ACTIONS_READ_TOKEN:
+        description: Optional token with read access to every action repository being dated; private refs fail closed if no lookup can read them
+        required: false
+
+# The caller job must cap token permissions; this reusable inherits that cap.
+# Do not require PR write access here: read-only callers would fail to start.
 
 concurrency:
   group: age-check-actions-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -46,19 +52,13 @@ jobs:
     name: Check GitHub Actions pin ages
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      contents: read
-      # Only used when `comment_on_failure: true`. Caller's job-level
-      # `permissions:` block caps this; if the caller restricts to
-      # `contents: read` (or runs as Dependabot without an explicit
-      # grant), the post-step soft-fails to a `::notice`.
-      pull-requests: write
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') }}
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') && !contains(github.event.pull_request.labels.*.name, 'age-check-bypass-actions') }}
     steps:
       - name: Checkout consumer repo
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Write the age-check library — lib/_preflight.sh (part 1 of 2)
         run: |
@@ -1656,7 +1656,8 @@ jobs:
             }
             # Bounded like tier 2. `gh` has internal timeouts, but leaving one tier
             # unbounded while the other is capped is an asymmetry with no rationale.
-            out=$(timeout 30 gh api "/repos/${owner}/${repo}/commits/${sha}" \
+            out=$(GH_TOKEN="${AGE_CHECK_ACTIONS_READ_TOKEN:-${GH_TOKEN:-}}" \
+              timeout 30 gh api "/repos/${owner}/${repo}/commits/${sha}" \
               --jq '.commit.committer.date // empty' 2>"$err_file") || rc=$?
             err=$(cat "$err_file")
             rm -f "$err_file"
@@ -1938,7 +1939,6 @@ jobs:
             fi
 
             # `--filter=blob:none` skips file contents; a server without partial-clone
-            # support ignores it with a warning rather than failing. `--depth=1` keeps
           OPS_ROUTINES_AGE_CHECK_LIB
 
       - name: Write the age-check library — lib/age-check-actions.sh (part 2 of 2)
@@ -1946,6 +1946,7 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
           cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-actions.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
+            # support ignores it with a warning rather than failing. `--depth=1` keeps
             # it to the single pinned commit. `timeout` bounds a hung TLS session so one
             # unreachable host cannot burn the whole job's budget: a measured
             # single-commit fetch is ~0.6s even for a large action repo, so 30s leaves
@@ -2565,6 +2566,7 @@ jobs:
           # without redoing classification. Unset → no-op.
           AGE_CHECK_FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
           GH_TOKEN: ${{ github.token }}
+          AGE_CHECK_ACTIONS_READ_TOKEN: ${{ secrets.AGE_CHECK_ACTIONS_READ_TOKEN }}
         run: |
           # Written verbatim from lib/ by the `Write the age-check library` step(s)
           # above, into the same directory, so this resolves the shared libs the
