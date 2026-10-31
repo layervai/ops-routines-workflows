@@ -27,6 +27,28 @@ Each fails closed on any newly-added pin younger than `min_age_days` (7 for sour
 
 The bash is commodity defensive infrastructure: `git diff` changed manifest files → curl public registries → classify ages → emit GH annotations. Nothing sensitive.
 
+## Caller permissions and private action references
+
+Callers must declare job-level `permissions`, with `contents: read` for age checks. Add
+`pull-requests: write` only when enabling `comment_on_failure`. The reusables
+inherit those permissions, so a read-only caller can run without a startup
+failure.
+
+The Actions checker accepts an optional `AGE_CHECK_ACTIONS_READ_TOKEN` secret with read
+access to referenced private or internal repositories. Commit-date lookups use that
+token; provenance checks and optional PR comments keep the caller's `GITHUB_TOKEN`.
+The token must cover every repository being dated. Public pins retain the
+anonymous exact-SHA fallback when the API read fails; unreadable private pins fail closed.
+
+Actions, Docker, and Go also accept the matching `age-check-bypass-actions`,
+`age-check-bypass-docker`, or `age-check-bypass-go` label. Apply an approved
+bypass in the reusable, keeping the caller job present so required checks
+report a result. Scoped and global labels require verified-CVE approval. The checker does not
+verify the label actor. If a consumer guards only the global label name, add
+the three scoped names to that guard before enabling scoped bypasses. The
+automatic CVE verifier still applies only the global label; npm, pip, and
+pre-commit recognize only that label.
+
 ## Consumer setup
 
 In your consumer repo:
