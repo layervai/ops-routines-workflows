@@ -37,7 +37,7 @@ on:
 
     secrets:
       AGE_CHECK_ACTIONS_READ_TOKEN:
-        description: Optional read-only token for every action repository being dated, including public refs; invalid or underscoped tokens fail closed
+        description: Optional token with read access to every action repository being dated; private refs fail closed if no lookup can read them
         required: false
 
 # The caller job must cap token permissions; this reusable inherits that cap.

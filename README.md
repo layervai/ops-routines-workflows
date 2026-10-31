@@ -36,7 +36,9 @@ failure.
 
 The Actions checker accepts an optional `AGE_CHECK_ACTIONS_READ_TOKEN` secret with read
 access to referenced private or internal repositories. Commit-date lookups use that
-token; provenance checks and optional PR comments still use the caller's `GITHUB_TOKEN`.
+token; provenance checks and optional PR comments keep the caller's `GITHUB_TOKEN`.
+The token must cover every repository being dated. Public pins retain the
+anonymous exact-SHA fallback when the API read fails; unreadable private pins fail closed.
 
 Actions, Docker, and Go also accept the matching `age-check-bypass-actions`,
 `age-check-bypass-docker`, or `age-check-bypass-go` label. Apply an approved
