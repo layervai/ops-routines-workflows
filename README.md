@@ -6,7 +6,7 @@ This repo exists so **public** consumer repos in the `layervai` organization can
 
 ## What's in here
 
-Five self-contained reusable workflows — each has its bash logic **inlined** as heredoc content. No cross-repo checkout, no secrets, no GitHub App tokens.
+Six self-contained reusable workflows — each has its bash logic **inlined** as heredoc content. Public-registry checks need no extra secrets. Private action or Go-module checks use the optional scoped credentials declared by each workflow.
 
 | Workflow | Purpose |
 |---|---|
@@ -15,6 +15,7 @@ Five self-contained reusable workflows — each has its bash logic **inlined** a
 | `age-check-go.yml` | Block PRs adding recently-published Go modules (go.sum diff) |
 | `age-check-npm.yml` | Block PRs adding recently-published npm packages (package-lock/pnpm-lock/yarn.lock) |
 | `age-check-pip.yml` | Block PRs adding recently-published PyPI packages (requirements.txt, poetry.lock, pyproject.toml) |
+| `age-check-precommit.yml` | Block PRs adding recently-committed pre-commit hook revisions |
 
 Each fails closed on any newly-added pin younger than `min_age_days` (7 for source-package ecosystems; 14 for Docker by default).
 
@@ -59,6 +60,7 @@ name: Dependency Age Check (pip)
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
 
 concurrency:
@@ -70,15 +72,14 @@ permissions:
 
 jobs:
   age-check:
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') }}
-    uses: layervai/ops-routines-workflows/.github/workflows/age-check-pip.yml@<SHA> # vX.Y.Z
+    uses: layervai/ops-routines-workflows/.github/workflows/age-check-pip.yml@414821a809395384de83d853a4bfd5b46e6bfc55 # v0.15.0
     with:
       min_age_days: 7
     permissions:
       contents: read
 ```
 
-Same pattern for the other ecosystems. No `secrets:` block needed — the workflows are self-contained.
+Use the same event types for the other ecosystems. Default public checks need no `secrets:` block; private reference reads use the optional credentials described above.
 
 ### Optional: PR comments with retry-after dates (v0.6.0+)
 
@@ -89,8 +90,7 @@ Requires the calling job to grant `pull-requests: write` (Dependabot PRs need th
 ```yaml
 jobs:
   age-check:
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') }}
-    uses: layervai/ops-routines-workflows/.github/workflows/age-check-pip.yml@<SHA> # v0.6.0
+    uses: layervai/ops-routines-workflows/.github/workflows/age-check-pip.yml@414821a809395384de83d853a4bfd5b46e6bfc55 # v0.15.0
     with:
       min_age_days: 7
       comment_on_failure: true
@@ -101,7 +101,9 @@ jobs:
 
 ## Bypass
 
-Add the `age-check-bypass` label to a PR to skip the check. Use only for CVE-driven emergency updates.
+Add the `age-check-bypass` label to a PR to skip all age checks. The Actions, Docker, and Go checks also honor their matching scoped label. Use only for approved CVE-driven emergency updates.
+
+Keep `labeled` and `unlabeled` in the caller's pull-request event types. Adding a bypass label then reports the named child check as `SKIPPED`; removing it reruns the check. Do not put a bypass `if:` on the caller job: that hides the child check required by branch protection. A manual rerun keeps its original event payload and cannot pick up a newly changed label.
 
 ## How these files are generated
 
