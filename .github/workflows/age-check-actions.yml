@@ -2,7 +2,7 @@
 # REUSABLE: GitHub Actions Pin Age Check (supply-chain guard, PUBLIC mirror)
 # ----------------------------------------------------------------------------
 # Self-contained: the bash lib is embedded below. No cross-repo checkout,
-# no secrets required (an optional read token dates private refs), no GitHub App.
+# no secrets required for public refs; an optional scoped reader App reads private refs.
 # Public consumer repos
 # point at this file (at the equivalent `layervai/ops-routines-workflows`
 # mirror) because GitHub blocks public → internal reusable-workflow calls.
@@ -35,7 +35,19 @@ on:
         required: false
         default: false
 
+      private_action_repositories:
+        description: "Exact repositories in the caller's owner to read with the existing reader App, one name per line. Empty keeps the public no-App path."
+        type: string
+        required: false
+        default: ''
+
     secrets:
+      OPS_ROUTINES_APP_ID:
+        description: Reader App ID; used only when private_action_repositories is non-empty
+        required: false
+      OPS_ROUTINES_APP_PRIVATE_KEY:
+        description: Reader App private key; used only when private_action_repositories is non-empty
+        required: false
       AGE_CHECK_ACTIONS_READ_TOKEN:
         description: Optional token with read access to every action repository being dated; private refs fail closed if no lookup can read them
         required: false
@@ -54,6 +66,53 @@ jobs:
     timeout-minutes: 5
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'age-check-bypass') && !contains(github.event.pull_request.labels.*.name, 'age-check-bypass-actions') }}
     steps:
+      - name: Validate private-action reader configuration
+        id: private_action_reader
+        if: ${{ inputs.private_action_repositories != '' }}
+        env:
+          APP_ID: ${{ secrets.OPS_ROUTINES_APP_ID }}
+          PRIVATE_KEY: ${{ secrets.OPS_ROUTINES_APP_PRIVATE_KEY }}
+          REPOSITORIES: ${{ inputs.private_action_repositories }}
+        run: |
+          set -euo pipefail
+          found=false
+          while IFS= read -r repo || [ -n "$repo" ]; do
+            [ -z "$repo" ] && continue
+            if [[ ! "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$ ]] || [[ "$repo" == *. ]]; then
+              echo "::error::Private Actions reader scope requires exact repository names, one per line."
+              exit 1
+            fi
+            found=true
+          done <<< "$REPOSITORIES"
+          if [ "$found" != true ]; then
+            echo "::error::Private Actions reader scope must name at least one repository."
+            exit 1
+          fi
+
+          if [ -z "$APP_ID" ] || [ -z "$PRIVATE_KEY" ]; then
+            echo "::notice::Reader App credentials unavailable; private-ref lookups will fail closed if needed."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          repositories=$(printf '%s\n' "$REPOSITORIES" | tr '[:upper:]' '[:lower:]' | sed '/^$/d' | LC_ALL=C sort -u | paste -sd, -)
+          if [ -z "$repositories" ]; then
+            echo "::error::Private Actions reader scope must not be empty."
+            exit 1
+          fi
+          echo "repositories=$repositories" >> "$GITHUB_OUTPUT"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Mint scoped private-action reader token
+        if: ${{ steps.private_action_reader.outputs.enabled == 'true' }}
+        id: private_action_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.OPS_ROUTINES_APP_ID }}
+          private-key: ${{ secrets.OPS_ROUTINES_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.private_action_reader.outputs.repositories }}
+          permission-contents: read
+
       - name: Checkout consumer repo
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -1459,6 +1518,8 @@ jobs:
           #                  `ALL_PROXY` are environment variables, are NOT scrubbed,
           #                  and git still honours them — so most proxied runners are
           #                  unaffected.
+          #   AGE_CHECK_ACTIONS_PRIVATE_* - optional reader TOKEN, OWNER and exact
+          #                  newline-separated REPOSITORIES; other reads keep GH_TOKEN
           #   ACTIONS_AGE_TRUSTED_OWNER - caller repository owner; self-reference pins
           #                  may skip age only inside this owner and after provenance
           #   AGE_CHECK_SKIP_SELF_REFS - trusted reusable repositories whose exact pins
@@ -1639,6 +1700,25 @@ jobs:
             return 0
           }
 
+          # Keep the scoped App on named private repositories; other reads retain the
+          # caller token. An explicit date reader never changes provenance authority.
+          actions_age::github_api() {
+            local purpose="$1" path="$2" token="${GH_TOKEN:-}"
+            shift
+            local remainder="${path#/repos/}" owner repo
+            owner="${remainder%%/*}"
+            remainder="${remainder#*/}"
+            repo="${remainder%%/*}"
+            if [ "$purpose" = date ] && [ -n "${AGE_CHECK_ACTIONS_READ_TOKEN:-}" ]; then
+              token="$AGE_CHECK_ACTIONS_READ_TOKEN"
+            elif [ -n "${AGE_CHECK_ACTIONS_PRIVATE_TOKEN:-}" ] \
+              && printf '%s\n' "${AGE_CHECK_ACTIONS_PRIVATE_OWNER:-}" | grep -Fxiq -- "$owner" \
+              && grep -Fxiq -- "$repo" <<< "${AGE_CHECK_ACTIONS_PRIVATE_REPOSITORIES:-}"; then
+              token="$AGE_CHECK_ACTIONS_PRIVATE_TOKEN"
+            fi
+            GH_TOKEN="$token" timeout 30 gh api "$@"
+          }
+
           # Tier 1 — authenticated REST. Still first because it is the only tier that
           # can read a pin from a PRIVATE repository the workflow token has access to.
           # Captures stderr instead of discarding it so the caller can classify the
@@ -1656,8 +1736,7 @@ jobs:
             }
             # Bounded like tier 2. `gh` has internal timeouts, but leaving one tier
             # unbounded while the other is capped is an asymmetry with no rationale.
-            out=$(GH_TOKEN="${AGE_CHECK_ACTIONS_READ_TOKEN:-${GH_TOKEN:-}}" \
-              timeout 30 gh api "/repos/${owner}/${repo}/commits/${sha}" \
+            out=$(actions_age::github_api date "/repos/${owner}/${repo}/commits/${sha}" \
               --jq '.commit.committer.date // empty' 2>"$err_file") || rc=$?
             err=$(cat "$err_file")
             rm -f "$err_file"
@@ -1922,6 +2001,13 @@ jobs:
             }
             local ACTIONS_AGE_ANON_HOME="$anon_home"
             # Structural cleanup: this function runs inside `ts=$(...)`, and a
+          OPS_ROUTINES_AGE_CHECK_LIB
+
+      - name: Write the age-check library — lib/age-check-actions.sh (part 2 of 2)
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
+          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-actions.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # command-substitution subshell resets traps, so main()'s EXIT trap does not
             # cover these. RETURN fires on every `return` below, and is NOT inherited by
             # the nested anon_git/set_reason calls, so it runs exactly once. It is the
@@ -1939,13 +2025,6 @@ jobs:
             fi
 
             # `--filter=blob:none` skips file contents; a server without partial-clone
-          OPS_ROUTINES_AGE_CHECK_LIB
-
-      - name: Write the age-check library — lib/age-check-actions.sh (part 2 of 2)
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/ops-routines-lib"
-          cat >> "${RUNNER_TEMP}/ops-routines-lib/age-check-actions.sh" <<'OPS_ROUTINES_AGE_CHECK_LIB'
             # support ignores it with a warning rather than failing. `--depth=1` keeps
             # it to the single pinned commit. `timeout` bounds a hung TLS session so one
             # unreachable host cannot burn the whole job's budget: a measured
@@ -2223,7 +2302,7 @@ jobs:
               actions_age::set_reason "provenance lookup could not allocate a workspace"
               return 1
             }
-            out=$(timeout 30 gh api "$path" --jq "$filter" 2>"$err_file") || rc=$?
+            out=$(actions_age::github_api provenance "$path" --jq "$filter" 2>"$err_file") || rc=$?
             err=$(cat "$err_file")
             rm -f "$err_file"
 
@@ -2566,6 +2645,9 @@ jobs:
           # without redoing classification. Unset → no-op.
           AGE_CHECK_FAILURES_FILE: ${{ runner.temp }}/age-check-failures.tsv
           GH_TOKEN: ${{ github.token }}
+          AGE_CHECK_ACTIONS_PRIVATE_TOKEN: ${{ steps.private_action_token.outputs.token }}
+          AGE_CHECK_ACTIONS_PRIVATE_OWNER: ${{ github.repository_owner }}
+          AGE_CHECK_ACTIONS_PRIVATE_REPOSITORIES: ${{ inputs.private_action_repositories }}
           AGE_CHECK_ACTIONS_READ_TOKEN: ${{ secrets.AGE_CHECK_ACTIONS_READ_TOKEN }}
         run: |
           # Written verbatim from lib/ by the `Write the age-check library` step(s)
